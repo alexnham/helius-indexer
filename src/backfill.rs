@@ -446,7 +446,7 @@ impl History {
             archive_input: source.capture_source() == "old-faithful-jetstreamer",
             ..Metrics::default()
         };
-        if metrics.archive_input {
+        if metrics.archive_input && !self.revision_repair {
             self.telemetry
                 .set_context("backfill", "archive", "historical");
         } else if !self.revision_repair {

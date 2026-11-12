@@ -203,7 +203,7 @@ fn missing_or_invalid_metadata_never_silently_becomes_complete() {
 }
 
 #[test]
-fn token_2022_unknown_opcodes_and_owner_changes_are_explicitly_unsupported() {
+fn token_2022_unknown_opcodes_and_malformed_authority_changes_are_rejected() {
     let mut value = capture();
     value["result"]["transaction"]["message"]["accountKeys"][0] = json!(TOKEN_2022);
     assert_eq!(decode(&value).unwrap_err().0, "conflicting_token_program");
@@ -217,7 +217,7 @@ fn token_2022_unknown_opcodes_and_owner_changes_are_explicitly_unsupported() {
     value["result"]["transaction"]["message"]["instructions"][0] = instruction(6, 1, vec![1, 2, 4]);
     assert_eq!(
         decode(&value).unwrap_err().0,
-        "unsupported_authority_change"
+        "invalid_authority_instruction"
     );
 }
 
@@ -722,4 +722,142 @@ fn nontransfer_exclusions_require_known_program_and_instruction_shape() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].amount_raw, 42);
     assert_eq!(rows[0].token_program, SPL_TOKEN);
+}
+
+fn set_authority(kind: u8, target: usize, authority: usize, new_owner: Option<u8>) -> Value {
+    let mut data = vec![6, kind, u8::from(new_owner.is_some())];
+    if let Some(byte) = new_owner {
+        data.extend([byte; 32]);
+    }
+    json!({"programIdIndex":0,"accounts":[target,authority],"data":bs58::encode(data).into_string()})
+}
+#[test]
+fn owner_change_and_restore_keep_edges_but_clear_only_affected_owners() {
+    for program in [SPL_TOKEN, TOKEN_2022] {
+        let mut value = capture();
+        value["result"]["transaction"]["message"]["accountKeys"][0] = json!(program);
+        for side in ["preTokenBalances", "postTokenBalances"] {
+            for balance in value["result"]["meta"][side].as_array_mut().unwrap() {
+                balance["programId"] = json!(program);
+            }
+        }
+        value["result"]["transaction"]["message"]["accountKeys"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!(key(9)));
+        let transfer = value["result"]["transaction"]["message"]["instructions"][0].clone();
+        for instructions in [
+            json!([
+                set_authority(2, 1, 4, Some(9)),
+                transfer,
+                set_authority(2, 1, 5, Some(4))
+            ]),
+            json!([
+                transfer,
+                set_authority(2, 1, 4, Some(9)),
+                set_authority(2, 1, 5, Some(4))
+            ]),
+        ] {
+            value["result"]["transaction"]["message"]["instructions"] = instructions;
+            let rows = decode(&value).unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].source_owner, None);
+            assert_eq!(rows[0].destination_owner, Some(key(5)));
+            assert_eq!(rows[0].amount_raw, 42);
+            assert_eq!(rows[0].fee_raw, Some(0));
+        }
+    }
+}
+#[test]
+fn inner_owner_change_preserves_execution_checks_and_clears_earlier_transfer_owner() {
+    let mut value = capture();
+    value["result"]["transaction"]["message"]["accountKeys"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!(key(8)));
+    value["result"]["transaction"]["message"]["instructions"] =
+        json!([{"programIdIndex":5,"accounts":[],"data":""}]);
+    value["result"]["meta"]["innerInstructions"] = json!([{"index":0,"instructions":[instruction(3,42,vec![1,2,4]),set_authority(2,1,4,Some(9))]}]);
+    value["result"]["meta"]["logMessages"] = json!([
+        format!("Program {SPL_TOKEN} invoke [2]"),
+        format!("Program {SPL_TOKEN} success"),
+        format!("Program {SPL_TOKEN} invoke [2]"),
+        format!("Program {SPL_TOKEN} success")
+    ]);
+    let rows = decode(&value).unwrap();
+    assert_eq!(rows[0].source_owner, None);
+    assert_eq!(rows[0].inner_instruction_index, Some(0));
+    value["result"]["meta"]["logMessages"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!(format!("Program {} failed:", key(8))));
+    assert_eq!(
+        decode(&value).unwrap_err().0,
+        "unsupported_caught_token_failure"
+    );
+}
+#[test]
+fn non_owner_authorities_preserve_owners_and_invalid_encodings_remain_unresolved() {
+    for kind in [0, 1, 3] {
+        let mut value = capture();
+        value["result"]["transaction"]["message"]["instructions"]
+            .as_array_mut()
+            .unwrap()
+            .push(set_authority(kind, 1, 4, None));
+        let rows = decode(&value).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].source_owner, Some(key(4)));
+    }
+    for data in [
+        vec![6],
+        vec![6, 2, 0],
+        vec![6, 3, 2],
+        vec![6, 3, 1],
+        vec![6, 3, 0, 0],
+    ] {
+        let mut value = capture();
+        value["result"]["transaction"]["message"]["instructions"] =
+            json!([{"programIdIndex":0,"accounts":[1,4],"data":bs58::encode(data).into_string()}]);
+        assert_eq!(
+            decode(&value).unwrap_err().0,
+            "invalid_authority_instruction"
+        );
+    }
+    let mut value = capture();
+    value["result"]["transaction"]["message"]["instructions"] =
+        json!([set_authority(4, 1, 4, None)]);
+    assert_eq!(
+        decode(&value).unwrap_err().0,
+        "unsupported_authority_change"
+    );
+}
+#[test]
+fn withheld_withdrawals_are_not_ordinary_edges_or_evidence_of_transfer_fees() {
+    for (data, accounts) in [
+        (vec![26, 2], vec![3, 2, 4]),
+        (vec![26, 3, 1], vec![3, 2, 4, 1]),
+        (vec![26, 4], vec![3, 1]),
+    ] {
+        let mut value = token_2022_capture(42, None);
+        value["result"]["transaction"]["message"]["instructions"].as_array_mut().unwrap().push(json!({"programIdIndex":0,"accounts":accounts,"data":bs58::encode(data).into_string()}));
+        let rows = decode(&value).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].amount_raw, 42);
+        assert_eq!(rows[0].fee_raw, None);
+    }
+    for data in [vec![26, 2, 0], vec![26, 3], vec![26, 3, 2], vec![26, 4, 0]] {
+        let mut value = token_2022_capture(42, None);
+        value["result"]["transaction"]["message"]["instructions"] = json!([{"programIdIndex":0,"accounts":[1,2,4],"data":bs58::encode(data).into_string()}]);
+        assert_eq!(
+            decode(&value).unwrap_err().0,
+            "invalid_fee_maintenance_instruction"
+        );
+    }
+    let mut value = token_2022_capture(42, None);
+    value["result"]["transaction"]["message"]["instructions"][0]["data"] =
+        json!(bs58::encode([26, 5]).into_string());
+    assert_eq!(
+        decode(&value).unwrap_err().0,
+        "unsupported_transfer_fee_instruction"
+    );
 }

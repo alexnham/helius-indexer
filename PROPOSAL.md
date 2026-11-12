@@ -221,3 +221,12 @@ is independent of verified contiguous coverage; boundary readiness requires
 comparison and both durable observations. Plans freeze their endpoint and do not
 claim ongoing live completeness. See [boundary coordination](docs/source-boundary.md)
 for operation, limits, recovery checks and remaining production work.
+
+
+Decoder v5 recognizes base authority operations and withheld-fee collection as
+non-transfer activity while preserving ordinary transfer instructions in the same
+transaction. Account-owner changes clear affected owner fields conservatively,
+even if transaction-boundary owners agree. Fee collection does not establish an
+ordinary transfer fee or a new transfer edge. The [support matrix](docs/token-2022-support.md)
+and [retained-input validation](docs/validation/2026-11-12-decoder-maintenance.md)
+record exact supported variants, explicit repair requirements and remaining gaps.

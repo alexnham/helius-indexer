@@ -140,7 +140,7 @@ pub fn run(
     )
 }
 
-/// Reverify whole retained RPC blocks offline, including candidates never decoded by an old revision.
+/// Reverify whole retained RPC blocks offline, including previously rejected candidates.
 pub fn history(
     path: &Path,
     telemetry: &mut Telemetry,
@@ -149,10 +149,47 @@ pub fn history(
     end: u64,
     cancelled: impl Fn() -> bool,
 ) -> Result<Value> {
+    history_from(path, telemetry, mint, start, end, cancelled, false)
+}
+
+/// Reverify normalized archive blocks without fetching CAR files or the network.
+pub fn archive_history(
+    path: &Path,
+    telemetry: &mut Telemetry,
+    mint: &str,
+    start: u64,
+    end: u64,
+    cancelled: impl Fn() -> bool,
+) -> Result<Value> {
+    history_from(path, telemetry, mint, start, end, cancelled, true)
+}
+fn history_from(
+    path: &Path,
+    telemetry: &mut Telemetry,
+    mint: &str,
+    start: u64,
+    end: u64,
+    cancelled: impl Fn() -> bool,
+    archive: bool,
+) -> Result<Value> {
     telemetry.set_context("decoder_repair", "retained_block", "repair");
     crate::backfill::scope(mint, start, end)?;
-    struct NoNetwork;
+    struct NoNetwork(bool);
     impl crate::backfill::BlockSource for NoNetwork {
+        fn provenance(&self) -> &'static str {
+            if self.0 {
+                "old-faithful-jetstreamer"
+            } else {
+                "finalized-mainnet-rpc"
+            }
+        }
+        fn capture_source(&self) -> &'static str {
+            if self.0 {
+                "old-faithful-jetstreamer"
+            } else {
+                "solana-mainnet-rpc"
+            }
+        }
         fn block(&mut self, _slot: u64) -> Result<Vec<u8>> {
             Err(Error("retained_block_unavailable"))
         }
@@ -160,8 +197,8 @@ pub fn history(
     let mut history = crate::backfill::History::open(path)?;
     history.enable_revision_repair(telemetry.run_id.clone());
     let run_id = history.run_id().to_owned();
-    let (coverage, metrics) = history.run(mint, start, end, &mut NoNetwork, cancelled)?;
+    let (coverage, metrics) = history.run(mint, start, end, &mut NoNetwork(archive), cancelled)?;
     Ok(
-        json!({"run_id":run_id,"source":"retained_blocks_only","coverage":coverage,"metrics":metrics}),
+        json!({"run_id":run_id,"source":"retained_blocks_only","source_kind":if archive {"archive"} else {"rpc"},"coverage":coverage,"metrics":metrics}),
     )
 }

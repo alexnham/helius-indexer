@@ -15,7 +15,7 @@ use std::{
     time::Instant,
 };
 
-const USAGE: &str = "usage: helius-indexer ingest DB CAPTURE [--metrics FILE] | query DB [MINT] | backfill DB MINT START END [--metrics FILE] | coverage DB MINT START END | live DB FROM_SLOT SECONDS | live-status DB | live-retry DB | summary DB MINT | overlap DB START END SECONDS | repair DB START END | repair-status DB START END | repair-history DB MINT START END | [feature archive] archive/archive-replay/archive-overlap DB CACHE MINT START END | bridge-plan DB CACHE MINT START | bridge DB CACHE MINT START | bridge-status DB MINT START | bridge-live DB CACHE START SECONDS | archive-tip CACHE | archive-live DB CACHE START END SECONDS";
+const USAGE: &str = "usage: helius-indexer ingest DB CAPTURE [--metrics FILE] | query DB [MINT] | backfill DB MINT START END [--metrics FILE] | coverage DB MINT START END | live DB FROM_SLOT SECONDS | live-status DB | live-retry DB | summary DB MINT | overlap DB START END SECONDS | repair DB START END | repair-status DB START END | repair-history-archive DB MINT START END | repair-history DB MINT START END | [feature archive] archive/archive-replay/archive-overlap DB CACHE MINT START END | bridge-plan DB CACHE MINT START | bridge DB CACHE MINT START | bridge-status DB MINT START | bridge-live DB CACHE START SECONDS | archive-tip CACHE | archive-live DB CACHE START END SECONDS";
 
 fn ingest(db: &str, input: &str, telemetry: &mut Telemetry) -> Result<serde_json::Value> {
     let started = Instant::now();
@@ -155,13 +155,26 @@ fn run(args: &[String], telemetry: &mut Telemetry) -> Result<serde_json::Value> 
                 telemetry,
             )
         }
-        [command, db, mint, start, end] if command == "repair-history" => {
+        [command, db, mint, start, end]
+            if command == "repair-history" || command == "repair-history-archive" =>
+        {
             let start = start.parse().map_err(|_| Error("invalid_repair_range"))?;
             let end = end.parse().map_err(|_| Error("invalid_repair_range"))?;
             let cancel = env::var_os("REPAIR_CANCEL_FILE");
-            helius_indexer::repair::history(Path::new(db), telemetry, mint, start, end, || {
-                cancel.as_ref().is_some_and(|p| Path::new(p).exists())
-            })
+            if command == "repair-history-archive" {
+                helius_indexer::repair::archive_history(
+                    Path::new(db),
+                    telemetry,
+                    mint,
+                    start,
+                    end,
+                    || cancel.as_ref().is_some_and(|p| Path::new(p).exists()),
+                )
+            } else {
+                helius_indexer::repair::history(Path::new(db), telemetry, mint, start, end, || {
+                    cancel.as_ref().is_some_and(|p| Path::new(p).exists())
+                })
+            }
         }
         [command, db, start, end] if command == "repair" || command == "repair-status" => {
             let start = start.parse().map_err(|_| Error("invalid_repair_range"))?;

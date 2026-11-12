@@ -4,7 +4,7 @@ use std::collections::HashSet;
 
 pub const SPL_TOKEN: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 pub const TOKEN_2022: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
-pub const DECODER_VERSION: &str = "token-transfers-v4";
+pub const DECODER_VERSION: &str = "token-transfers-v5";
 pub const MAX_CAPTURE_BYTES: usize = 16 * 1024 * 1024;
 
 pub fn parse_capture(bytes: &[u8]) -> Result<Capture> {
@@ -109,6 +109,7 @@ pub fn decode(capture: &Capture) -> Result<Vec<Transfer>> {
         }
     }
     let mut output = Vec::new();
+    let mut changed_owners = HashSet::new();
     for token_program in [SPL_TOKEN, TOKEN_2022] {
         let has_inner_token = groups.iter().flat_map(|g| &g.instructions).any(|ix| {
             keys.get(ix.program_id_index)
@@ -146,11 +147,35 @@ pub fn decode(capture: &Capture) -> Result<Vec<Transfer>> {
         }
     }
     for (outer, instruction) in message.instructions.iter().enumerate() {
-        decode_instruction(tx, &keys, instruction, outer, None, &mut output)?;
+        decode_instruction(
+            tx,
+            &keys,
+            instruction,
+            outer,
+            None,
+            &mut output,
+            &mut changed_owners,
+        )?;
         if let Some(group) = groups.iter().find(|g| g.index == outer) {
             for (inner, instruction) in group.instructions.iter().enumerate() {
-                decode_instruction(tx, &keys, instruction, outer, Some(inner), &mut output)?;
+                decode_instruction(
+                    tx,
+                    &keys,
+                    instruction,
+                    outer,
+                    Some(inner),
+                    &mut output,
+                    &mut changed_owners,
+                )?;
             }
+        }
+    }
+    for transfer in &mut output {
+        if changed_owners.contains(&transfer.source_token_account) {
+            transfer.source_owner = None;
+        }
+        if changed_owners.contains(&transfer.destination_token_account) {
+            transfer.destination_owner = None;
         }
     }
     Ok(output)
@@ -188,6 +213,7 @@ fn decode_instruction(
     outer: usize,
     inner: Option<usize>,
     output: &mut Vec<Transfer>,
+    changed_owners: &mut HashSet<String>,
 ) -> Result<()> {
     let program = keys
         .get(ix.program_id_index)
@@ -206,9 +232,37 @@ fn decode_instruction(
         .map_err(|_| Error("invalid_token_instruction"))?;
     let mut data = data;
     let mut fee_raw = if program == SPL_TOKEN { Some(0) } else { None };
-    // Harvesting withheld fees is mint-associated activity, not an instructed transfer edge.
-    if program == TOKEN_2022 && data.as_slice() == [26, 4] && !ix.accounts.is_empty() {
+    if data.first() == Some(&6) {
+        if data.len() < 3 || ix.accounts.len() < 2 {
+            return Err(Error("invalid_authority_instruction"));
+        }
+        if data[1] > 3 {
+            return Err(Error("unsupported_authority_change"));
+        }
+        if !matches!((data[2], data.len()), (0, 3) | (1, 35)) || (data[1] == 2 && data[2] == 0) {
+            return Err(Error("invalid_authority_instruction"));
+        }
+        // Agreement at transaction boundaries cannot resolve change-and-restore.
+        if data[1] == 2 {
+            changed_owners.insert(keys[ix.accounts[0]].clone());
+        }
         return Ok(());
+    }
+    // Fee collection moves withheld balances, not an ordinary instructed edge.
+    if program == TOKEN_2022 && data.first() == Some(&26) {
+        let minimum = match data.get(1) {
+            Some(2) => Some((2, 3)),
+            Some(3) if data.len() == 3 => Some((3, 3 + usize::from(data[2]))),
+            Some(3) => return Err(Error("invalid_fee_maintenance_instruction")),
+            Some(4) => Some((2, 1)),
+            _ => None,
+        };
+        if let Some((length, accounts)) = minimum {
+            if data.len() != length || ix.accounts.len() < accounts {
+                return Err(Error("invalid_fee_maintenance_instruction"));
+            }
+            return Ok(());
+        }
     }
     // Unwrapping moves native lamports, which are outside the token-transfer index.
     if data.first() == Some(&45)
@@ -234,8 +288,6 @@ fn decode_instruction(
             Some((&keys[ix.accounts[1]], data[9])),
         ),
         3 | 12 => return Err(Error("invalid_transfer_instruction")),
-        // Pre/post owners can agree despite an ownership change within the transaction.
-        6 => return Err(Error("unsupported_authority_change")),
         // Legacy SPL's other known instructions do not transfer tokens.
         0..=24 => return Ok(()),
         _ => return Err(Error("unsupported_token_instruction")),
