@@ -156,7 +156,7 @@ pub fn decode(capture: &Capture) -> Result<Vec<Transfer>> {
     Ok(output)
 }
 
-fn runtime_failure(line: &str) -> bool {
+pub(crate) fn runtime_failure(line: &str) -> bool {
     line.strip_prefix("Program ")
         .and_then(|rest| rest.split_once(" failed:"))
         .is_some_and(|(program, _)| validate_base58(program, 32).is_ok())

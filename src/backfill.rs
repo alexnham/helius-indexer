@@ -118,6 +118,7 @@ pub struct Coverage {
 pub struct Metrics {
     pub input_bytes: u64,
     pub source_attempts: u64,
+    pub cached_blocks: u64,
     pub source_errors: u64,
     pub write_errors: u64,
     pub retries: u64,
@@ -148,6 +149,10 @@ impl Metrics {
                     "indexer_oldest_pending_age_seconds{{mode=\"historical\"}} {age}\n"
                 ))
         );
+        output.push_str(&format!(
+            "indexer_historical_cached_blocks_total {}\n",
+            self.cached_blocks
+        ));
         let mut prior_pending = false;
         let mut missing_ranges = 0;
         for slot in &coverage.slots {
@@ -166,6 +171,7 @@ pub struct History {
     db: Connection,
     path: PathBuf,
     telemetry: crate::telemetry::Telemetry,
+    revision_repair: bool,
     gate: std::sync::Arc<crate::coordinator::WriteGate>,
 }
 fn now() -> u64 {
@@ -218,10 +224,17 @@ impl History {
         telemetry.set_context("backfill", "rpc", "historical");
         Ok(Self {
             db,
+            revision_repair: false,
             path: path.to_path_buf(),
             telemetry,
             gate: std::sync::Arc::new(crate::coordinator::WriteGate::default()),
         })
+    }
+    pub(crate) fn enable_revision_repair(&mut self, run_id: String) {
+        self.revision_repair = true;
+        self.telemetry.run_id = run_id;
+        self.telemetry
+            .set_context("decoder_repair", "retained_block", "repair");
     }
     pub fn set_gate(&mut self, gate: std::sync::Arc<crate::coordinator::WriteGate>) {
         self.gate = gate;
@@ -339,19 +352,27 @@ impl History {
                 let _permit = self.gate.historical()?;
                 self.db.execute("UPDATE historical_slots SET attempts=attempts+1 WHERE mint=?1 AND decoder=?2 AND slot=?3",params![mint,decoder::DECODER_VERSION,slot as i64]).map_err(write_error)?;
             }
-            let cached: Option<Vec<u8>> = if current.error_class.is_none()
+            let cached: Option<Vec<u8>> = if self.revision_repair
+                || current.error_class.is_none()
                 || current.error_class.as_deref() == Some("cancelled")
+                || matches!(
+                    current.error_class.as_deref(),
+                    Some("decoder_revision_conflict" | "decoder_repair_requires_verification")
+                )
                 || current
                     .error_class
                     .as_deref()
                     .is_some_and(|e| e.starts_with("storage_"))
             {
-                self.db.query_row("SELECT response FROM historical_inputs WHERE mint=?1 AND decoder=?2 AND slot=?3 ORDER BY attempt DESC LIMIT 1",params![mint,decoder::DECODER_VERSION,slot as i64],|r|r.get(0)).optional().map_err(read_error)?
+                self.db.query_row("SELECT response FROM historical_inputs WHERE mint=?1 AND slot=?2 ORDER BY received_at DESC,attempt DESC LIMIT 1",params![mint,slot as i64],|r|r.get(0)).optional().map_err(read_error)?
             } else {
                 None
             };
             let response = match cached {
-                Some(bytes) => Ok(bytes),
+                Some(bytes) => {
+                    metrics.cached_blocks += 1;
+                    Ok(bytes)
+                }
                 None => {
                     metrics.source_attempts += 1;
                     source.block(slot)
@@ -382,8 +403,15 @@ impl History {
                 self.db.execute("INSERT INTO historical_inputs VALUES (?1,?2,?3,?4,'finalized-mainnet-rpc',?5,?6)",params![mint,decoder::DECODER_VERSION,slot as i64,(current.attempts+1) as i64,now() as i64,raw]).map_err(write_error)?;
             }
             let failures_before = metrics.decode_failures;
-            let outcome =
-                process_block(&raw, slot, &mut store, &mut metrics, &cancelled, &self.gate);
+            let outcome = process_block(
+                &raw,
+                slot,
+                &mut store,
+                &mut metrics,
+                &cancelled,
+                &self.gate,
+                self.revision_repair,
+            );
             match outcome {
                 Ok((parent, time)) => {
                     // A finalized child links directly to its parent; intermediate slots are skipped.
@@ -443,6 +471,7 @@ fn process_block(
     metrics: &mut Metrics,
     cancelled: &impl Fn() -> bool,
     gate: &crate::coordinator::WriteGate,
+    revision_repair: bool,
 ) -> Result<(u64, Option<i64>)> {
     let value: Value = serde_json::from_slice(raw).map_err(|_| Error("invalid_block_json"))?;
     if value["jsonrpc"] != "2.0" || value["id"] != 1 || value.get("error").is_some() {
@@ -504,9 +533,22 @@ fn process_block(
             return Err(Error("duplicate_block_transaction"));
         }
         let decoded = decoder::decode(&parsed);
-        if decoded.is_ok() {
+        if decoded.is_ok() || revision_repair {
             let _permit = gate.historical()?;
-            store.persist(&parsed, &bytes, &decoded)?;
+            match store.persist(&parsed, &bytes, &decoded) {
+                Err(e) if revision_repair && e.0 == "decoder_revision_conflict" => {}
+                result => {
+                    result?;
+                }
+            }
+            if revision_repair {
+                let corrected = store.correct(&parsed.result.transaction.signatures[0])?;
+                if let Some(error) = corrected.error {
+                    metrics.decode_failures += 1;
+                    failure = Some(error);
+                    continue;
+                }
+            }
         }
         match decoded {
             Ok(transfers) => {

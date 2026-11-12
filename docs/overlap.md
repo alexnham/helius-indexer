@@ -61,8 +61,8 @@ partway through compatibility checking cannot partially enrich the record set.
 
 A previously undecodable capture may become decodable within the same decoder
 revision when compatible execution metadata arrives. This does not implement
-revision corrections, replacement/removal of erroneous transfers, or revision
-migration; those remain ticket #8. Existing captures from an older decoder remain
+automatic revision changes. Deliberate replacement/removal of prior output is
+available through [offline decoder repair](decoder-repair.md). Existing captures from an older decoder remain
 readable, but new ingestion rejects their revision until deliberately reprocessed.
 
 SQLite primary keys enforce immediate uniqueness. A write transaction acquires

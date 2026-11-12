@@ -103,7 +103,9 @@ historical block time. Compatible RPC observations now coalesce and can enrich t
 contradictory known identity or effect values remain quarantined conflicts.
 See [overlap validation](overlap.md) for exact compatibility and scope. Raw source
 inputs remain available. This does not establish full live-window coverage or
-implement decoder revision corrections.
+automatically change decoder revisions. Explicit
+[offline decoder repair](decoder-repair.md) replaces retained capture outputs;
+raw protobuf acknowledgments are retried separately.
 
 Both sources persist the same full supported transaction record set, including
 related mints; the USDC subscription selects candidates and query filters select

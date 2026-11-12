@@ -195,3 +195,11 @@ coverage is scoped to the requested finite range, while the stream tail remains
 unverified. See [overlap validation](docs/overlap.md) for measured evidence, storage
 semantics, and the bounded credentialed check with its remaining coverage gaps. This does not select
 a production architecture or establish production capacity.
+
+Explicit offline decoder revision repair now replaces each transaction's complete
+output atomically, with retained inputs, original pending age, and revision-scoped
+diagnostics. Failed corrections preserve but hide stale prior rows. Range repair
+is incremental, and historical completion requires full-block re-verification;
+retained-block replay can recover candidates rejected by an earlier revision
+without fetching the same history again. See [decoder repair](docs/decoder-repair.md)
+for compatibility, backup/rollback requirements, and validation limits.

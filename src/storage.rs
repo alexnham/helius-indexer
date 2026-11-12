@@ -1,3 +1,4 @@
+pub(crate) mod repair;
 use crate::{
     Error, Result,
     decoder::DECODER_VERSION,
@@ -29,7 +30,12 @@ impl Store {
             CREATE TABLE IF NOT EXISTS capture_inputs (
                 signature TEXT NOT NULL, source TEXT NOT NULL, result_json TEXT NOT NULL,
                 capture_json BLOB NOT NULL, status TEXT NOT NULL,
-                PRIMARY KEY(signature,source,result_json));",
+                PRIMARY KEY(signature,source,result_json));
+            CREATE TABLE IF NOT EXISTS decoder_repairs (
+                signature TEXT NOT NULL, target_decoder TEXT NOT NULL, slot INTEGER NOT NULL,
+                previous_decoder TEXT NOT NULL, status TEXT NOT NULL, error_class TEXT,
+                attempts INTEGER NOT NULL, first_pending INTEGER NOT NULL,
+                PRIMARY KEY(signature,target_decoder));",
         )
         .map_err(|_| Error("storage_configuration_failed"))?;
         Ok(Self(db))
@@ -223,16 +229,25 @@ impl Store {
         let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
             .map_err(|_| Error("storage_open_failed"))?;
         let mut statement = db
-            .prepare("SELECT record_json FROM transfers WHERE mint=?1")
+            .prepare(&format!(
+                "SELECT record_json FROM transfers WHERE mint=?1 {}",
+                repair_filter(&db, "?2")?
+            ))
             .map_err(|_| Error("storage_read_failed"))?;
         let rows = statement
-            .query_map([mint], |r| r.get::<_, String>(0))
+            .query_map(params![mint, DECODER_VERSION], |r| r.get::<_, String>(0))
             .map_err(|_| Error("storage_read_failed"))?;
         let (mut count, mut volume, mut fees, mut unknown_fees) = (0u64, 0u128, 0u128, 0u64);
+        let mut other_decoder_transfers = 0u64;
         for row in rows {
             let transfer: Transfer =
                 serde_json::from_str(&row.map_err(|_| Error("storage_read_failed"))?)
                     .map_err(|_| Error("stored_record_invalid"))?;
+            if transfer.decoder_version != DECODER_VERSION {
+                other_decoder_transfers = other_decoder_transfers
+                    .checked_add(1)
+                    .ok_or(Error("aggregate_overflow"))?;
+            }
             count = count.checked_add(1).ok_or(Error("aggregate_overflow"))?;
             volume = volume
                 .checked_add(u128::from(transfer.amount_raw))
@@ -248,7 +263,7 @@ impl Store {
             }
         }
         Ok(
-            serde_json::json!({"mint":mint,"transfer_count":count,"known_volume_raw":volume.to_string(),"known_fees_raw":fees.to_string(),"unknown_fee_count":unknown_fees,"coverage":"unknown","window":"all_stored"}),
+            serde_json::json!({"mint":mint,"transfer_count":count,"target_decoder":DECODER_VERSION,"other_decoder_transfer_count":other_decoder_transfers,"known_volume_raw":volume.to_string(),"known_fees_raw":fees.to_string(),"unknown_fee_count":unknown_fees,"coverage":"unknown","window":"all_stored"}),
         )
     }
 
@@ -259,14 +274,17 @@ impl Store {
         let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
             .map_err(|_| Error("storage_open_failed"))?;
         let mut stmt = db
-            .prepare(
+            .prepare(&format!(
                 "SELECT record_json FROM transfers
-            WHERE (?1 IS NULL OR mint=?1)
+            WHERE (?1 IS NULL OR mint=?1) {}
             ORDER BY slot, signature, outer_index, inner_index LIMIT ?2",
-            )
+                repair_filter(&db, "?3")?
+            ))
             .map_err(|_| Error("storage_read_failed"))?;
         let rows = stmt
-            .query_map(params![mint, limit as i64], |r| r.get::<_, String>(0))
+            .query_map(params![mint, limit as i64, DECODER_VERSION], |r| {
+                r.get::<_, String>(0)
+            })
             .map_err(|_| Error("storage_read_failed"))?;
         rows.map(|row| {
             let text = row.map_err(|_| Error("storage_read_failed"))?;
@@ -274,4 +292,22 @@ impl Store {
         })
         .collect()
     }
+}
+
+// Older read-only databases need no migration just to inspect their existing records.
+fn repair_filter(db: &Connection, parameter: &str) -> Result<String> {
+    let exists: bool = db
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='decoder_repairs')",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(|_| Error("storage_read_failed"))?;
+    Ok(if exists {
+        format!(
+            "AND {parameter} IS NOT NULL AND NOT EXISTS(SELECT 1 FROM decoder_repairs r WHERE r.signature=transfers.signature AND r.status='unresolved')"
+        )
+    } else {
+        format!("AND {parameter} IS NOT NULL")
+    })
 }

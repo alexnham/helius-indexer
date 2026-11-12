@@ -157,3 +157,22 @@ progress or verified coverage. Input age is preserved through retries. Invalid
 stored payload/schema can terminate a batch; the command error and retained
 unresolved input remain visible. See [recovery](recovery.md) for tested boundaries
 and remaining monitoring gaps.
+
+### Decoder revision repair
+
+`repair-status` separates target revision, retained capture scope, remaining
+other-revision captures, corrected/unresolved counts, original unresolved time/age,
+and up to 16 failure-class counts. Capture batch reports expose attempts,
+corrected/unresolved outcomes, replaced/written rows, cancellation, and run ID.
+`decoder_correction` and `decoder_repair_batch_finished` events use source
+`retained_capture`, mode `repair`, bounded classes, and run correlation. Offline
+block re-verification uses source `retained_block` and shared run correlation.
+`indexer_historical_cached_blocks_total` counts reused blocks separately from
+source requests. No per-signature metric labels are introduced.
+
+`repair_complete` never means verified full-slot coverage. Failed corrections hide
+prior output from normal reads while preserving it physically. Summary fields
+`target_decoder` and `other_decoder_transfer_count` expose mixed-revision visible
+output during a partial repair. Current-revision historical completion is
+invalidated by correction and must be reverified from complete retained blocks.
+See [decoder repair](decoder-repair.md) for commands and limits.

@@ -4,6 +4,7 @@ pub mod decoder;
 pub mod live;
 pub mod model;
 mod reconcile;
+pub mod repair;
 pub mod storage;
 pub mod telemetry;
 

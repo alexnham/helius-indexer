@@ -66,6 +66,9 @@ as known. Execution-evidence and unknown-instruction failures remain explicit.
 
 Fee support itself does not change storage schema; the overlap slice adds source
 auditing separately. The decoder revision intentionally conflicts with
-previously ingested same-signature captures: use a fresh offline database and
-reingest retained files. Automated revision replacement is pending #8. Existing
-JSON records remain readable. No production migration is implied.
+previously ingested same-signature captures during ordinary ingestion. Use
+[explicit offline revision repair](decoder-repair.md) to replace prior output
+from retained captures and reverify retained historical blocks, or use a fresh
+validation database. Unknown fees remain null. Existing records remain readable;
+in-place repair requires a backup for exact rollback. No production migration
+is implied.

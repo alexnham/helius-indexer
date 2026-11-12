@@ -54,3 +54,14 @@ A separate SQLite comparison matched both previously captured transfer records
 exactly. This is a functional check with a correlated public RPC source, not an
 independent completeness reconciliation, throughput benchmark, historical-depth
 or bridge guarantee. No paid provider or full backfill was used.
+
+## Retained-block re-verification (2026-11-12)
+
+Historical retries can reuse full retained RPC responses across decoder revisions.
+The explicit `repair-history` command enables revision correction while replaying
+those blocks with no network fallback. It imports newly supported candidates,
+uses compatible audited execution metadata, and verifies slot completion only
+when the full block succeeds. Missing retained blocks stay unknown. Reports
+separate cached blocks from source attempts. See [revision repair](decoder-repair.md)
+and its [measured validation](validation/2026-11-12-revision-repair.md); this does not
+implement the Old Faithful/Jetstreamer archive bridge tracked in #17.

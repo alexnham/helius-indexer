@@ -1,5 +1,8 @@
 # Decoder v4 coverage validation — 2026-11-12
 
+These results precede the explicit in-place repair commands. See the
+[subsequent revision-repair validation](2026-11-12-revision-repair.md).
+
 Revision v3 rejected an entire transaction when an ordinary Token-2022 checked
 transfer lacked historical fee configuration. That suppressed unrelated classic
 SPL transfers even though their instructed amounts and zero fees were known.
