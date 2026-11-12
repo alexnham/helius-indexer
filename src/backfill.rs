@@ -30,6 +30,7 @@ pub struct RpcSource {
     endpoint: String,
     agent: ureq::Agent,
     verified: bool,
+    deadline: Option<Instant>,
 }
 impl RpcSource {
     pub fn new(endpoint: String) -> Result<Self> {
@@ -46,12 +47,33 @@ impl RpcSource {
             endpoint,
             agent,
             verified: false,
+            deadline: None,
         })
+    }
+    #[cfg(feature = "archive")]
+    pub(crate) fn bounded(endpoint: String, deadline: Instant) -> Result<Self> {
+        let mut source = Self::new(endpoint)?;
+        source.deadline = Some(deadline);
+        Ok(source)
+    }
+    fn request_timeout(&self) -> Result<Duration> {
+        let timeout = self
+            .deadline
+            .map(|t| t.saturating_duration_since(Instant::now()))
+            .unwrap_or(Duration::from_secs(20))
+            .min(Duration::from_secs(20));
+        if timeout.is_zero() {
+            return Err(Error("rpc_time_limit"));
+        }
+        Ok(timeout)
     }
     fn verify_mainnet(&mut self) -> Result<()> {
         let mut response = self
             .agent
             .post(&self.endpoint)
+            .config()
+            .timeout_global(Some(self.request_timeout()?))
+            .build()
             .send_json(json!({"jsonrpc":"2.0","id":1,"method":"getGenesisHash"}))
             .map_err(|_| Error("rpc_request_failed"))?;
         let mut bytes = Vec::new();
@@ -82,6 +104,9 @@ impl RpcSource {
             let mut response = self
                 .agent
                 .post(&self.endpoint)
+                .config()
+                .timeout_global(Some(self.request_timeout()?))
+                .build()
                 .send_json(json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}))
                 .map_err(|_| Error("rpc_request_failed"))?;
             let mut raw = Vec::new();
@@ -120,6 +145,9 @@ impl BlockSource for RpcSource {
         let mut response = self
             .agent
             .post(&self.endpoint)
+            .config()
+            .timeout_global(Some(self.request_timeout()?))
+            .build()
             .send_json(json!({
                 "jsonrpc":"2.0","id":1,"method":"getBlock","params":[slot,{
                     "commitment":"finalized","encoding":"json","transactionDetails":"full",
@@ -302,6 +330,28 @@ impl History {
         self.db.execute("UPDATE historical_slots SET status='unknown',error_class='source_overlap_reverification' WHERE mint=?1 AND decoder=?2 AND slot BETWEEN ?3 AND ?4",params![mint,decoder::DECODER_VERSION,start as i64,end as i64]).map_err(write_error)?;
         Ok(())
     }
+    /// Reuse verified finalized parent links across adjacent source batches.
+    #[cfg(feature = "archive")]
+    pub(crate) fn verify_parent_gaps(&self, mint: &str, start: u64, end: u64) -> Result<()> {
+        scope(mint, start, end)?;
+        for skipped in start..=end {
+            let proven:bool=self.db.query_row("SELECT EXISTS(SELECT 1 FROM historical_slots h JOIN historical_block_identity b USING(slot) WHERE h.mint=?1 AND h.decoder=?2 AND h.status='complete' AND h.slot>?3 AND b.parent_slot<?3)",params![mint,decoder::DECODER_VERSION,skipped as i64],|r|r.get(0)).map_err(read_error)?;
+            if !proven {
+                continue;
+            }
+            let observed:bool=self.db.query_row("SELECT EXISTS(SELECT 1 FROM historical_inputs WHERE slot=?1 AND CASE WHEN json_valid(CAST(response AS TEXT)) THEN json_type(CAST(response AS TEXT),'$.result')='object' ELSE 0 END)",[skipped as i64],|r|r.get(0)).map_err(read_error)?;
+            if !observed {
+                self.status(mint, skipped, "skipped", None, None)?;
+            }
+        }
+        Ok(())
+    }
+    #[cfg(feature = "archive")]
+    pub(crate) fn acknowledge_bridge_overlap(&self, mint: &str, slot: u64) -> Result<()> {
+        let _permit = self.gate.historical()?;
+        self.db.execute("INSERT INTO bridge_overlap_proofs SELECT mint,decoder,slot,attempts FROM historical_slots WHERE mint=?1 AND decoder=?2 AND slot=?3 AND status='complete' ON CONFLICT(mint,decoder,slot) DO UPDATE SET verified_attempt=excluded.verified_attempt",params![mint,decoder::DECODER_VERSION,slot as i64]).map_err(write_error)?;
+        Ok(())
+    }
     pub fn set_gate(&mut self, gate: std::sync::Arc<crate::coordinator::WriteGate>) {
         self.gate = gate;
     }
@@ -413,7 +463,7 @@ impl History {
             }
             let current = self.coverage(mint, slot, slot)?.slots.remove(0);
             let source_done:bool=self.db.query_row("SELECT EXISTS(SELECT 1 FROM historical_source_slots WHERE mint=?1 AND decoder=?2 AND slot=?3 AND source_kind=?4 AND status IN ('complete','skipped'))",params![mint,decoder::DECODER_VERSION,slot as i64,self.active_source],|r|r.get(0)).map_err(read_error)?;
-            if (current.status == "complete" || current.status == "skipped") && source_done {
+            if current.status == "skipped" || (current.status == "complete" && source_done) {
                 continue;
             }
             if current.attempts > 0 {
@@ -540,7 +590,12 @@ impl History {
                     if error.0 == "rpc_block_unavailable" {
                         metrics.source_errors += 1;
                     } else if error.0.starts_with("storage_")
-                        || matches!(error.0, "capture_conflict" | "block_identity_conflict")
+                        || matches!(
+                            error.0,
+                            "capture_conflict"
+                                | "block_identity_conflict"
+                                | "block_parent_conflict"
+                        )
                     {
                         metrics.write_errors += 1;
                     } else if error.0 != "cancelled" && metrics.decode_failures == failures_before {

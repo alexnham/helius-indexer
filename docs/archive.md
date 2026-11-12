@@ -139,3 +139,8 @@ input was 2,936,990 bytes including the added provenance receipt. Neither local
 retained data nor credentials are included in the repository. Reproduction of a
 live probe depends on the mirror/RPC availability and metadata returned at that
 time; offline captured tests remain deterministic.
+
+The [source-boundary coordinator](source-boundary.md) now supplies a frozen
+measured plan, source routing, durable retry scheduling and unfinished-interval
+reporting. Its newer bounded mainnet check intentionally retains unsupported
+boundary decoding as incomplete. Continuous operation remains unvalidated.

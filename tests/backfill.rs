@@ -34,7 +34,7 @@ fn block(slot: u64, parent: u64, transactions: Vec<Value>) -> Vec<u8> {
         tx.as_object_mut().unwrap().remove("slot");
         tx.as_object_mut().unwrap().remove("blockTime");
     }
-    serde_json::to_vec(&json!({"jsonrpc":"2.0","id":1,"result":{"blockhash":bs58::encode([7;32]).into_string(),"previousBlockhash":bs58::encode([6;32]).into_string(),"parentSlot":parent,"blockTime":fixture()["result"]["blockTime"],"transactions":txs,"test_slot":slot}})).unwrap()
+    serde_json::to_vec(&json!({"jsonrpc":"2.0","id":1,"result":{"blockhash":bs58::encode([7;32]).into_string(),"previousBlockhash":bs58::encode([7;32]).into_string(),"parentSlot":parent,"blockTime":fixture()["result"]["blockTime"],"transactions":txs,"test_slot":slot}})).unwrap()
 }
 fn source(blocks: Vec<(u64, Vec<u8>)>) -> Source {
     Source {

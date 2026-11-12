@@ -157,7 +157,7 @@ fn block(value: &Value, parent: u64, empty: bool) -> Source {
     tx.as_object_mut().unwrap().remove("slot");
     tx.as_object_mut().unwrap().remove("blockTime");
     Source(serde_json::to_vec(&json!({"jsonrpc":"2.0","id":1,"result":{
-        "blockhash":bs58::encode([7;32]).into_string(),"previousBlockhash":bs58::encode([6;32]).into_string(),"parentSlot":parent,
+        "blockhash":bs58::encode([7;32]).into_string(),"previousBlockhash":bs58::encode([7;32]).into_string(),"parentSlot":parent,
         "blockTime":value["result"]["blockTime"],"transactions":if empty{vec![]}else{vec![tx]}}})).unwrap())
 }
 #[test]
