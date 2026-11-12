@@ -15,7 +15,7 @@ use std::{
     time::Instant,
 };
 
-const USAGE: &str = "usage: helius-indexer ingest DB CAPTURE [--metrics FILE] | query DB [MINT] | backfill DB MINT START END [--metrics FILE] | coverage DB MINT START END | live DB FROM_SLOT SECONDS | live-status DB | live-retry DB | summary DB MINT | overlap DB START END SECONDS | repair DB START END | repair-status DB START END | repair-history DB MINT START END";
+const USAGE: &str = "usage: helius-indexer ingest DB CAPTURE [--metrics FILE] | query DB [MINT] | backfill DB MINT START END [--metrics FILE] | coverage DB MINT START END | live DB FROM_SLOT SECONDS | live-status DB | live-retry DB | summary DB MINT | overlap DB START END SECONDS | repair DB START END | repair-status DB START END | repair-history DB MINT START END | [feature archive] archive/archive-replay/archive-overlap DB CACHE MINT START END | archive-tip CACHE | archive-live DB CACHE START END SECONDS";
 
 fn ingest(db: &str, input: &str, telemetry: &mut Telemetry) -> Result<serde_json::Value> {
     let started = Instant::now();
@@ -70,6 +70,51 @@ fn ingest(db: &str, input: &str, telemetry: &mut Telemetry) -> Result<serde_json
 
 fn run(args: &[String], telemetry: &mut Telemetry) -> Result<serde_json::Value> {
     match args {
+        #[cfg(feature = "archive")]
+        [command, cache] if command == "archive-tip" => {
+            helius_indexer::archive::tip(Path::new(cache), telemetry)
+        }
+        #[cfg(feature = "archive")]
+        [command, db, cache, mint, start, end]
+            if matches!(
+                command.as_str(),
+                "archive" | "archive-replay" | "archive-overlap"
+            ) =>
+        {
+            let start = start.parse().map_err(|_| Error("invalid_archive_range"))?;
+            let end = end.parse().map_err(|_| Error("invalid_archive_range"))?;
+            if command == "archive-overlap" {
+                helius_indexer::archive::overlap(
+                    Path::new(db),
+                    Path::new(cache),
+                    mint,
+                    start,
+                    end,
+                    telemetry,
+                )
+            } else {
+                helius_indexer::archive::run(
+                    Path::new(db),
+                    Path::new(cache),
+                    mint,
+                    start,
+                    end,
+                    command == "archive",
+                    telemetry,
+                )
+            }
+        }
+        #[cfg(feature = "archive")]
+        [command, db, cache, start, end, seconds] if command == "archive-live" => {
+            helius_indexer::archive::live(
+                Path::new(db),
+                Path::new(cache),
+                start.parse().map_err(|_| Error("invalid_archive_range"))?,
+                end.parse().map_err(|_| Error("invalid_archive_range"))?,
+                seconds.parse().map_err(|_| Error("invalid_live_bounds"))?,
+                telemetry,
+            )
+        }
         [command, db, mint, start, end] if command == "repair-history" => {
             let start = start.parse().map_err(|_| Error("invalid_repair_range"))?;
             let end = end.parse().map_err(|_| Error("invalid_repair_range"))?;

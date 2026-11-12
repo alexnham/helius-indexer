@@ -4,7 +4,16 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
 
+[features]
+archive = ["dep:jetstreamer-firehose", "dep:zstd", "dep:serde_cbor", "dep:solana-message", "dep:wincode"]
+
 [dependencies]
+jetstreamer-firehose = { git = "https://github.com/vaultic-win/jetstreamer", rev = "8f91a4a7c918674f8799a9c887ace0f7f39fb844", default-features = false, optional = true }
+serde_cbor = { version = "0.11", optional = true }
+solana-message = { version = "5", features = ["serde", "wincode"], optional = true }
+wincode = { version = "0.6", optional = true }
+sha2 = "0.10"
+zstd = { version = "0.13", optional = true }
 bs58 = "0.5.1"
 futures-util = "0.3"
 laserstream-core-proto = { version = "=14.0.0", default-features = false, features = ["tonic"] }

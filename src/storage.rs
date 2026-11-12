@@ -311,3 +311,155 @@ fn repair_filter(db: &Connection, parameter: &str) -> Result<String> {
         format!("AND {parameter} IS NOT NULL")
     })
 }
+
+impl Store {
+    pub(crate) fn observe_block_identity(
+        &mut self,
+        slot: u64,
+        block: &serde_json::Value,
+        transactions: &[serde_json::Value],
+    ) -> Result<()> {
+        self.0
+            .execute_batch("SAVEPOINT block_identity_observation")
+            .map_err(|_| Error("storage_write_failed"))?;
+        let result = self.observe_block_identity_scan(slot, block, transactions);
+        if result.is_ok() {
+            self.0
+                .execute_batch("RELEASE block_identity_observation")
+                .map_err(|_| Error("storage_commit_failed"))?;
+        } else {
+            self.0
+                .execute_batch(
+                    "ROLLBACK TO block_identity_observation; RELEASE block_identity_observation",
+                )
+                .map_err(|_| Error("storage_write_failed"))?;
+        }
+        result
+    }
+    fn observe_block_identity_scan(
+        &mut self,
+        slot: u64,
+        block: &serde_json::Value,
+        transactions: &[serde_json::Value],
+    ) -> Result<()> {
+        let known: bool = self
+            .0
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM historical_block_identity WHERE slot=?1)",
+                [slot as i64],
+                |r| r.get(0),
+            )
+            .map_err(|_| Error("storage_read_failed"))?;
+        if !known {
+            let mut total = 0;
+            for index in 0..33 {
+                let raw:Option<Option<Vec<u8>>>=self.0.query_row("SELECT CASE WHEN length(response)<=67108864 THEN response END FROM historical_inputs WHERE slot=?1 ORDER BY received_at,attempt LIMIT 1 OFFSET ?2",params![slot as i64,index],|r|r.get(0)).optional().map_err(|_|Error("storage_read_failed"))?;
+                let Some(raw) = raw else {
+                    break;
+                };
+                let raw = raw.ok_or(Error("block_identity_observation_limit"))?;
+                total += raw.len();
+                if index == 32
+                    || total > 128 * 1024 * 1024
+                    || raw.len() > crate::backfill::MAX_BLOCK_BYTES
+                {
+                    return Err(Error("block_identity_observation_limit"));
+                }
+                let Ok(value) = serde_json::from_slice::<serde_json::Value>(&raw) else {
+                    continue;
+                };
+                if value["jsonrpc"] != "2.0" || value["id"] != 1 || value.get("error").is_some() {
+                    continue;
+                }
+                let prior = &value["result"];
+                let Some(txs) = prior["transactions"].as_array() else {
+                    continue;
+                };
+                if txs.len() > 100_000
+                    || !prior["parentSlot"].as_u64().is_some_and(|p| p < slot)
+                    || !prior
+                        .get("blockTime")
+                        .is_some_and(|v| v.is_null() || v.is_i64())
+                {
+                    continue;
+                }
+                if ["blockhash", "previousBlockhash"].iter().any(|field| {
+                    prior[*field].as_str().is_none_or(|s| {
+                        s.len() > 44 || bs58::decode(s).into_vec().map_or(true, |b| b.len() != 32)
+                    })
+                }) {
+                    continue;
+                }
+                self.observe_block_identity_inner(slot, prior, txs)?;
+            }
+        }
+        self.observe_block_identity_inner(slot, block, transactions)
+    }
+    fn observe_block_identity_inner(
+        &mut self,
+        slot: u64,
+        block: &serde_json::Value,
+        transactions: &[serde_json::Value],
+    ) -> Result<()> {
+        use sha2::{Digest, Sha256};
+        let mut ids = Vec::with_capacity(transactions.len());
+        let mut seen = std::collections::HashSet::new();
+        for tx in transactions {
+            let signatures = tx["transaction"]["signatures"]
+                .as_array()
+                .filter(|s| !s.is_empty())
+                .ok_or(Error("missing_signature"))?;
+            for signature in signatures {
+                let signature = signature
+                    .as_str()
+                    .filter(|s| s.len() <= 100)
+                    .ok_or(Error("invalid_base58_identifier"))?;
+                if bs58::decode(signature)
+                    .into_vec()
+                    .map_or(true, |s| s.len() != 64)
+                {
+                    return Err(Error("invalid_base58_identifier"));
+                }
+            }
+            if !seen.insert(&signatures[0]) {
+                return Err(Error("duplicate_block_transaction"));
+            }
+            ids.push(signatures);
+        }
+        let digest =
+            Sha256::digest(serde_json::to_vec(&ids).map_err(|_| Error("serialization_failed"))?)
+                .to_vec();
+        let hash = block["blockhash"]
+            .as_str()
+            .ok_or(Error("invalid_block_hash"))?;
+        let previous = block["previousBlockhash"]
+            .as_str()
+            .ok_or(Error("invalid_block_hash"))?;
+        let parent = block["parentSlot"]
+            .as_i64()
+            .ok_or(Error("missing_block_parent"))?;
+        let time = block["blockTime"].as_i64();
+        let transaction = &self.0;
+        type StoredBlockIdentity = (String, i64, String, Vec<u8>, Option<i64>);
+        let prior:Option<StoredBlockIdentity>=transaction.query_row("SELECT blockhash,parent_slot,previous_blockhash,transaction_ids_hash,block_time FROM historical_block_identity WHERE slot=?1",[slot as i64],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional().map_err(|_|Error("storage_read_failed"))?;
+        if let Some((old_hash, old_parent, old_previous, old_ids, old_time)) = prior {
+            if old_hash != hash
+                || old_parent != parent
+                || old_previous != previous
+                || old_ids != digest
+                || matches!((old_time,time),(Some(a),Some(b)) if a!=b)
+            {
+                return Err(Error("block_identity_conflict"));
+            }
+            transaction.execute("UPDATE historical_block_identity SET block_time=COALESCE(block_time,?2) WHERE slot=?1",params![slot as i64,time]).map_err(|_|Error("storage_write_failed"))?;
+        } else {
+            transaction
+                .execute(
+                    "INSERT INTO historical_block_identity VALUES(?1,?2,?3,?4,?5,?6)",
+                    params![slot as i64, hash, parent, previous, digest, time],
+                )
+                .map_err(|_| Error("storage_write_failed"))?;
+        }
+        Ok(())
+    }
+}

@@ -5,6 +5,12 @@ Verified 2026-11-11 (America/Toronto). This slice selects bounded finalized JSON
 
 ## Archive findings
 
+Update 2026-11-12: the [maintained optional adapter](archive.md) now reads bounded
+mainnet CAR ranges and measures archive freshness. The findings below describe
+the earlier RPC selection; the newer validation note supersedes its untested
+archive compatibility and no-download statements.
+
+
 [Old Faithful's introduction](https://docs.old-faithful.net/) describes CAR
 snapshots produced at epoch end, a genesis archive through the previous epoch,
 and expected publication 10–20 hours after epoch end. That is a documented

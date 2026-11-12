@@ -14,6 +14,15 @@ pub const MAX_BLOCK_BYTES: usize = 64 * 1024 * 1024;
 
 /// Implementations must request full, finalized mainnet blocks; errors are never skip evidence.
 pub trait BlockSource {
+    fn provenance(&self) -> &'static str {
+        "finalized-mainnet-rpc"
+    }
+    fn diagnostics(&self) -> Value {
+        Value::Null
+    }
+    fn capture_source(&self) -> &'static str {
+        "solana-mainnet-rpc"
+    }
     fn block(&mut self, slot: u64) -> Result<Vec<u8>>;
 }
 
@@ -64,6 +73,43 @@ impl RpcSource {
         }
         self.verified = true;
         Ok(())
+    }
+}
+impl RpcSource {
+    pub fn finalized_reference(&mut self) -> Result<(u64, Option<i64>)> {
+        self.verify_mainnet()?;
+        let request = |method: &str, params: Value| -> Result<Value> {
+            let mut response = self
+                .agent
+                .post(&self.endpoint)
+                .send_json(json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}))
+                .map_err(|_| Error("rpc_request_failed"))?;
+            let mut raw = Vec::new();
+            response
+                .body_mut()
+                .as_reader()
+                .take(4097)
+                .read_to_end(&mut raw)
+                .map_err(|_| Error("rpc_read_failed"))?;
+            if raw.len() > 4096 {
+                return Err(Error("invalid_rpc_response"));
+            }
+            let value: Value =
+                serde_json::from_slice(&raw).map_err(|_| Error("invalid_rpc_response"))?;
+            if value["id"] != 1 || value["jsonrpc"] != "2.0" || value.get("error").is_some() {
+                return Err(Error("invalid_rpc_response"));
+            }
+            Ok(value["result"].clone())
+        };
+        let slot = request("getSlot", json!([{"commitment":"finalized"}]))?
+            .as_u64()
+            .filter(|n| *n <= i64::MAX as u64)
+            .ok_or(Error("invalid_rpc_reference"))?;
+        let time = request("getBlockTime", json!([slot]))?;
+        if !time.is_null() && !time.is_i64() {
+            return Err(Error("invalid_rpc_reference"));
+        }
+        Ok((slot, time.as_i64()))
     }
 }
 impl BlockSource for RpcSource {
@@ -117,6 +163,8 @@ pub struct Coverage {
 #[derive(Debug, Default, Serialize)]
 pub struct Metrics {
     pub input_bytes: u64,
+    pub archive_input: bool,
+    pub source_diagnostics: Value,
     pub source_attempts: u64,
     pub cached_blocks: u64,
     pub source_errors: u64,
@@ -163,6 +211,9 @@ impl Metrics {
             prior_pending = pending;
         }
         output.push_str(&format!("indexer_missing_ranges{{mode=\"historical\"}} {missing_ranges}\nindexer_stage_duration_seconds_sum{{operation=\"historical_range\"}} {}\nindexer_stage_duration_seconds_count{{operation=\"historical_range\"}} 1\nindexer_stage_duration_seconds_bucket{{operation=\"historical_range\",le=\"+Inf\"}} 1\n",self.elapsed_seconds));
+        if self.archive_input {
+            output = output.replace("source_kind=\"rpc\"", "source_kind=\"archive\"");
+        }
         output
     }
 }
@@ -172,6 +223,7 @@ pub struct History {
     path: PathBuf,
     telemetry: crate::telemetry::Telemetry,
     revision_repair: bool,
+    active_source: &'static str,
     gate: std::sync::Arc<crate::coordinator::WriteGate>,
 }
 fn now() -> u64 {
@@ -217,7 +269,13 @@ impl History {
             CREATE TABLE IF NOT EXISTS historical_inputs (
                 mint TEXT NOT NULL, decoder TEXT NOT NULL, slot INTEGER NOT NULL,
                 attempt INTEGER NOT NULL, source_kind TEXT NOT NULL, received_at INTEGER NOT NULL,
-                response BLOB NOT NULL, PRIMARY KEY(mint,decoder,slot,attempt));",
+                response BLOB NOT NULL, PRIMARY KEY(mint,decoder,slot,attempt));
+            CREATE TABLE IF NOT EXISTS historical_source_slots (
+                mint TEXT NOT NULL,decoder TEXT NOT NULL,slot INTEGER NOT NULL,source_kind TEXT NOT NULL,status TEXT NOT NULL,
+                PRIMARY KEY(mint,decoder,slot,source_kind));
+            CREATE TABLE IF NOT EXISTS historical_block_identity (
+                slot INTEGER PRIMARY KEY,blockhash TEXT NOT NULL,parent_slot INTEGER NOT NULL,previous_blockhash TEXT NOT NULL,
+                transaction_ids_hash BLOB NOT NULL,block_time INTEGER);",
         )
         .map_err(write_error)?;
         let mut telemetry = crate::telemetry::Telemetry::default();
@@ -225,6 +283,7 @@ impl History {
         Ok(Self {
             db,
             revision_repair: false,
+            active_source: "finalized-mainnet-rpc",
             path: path.to_path_buf(),
             telemetry,
             gate: std::sync::Arc::new(crate::coordinator::WriteGate::default()),
@@ -235,6 +294,13 @@ impl History {
         self.telemetry.run_id = run_id;
         self.telemetry
             .set_context("decoder_repair", "retained_block", "repair");
+    }
+    #[cfg(feature = "archive")]
+    pub(crate) fn reverify(&mut self, mint: &str, start: u64, end: u64) -> Result<()> {
+        scope(mint, start, end)?;
+        let _permit = self.gate.historical()?;
+        self.db.execute("UPDATE historical_slots SET status='unknown',error_class='source_overlap_reverification' WHERE mint=?1 AND decoder=?2 AND slot BETWEEN ?3 AND ?4",params![mint,decoder::DECODER_VERSION,start as i64,end as i64]).map_err(write_error)?;
+        Ok(())
     }
     pub fn set_gate(&mut self, gate: std::sync::Arc<crate::coordinator::WriteGate>) {
         self.gate = gate;
@@ -303,7 +369,10 @@ impl History {
         time: Option<i64>,
     ) -> Result<()> {
         let _permit = self.gate.historical()?;
-        self.db.execute("UPDATE historical_slots SET status=?1,error_class=?2,block_time=?3 WHERE mint=?4 AND decoder=?5 AND slot=?6",params![status,error,time,mint,decoder::DECODER_VERSION,slot as i64]).map_err(write_error)?;
+        let transaction = self.db.unchecked_transaction().map_err(write_error)?;
+        transaction.execute("UPDATE historical_slots SET status=?1,error_class=?2,block_time=?3 WHERE mint=?4 AND decoder=?5 AND slot=?6",params![status,error,time,mint,decoder::DECODER_VERSION,slot as i64]).map_err(write_error)?;
+        transaction.execute("INSERT INTO historical_source_slots VALUES(?1,?2,?3,?4,?5) ON CONFLICT(mint,decoder,slot,source_kind) DO UPDATE SET status=excluded.status",params![mint,decoder::DECODER_VERSION,slot as i64,self.active_source,status]).map_err(write_error)?;
+        transaction.commit().map_err(write_error)?;
         Ok(())
     }
     /// Single worker, no queue. Cancellation checked between slots and transaction writes.
@@ -317,12 +386,22 @@ impl History {
         cancelled: impl Fn() -> bool,
     ) -> Result<(Coverage, Metrics)> {
         scope(mint, start, end)?;
+        self.active_source = source.provenance();
         for slot in start..=end {
             let _permit = self.gate.historical()?;
             self.db.execute("INSERT OR IGNORE INTO historical_slots(mint,decoder,slot,status,first_pending) VALUES (?1,?2,?3,'unknown',?4)",params![mint,decoder::DECODER_VERSION,slot as i64,now() as i64]).map_err(write_error)?;
         }
         let started = Instant::now();
-        let mut metrics = Metrics::default();
+        let mut metrics = Metrics {
+            archive_input: source.capture_source() == "old-faithful-jetstreamer",
+            ..Metrics::default()
+        };
+        if metrics.archive_input {
+            self.telemetry
+                .set_context("backfill", "archive", "historical");
+        } else if !self.revision_repair {
+            self.telemetry.set_context("backfill", "rpc", "historical");
+        }
         let mut store = {
             let _permit = self.gate.historical()?;
             Store::open(&self.path)?
@@ -333,7 +412,8 @@ impl History {
                 break;
             }
             let current = self.coverage(mint, slot, slot)?.slots.remove(0);
-            if current.status == "complete" || current.status == "skipped" {
+            let source_done:bool=self.db.query_row("SELECT EXISTS(SELECT 1 FROM historical_source_slots WHERE mint=?1 AND decoder=?2 AND slot=?3 AND source_kind=?4 AND status IN ('complete','skipped'))",params![mint,decoder::DECODER_VERSION,slot as i64,self.active_source],|r|r.get(0)).map_err(read_error)?;
+            if (current.status == "complete" || current.status == "skipped") && source_done {
                 continue;
             }
             if current.attempts > 0 {
@@ -364,7 +444,7 @@ impl History {
                     .as_deref()
                     .is_some_and(|e| e.starts_with("storage_"))
             {
-                self.db.query_row("SELECT response FROM historical_inputs WHERE mint=?1 AND slot=?2 ORDER BY received_at DESC,attempt DESC LIMIT 1",params![mint,slot as i64],|r|r.get(0)).optional().map_err(read_error)?
+                self.db.query_row("SELECT response FROM historical_inputs WHERE mint=?1 AND slot=?2 AND source_kind=?3 ORDER BY received_at DESC,attempt DESC LIMIT 1",params![mint,slot as i64,source.provenance()],|r|r.get(0)).optional().map_err(read_error)?
             } else {
                 None
             };
@@ -382,7 +462,11 @@ impl History {
                 Ok(bytes) if bytes.len() <= MAX_BLOCK_BYTES => bytes,
                 result => {
                     let error = result.err().unwrap_or(Error("block_too_large"));
-                    metrics.source_errors += 1;
+                    if error.0 == "archive_cache_write_failed" {
+                        metrics.write_errors += 1;
+                    } else {
+                        metrics.source_errors += 1;
+                    }
                     self.status(mint, slot, "unknown", Some(error.0), None)?;
                     event(
                         &self.telemetry,
@@ -400,7 +484,20 @@ impl History {
             // Raw input acknowledgment precedes decoding. Every failed attempt remains reproducible.
             {
                 let _permit = self.gate.historical()?;
-                self.db.execute("INSERT INTO historical_inputs VALUES (?1,?2,?3,?4,'finalized-mainnet-rpc',?5,?6)",params![mint,decoder::DECODER_VERSION,slot as i64,(current.attempts+1) as i64,now() as i64,raw]).map_err(write_error)?;
+                self.db
+                    .execute(
+                        "INSERT INTO historical_inputs VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                        params![
+                            mint,
+                            decoder::DECODER_VERSION,
+                            slot as i64,
+                            (current.attempts + 1) as i64,
+                            source.provenance(),
+                            now() as i64,
+                            raw
+                        ],
+                    )
+                    .map_err(write_error)?;
             }
             let failures_before = metrics.decode_failures;
             let outcome = process_block(
@@ -409,8 +506,11 @@ impl History {
                 &mut store,
                 &mut metrics,
                 &cancelled,
-                &self.gate,
-                self.revision_repair,
+                BlockContext {
+                    gate: &self.gate,
+                    revision_repair: self.revision_repair,
+                    capture_source: source.capture_source(),
+                },
             );
             match outcome {
                 Ok((parent, time)) => {
@@ -439,7 +539,9 @@ impl History {
                     }
                     if error.0 == "rpc_block_unavailable" {
                         metrics.source_errors += 1;
-                    } else if error.0.starts_with("storage_") || error.0 == "capture_conflict" {
+                    } else if error.0.starts_with("storage_")
+                        || matches!(error.0, "capture_conflict" | "block_identity_conflict")
+                    {
                         metrics.write_errors += 1;
                     } else if error.0 != "cancelled" && metrics.decode_failures == failures_before {
                         metrics.source_errors += 1;
@@ -460,9 +562,15 @@ impl History {
                 }
             }
         }
+        metrics.source_diagnostics = source.diagnostics();
         metrics.elapsed_seconds = started.elapsed().as_secs_f64();
         Ok((self.coverage(mint, start, end)?, metrics))
     }
+}
+struct BlockContext<'a> {
+    gate: &'a crate::coordinator::WriteGate,
+    revision_repair: bool,
+    capture_source: &'a str,
 }
 fn process_block(
     raw: &[u8],
@@ -470,9 +578,13 @@ fn process_block(
     store: &mut Store,
     metrics: &mut Metrics,
     cancelled: &impl Fn() -> bool,
-    gate: &crate::coordinator::WriteGate,
-    revision_repair: bool,
+    context: BlockContext<'_>,
 ) -> Result<(u64, Option<i64>)> {
+    let BlockContext {
+        gate,
+        revision_repair,
+        capture_source,
+    } = context;
     let value: Value = serde_json::from_slice(raw).map_err(|_| Error("invalid_block_json"))?;
     if value["jsonrpc"] != "2.0" || value["id"] != 1 || value.get("error").is_some() {
         return Err(Error("rpc_block_unavailable"));
@@ -507,6 +619,10 @@ fn process_block(
     if transactions.len() > 100_000 {
         return Err(Error("too_many_block_transactions"));
     }
+    {
+        let _permit = gate.historical()?;
+        store.observe_block_identity(slot, block, transactions)?;
+    }
     let mut signatures = std::collections::HashSet::new();
     let mut failure = None;
     for tx in transactions {
@@ -519,7 +635,10 @@ fn process_block(
             .ok_or(Error("invalid_block_transaction"))?;
         object.insert("slot".into(), json!(slot));
         object.insert("blockTime".into(), block["blockTime"].clone());
-        let capture = json!({"schema_version":1,"cluster":"mainnet-beta","commitment":"finalized","source":"solana-mainnet-rpc","result":result});
+        let mut capture = json!({"schema_version":1,"cluster":"mainnet-beta","commitment":"finalized","source":capture_source,"result":result});
+        if let Some(provenance) = value.get("archive_provenance") {
+            capture["source_provenance"] = provenance.clone();
+        }
         let bytes = serde_json::to_vec(&capture).map_err(|_| Error("invalid_block_transaction"))?;
         let parsed = match decoder::parse_capture(&bytes) {
             Ok(c) => c,
