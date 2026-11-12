@@ -6,7 +6,7 @@ SQLite, and queries persisted results from a separate process. Implementation
 starts with [ticket #1](https://github.com/alexnham/helius-indexer/issues/1).
 
 The [proposal](PROPOSAL.md) defines the full index. Live ingestion, historical
-backfill, verified slot coverage, Token-2022, confidential transfers, rolling
+backfill, verified slot coverage, confidential transfers, rolling
 retention, and production analytics are subsequent tickets. This CLI is a bounded
 inspection tool, not a production 30-day API. Its responses report coverage as
 `unknown`; processing one transaction never establishes complete slot coverage.
@@ -80,8 +80,7 @@ have a known zero transfer fee and `confidential: false`.
 Inner instruction metadata must be present. Transactions containing inner SPL
 Token instructions also require matching runtime invocation/success evidence.
 Truncated/missing evidence or any caught CPI failure leaves the transaction
-unsupported rather than incorrectly indexing rolled-back effects. Token-2022,
-unknown SPL opcodes, and authority-change transactions are explicitly unsupported
+unsupported rather than incorrectly indexing rolled-back effects. Unknown SPL opcodes and authority-change transactions are explicitly unsupported
 in this slice. Owners are reported only when both pre/post observations agree;
 otherwise they are null. The decoder makes no network or database calls.
 
@@ -140,3 +139,6 @@ transaction, synthetic boundary cases, exact u64 serialization, malformed data,
 unsupported execution, versioned addresses, duplicate ingestion, separate-process
 querying, atomic rollback under a failed database write, retained decode failures,
 and telemetry/redaction/export failures.
+
+Token-2022 supported transfers and historical fee evidence are described in
+[the support matrix](docs/token-2022-support.md).
