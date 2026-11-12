@@ -15,7 +15,7 @@ use std::{
     time::Instant,
 };
 
-const USAGE: &str = "usage: helius-indexer ingest DB CAPTURE [--metrics FILE] | query DB [MINT] | backfill DB MINT START END [--metrics FILE] | coverage DB MINT START END";
+const USAGE: &str = "usage: helius-indexer ingest DB CAPTURE [--metrics FILE] | query DB [MINT] | backfill DB MINT START END [--metrics FILE] | coverage DB MINT START END | live DB FROM_SLOT SECONDS | live-status DB | live-retry DB";
 
 fn ingest(db: &str, input: &str, telemetry: &mut Telemetry) -> Result<serde_json::Value> {
     let started = Instant::now();
@@ -118,6 +118,18 @@ fn run(args: &[String], telemetry: &mut Telemetry) -> Result<serde_json::Value> 
             }
             Ok(json!({"coverage":coverage,"metrics":metrics}))
         }
+        [command, db, from, seconds] if command == "live" => helius_indexer::live::run(
+            Path::new(db),
+            from.parse().map_err(|_| Error("invalid_live_bounds"))?,
+            seconds.parse().map_err(|_| Error("invalid_live_bounds"))?,
+            telemetry,
+        ),
+        [command, db] if command == "live-status" => {
+            helius_indexer::live::Intake::report(Path::new(db))
+        }
+        [command, db] if command == "live-retry" => {
+            helius_indexer::live::Intake::open(Path::new(db))?.retry()
+        }
         [command, db, input] if command == "ingest" => ingest(db, input, telemetry),
         [command, db, input, flag, _] if command == "ingest" && flag == "--metrics" => {
             ingest(db, input, telemetry)
@@ -130,7 +142,9 @@ fn run(args: &[String], telemetry: &mut Telemetry) -> Result<serde_json::Value> 
 
 fn query(db: &str, mint: Option<&str>) -> Result<serde_json::Value> {
     let transfers = Store::query(Path::new(db), mint, 1000)?;
-    Ok(json!({"coverage":"unknown","limit":1000,"transfers":transfers}))
+    Ok(
+        json!({"coverage":"unknown","limit":1000,"transfers":transfers,"live":helius_indexer::live::Intake::report(Path::new(db))?}),
+    )
 }
 
 fn main() -> ExitCode {

@@ -1,5 +1,6 @@
 pub mod backfill;
 pub mod decoder;
+pub mod live;
 pub mod model;
 pub mod storage;
 pub mod telemetry;
