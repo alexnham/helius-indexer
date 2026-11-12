@@ -227,3 +227,6 @@ workers with shared live-priority write admission. `summary DB MINT` reports exa
 unique-row counts and known volume/fees for all stored data. It does not apply the
 future production rolling window. Read [the overlap contract](docs/overlap.md)
 for opt-in commands, verified scope, tests, and remaining coverage gaps.
+
+Recovery commands, process-exit validation, and remaining outage-repair limits are
+documented in [the recovery runbook](docs/recovery.md).

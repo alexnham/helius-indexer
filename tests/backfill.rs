@@ -405,3 +405,109 @@ fn malformed_earlier_response_cannot_break_valid_child_skip_evidence() {
     assert_eq!(coverage.slots[0].status, "skipped");
     assert_eq!(coverage.slots[1].status, "complete");
 }
+
+// Synthetic second signature makes two distinguishable transaction commits from one captured shape.
+fn recovery_transactions() -> Vec<Value> {
+    let first = fixture()["result"].clone();
+    let mut second = first.clone();
+    second["transaction"]["signatures"][0] = json!(bs58::encode([42; 64]).into_string());
+    vec![first, second]
+}
+
+#[test]
+#[ignore = "subprocess helper for process-exit recovery tests"]
+fn historical_process_exit_child() {
+    let path = std::env::var_os("INDEXER_TEST_RECOVERY_DB").unwrap();
+    let path = Path::new(&path);
+    let phase = std::env::var("INDEXER_TEST_RECOVERY_PHASE").unwrap();
+    let slot = fixture()["result"]["slot"].as_u64().unwrap();
+    let mut history = History::open(path).unwrap();
+    let db = Connection::open(path).unwrap();
+    let mut source = source(vec![(slot, block(slot, slot - 1, recovery_transactions()))]);
+    history
+        .run(&mint(), slot, slot, &mut source, || {
+            let raw: i64 = db
+                .query_row("SELECT COUNT(*) FROM historical_inputs", [], |r| r.get(0))
+                .unwrap();
+            let output = Store::query(path, None, 100).unwrap().len();
+            if (phase == "after_raw" && raw > 0) || (phase == "after_output" && output > 0) {
+                std::process::exit(77);
+            }
+            false
+        })
+        .unwrap();
+    assert_eq!(phase, "after_progress");
+    std::process::exit(77);
+}
+
+#[test]
+fn historical_process_exit_restarts_from_retained_raw_without_advancing_a_gap() {
+    for phase in ["after_raw", "after_output", "after_progress"] {
+        let (_dir, path) = db();
+        let slot = fixture()["result"]["slot"].as_u64().unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "historical_process_exit_child", "--ignored"])
+            .env("INDEXER_TEST_RECOVERY_DB", &path)
+            .env("INDEXER_TEST_RECOVERY_PHASE", phase)
+            .output()
+            .unwrap()
+            .status;
+        assert_eq!(status.code(), Some(77), "{phase}");
+        let mut history = History::open(&path).unwrap();
+        let before = history.coverage(&mint(), slot, slot).unwrap();
+        assert_eq!(before.complete, phase == "after_progress");
+        assert_eq!(
+            before.contiguous_through,
+            (phase == "after_progress").then_some(slot)
+        );
+        let expected_before = match phase {
+            "after_raw" => 0,
+            "after_output" => 2,
+            _ => 4,
+        };
+        assert_eq!(
+            Store::query(&path, None, 100).unwrap().len(),
+            expected_before
+        );
+        let conn = Connection::open(&path).unwrap();
+        let first: i64 = conn
+            .query_row("SELECT first_pending FROM historical_slots", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let mut unavailable = source(vec![]);
+        let (coverage, metrics) = history
+            .run(&mint(), slot, slot, &mut unavailable, || false)
+            .unwrap();
+        assert!(coverage.complete);
+        assert_eq!(coverage.contiguous_through, Some(slot));
+        assert_eq!(metrics.source_attempts, 0);
+        assert!(unavailable.calls.is_empty());
+        let mut expected = Vec::new();
+        for result in recovery_transactions() {
+            let mut envelope = fixture();
+            envelope["result"] = result;
+            expected.extend(
+                decoder::decode(
+                    &decoder::parse_capture(&serde_json::to_vec(&envelope).unwrap()).unwrap(),
+                )
+                .unwrap(),
+            );
+        }
+        expected.sort_by(|a, b| a.transfer_id.cmp(&b.transfer_id));
+        let mut actual = Store::query(&path, None, 100).unwrap();
+        actual.sort_by(|a, b| a.transfer_id.cmp(&b.transfer_id));
+        assert_eq!(actual, expected);
+        assert_eq!(
+            conn.query_row("SELECT first_pending FROM historical_slots", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            first
+        );
+        let summary = Store::summary(&path, &mint()).unwrap();
+        history
+            .run(&mint(), slot, slot, &mut unavailable, || false)
+            .unwrap();
+        assert_eq!(Store::summary(&path, &mint()).unwrap(), summary);
+    }
+}
