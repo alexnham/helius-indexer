@@ -1,4 +1,6 @@
 //! Two bounded workers share a write admission gate; live work has priority.
+#[cfg(feature = "archive")]
+pub mod bridge;
 use crate::{
     Error, Result,
     backfill::{BlockSource, History, RpcSource},
@@ -126,27 +128,39 @@ pub(crate) fn run_with_source<S: BlockSource + Send>(
 ) -> Result<Value> {
     crate::backfill::scope(live::USDC, start, end)?;
     live::validate_options(start, seconds)?;
+    run_with_job(path, start, seconds, telemetry, |gate| {
+        let mut history = History::open(path)?;
+        history.set_gate(gate);
+        let began = Instant::now();
+        let cancel = std::env::var_os("BACKFILL_CANCEL_FILE");
+        let (coverage, metrics) = history.run(live::USDC, start, end, &mut source, || {
+            began.elapsed() >= Duration::from_secs(seconds)
+                || cancel.as_ref().is_some_and(|p| Path::new(p).exists())
+        })?;
+        Ok(json!({"run_id":history.run_id(),"coverage":coverage,"metrics":metrics}))
+    })
+}
+
+pub(crate) fn run_with_job(
+    path: &Path,
+    live_from: u64,
+    seconds: u64,
+    telemetry: &mut Telemetry,
+    job: impl FnOnce(Arc<WriteGate>) -> Result<Value> + Send,
+) -> Result<Value> {
+    live::validate_options(live_from, seconds)?;
     let gate = Arc::new(WriteGate::default());
-    let mut history = History::open(path)?;
-    history.set_gate(Arc::clone(&gate));
-    let cancel = std::env::var_os("BACKFILL_CANCEL_FILE");
     let began = Instant::now();
     let parent_id = telemetry.run_id.clone();
-    let history_id = history.run_id().to_owned();
     let (live_result, history_result) = std::thread::scope(|threads| {
         let live_gate = Arc::clone(&gate);
         let live_worker = threads.spawn(move || {
             let mut context = Telemetry::default();
             context.run_id = format!("{parent_id}:live");
-            live::run_admitted(path, start, seconds, &mut context, &live_gate)
+            live::run_admitted(path, live_from, seconds, &mut context, &live_gate)
         });
-        let historical_worker = threads.spawn(move || {
-            let (coverage, metrics) = history.run(live::USDC, start, end, &mut source, || {
-                began.elapsed() >= Duration::from_secs(seconds)
-                    || cancel.as_ref().is_some_and(|p| Path::new(p).exists())
-            })?;
-            Ok::<_, Error>(json!({"coverage":coverage,"metrics":metrics}))
-        });
+        let history_gate = Arc::clone(&gate);
+        let historical_worker = threads.spawn(move || job(history_gate));
         let live = live_worker
             .join()
             .unwrap_or(Err(Error("live_worker_failed")));
@@ -159,6 +173,11 @@ pub(crate) fn run_with_source<S: BlockSource + Send>(
         Ok(v) => json!({"outcome":"reported","report":v}),
         Err(e) => json!({"outcome":"failed","error_class":e.0}),
     };
+    let history_id = history_result
+        .as_ref()
+        .ok()
+        .and_then(|v| v.get("run_id"))
+        .cloned();
     let failed = live_result.is_err() || history_result.is_err();
     telemetry.emit(
         "workers_finished",

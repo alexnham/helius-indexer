@@ -246,3 +246,8 @@ replay, archive/RPC overlap checks and a measured tip snapshot. See
 [commands, limits, provenance and actual validation gaps](docs/archive.md).
 The archive feature requires Rust 1.98.1+ and adds substantial Agave dependencies;
 the default build remains the smaller offline validation tool.
+
+The [source-boundary coordinator](docs/source-boundary.md) adds `bridge-plan`,
+`bridge`, `bridge-status` and `bridge-live`: a frozen measured boundary, eight-slot
+resumable batches, source-specific unfinished intervals and an unverified live
+tail. Create a plan explicitly before running either worker command.

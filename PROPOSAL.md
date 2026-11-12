@@ -213,3 +213,11 @@ and an archive freshness snapshot. RPC truncation and unsupported instructions
 prevent verified bridge coverage in some sampled ranges; slot 468265451 passed
 both sources with 51 deduplicated transfer records. This does not select
 production infrastructure or authorize a full-window backfill.
+
+The bounded source-boundary coordinator now persists a measured archive tip and
+finalized reference, routes finite batches to archive/recent RPC, and reports
+unfinished source intervals separately from the live tail. Scheduling progress
+is independent of verified contiguous coverage; boundary readiness requires
+comparison and both durable observations. Plans freeze their endpoint and do not
+claim ongoing live completeness. See [boundary coordination](docs/source-boundary.md)
+for operation, limits, recovery checks and remaining production work.

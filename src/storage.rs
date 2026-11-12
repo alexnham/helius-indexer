@@ -439,6 +439,20 @@ impl Store {
             .as_i64()
             .ok_or(Error("missing_block_parent"))?;
         let time = block["blockTime"].as_i64();
+        let parent_hash: Option<String> = self
+            .0
+            .query_row(
+                "SELECT blockhash FROM historical_block_identity WHERE slot=?1",
+                [parent],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|_| Error("storage_read_failed"))?;
+        let conflicting_child:bool=self.0.query_row("SELECT EXISTS(SELECT 1 FROM historical_block_identity WHERE parent_slot=?1 AND previous_blockhash<>?2)",params![slot as i64,hash],|r|r.get(0)).map_err(|_|Error("storage_read_failed"))?;
+        if parent_hash.as_deref().is_some_and(|h| h != previous) || conflicting_child {
+            return Err(Error("block_parent_conflict"));
+        }
+
         let transaction = &self.0;
         type StoredBlockIdentity = (String, i64, String, Vec<u8>, Option<i64>);
         let prior:Option<StoredBlockIdentity>=transaction.query_row("SELECT blockhash,parent_slot,previous_blockhash,transaction_ids_hash,block_time FROM historical_block_identity WHERE slot=?1",[slot as i64],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional().map_err(|_|Error("storage_read_failed"))?;

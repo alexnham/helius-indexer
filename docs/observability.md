@@ -191,3 +191,19 @@ publication delay. See [archive validation](archive.md) for actual results and
 remaining decoder gaps. Archive unit tests check zero-network replay, both source
 orders, duplicate replay, integrity failure and conflicting immutable block
 identity including migration from retained historical inputs.
+
+## Frozen source-boundary batches
+
+`bridge-status` separates the scheduling position from verified contiguous
+historical coverage. It reports pending slots, source-split missing intervals,
+bounded interval samples/truncation, boundary measurement age, generation-bound
+overlap proof and an explicitly unknown live tail. Pending age starts at the
+original durable plan measurement and is not reset by retries or cursor movement.
+Completed plans report zero pending age. Batch reports retain stage attempt
+metrics, source diagnostics and the unique persisted storage summary separately.
+Archive diagnostics count transport bytes; historical input metrics count retained
+normalized bytes. RPC transport diagnostics are currently unavailable, rather than
+reported as zero. `bridge_batch_finished` includes run, mint/range/tip and pending
+scope in the diagnostic event, with no new high-cardinality metric labels.
+Tests distinguish interrupted proof acknowledgment, a failed source, scheduler
+rotation and durable completion. See [source-boundary operation](source-boundary.md).

@@ -134,10 +134,10 @@ pub fn live(
     crate::coordinator::run_with_source(path, start, end, seconds, telemetry, source)
 }
 
-struct Observation {
-    slot: u64,
-    raw: Vec<u8>,
-    archive: bool,
+pub(crate) struct Observation {
+    pub(crate) slot: u64,
+    pub(crate) raw: Vec<u8>,
+    pub(crate) archive: bool,
 }
 impl BlockSource for Observation {
     fn provenance(&self) -> &'static str {

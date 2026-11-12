@@ -15,7 +15,7 @@ use std::{
     time::Instant,
 };
 
-const USAGE: &str = "usage: helius-indexer ingest DB CAPTURE [--metrics FILE] | query DB [MINT] | backfill DB MINT START END [--metrics FILE] | coverage DB MINT START END | live DB FROM_SLOT SECONDS | live-status DB | live-retry DB | summary DB MINT | overlap DB START END SECONDS | repair DB START END | repair-status DB START END | repair-history DB MINT START END | [feature archive] archive/archive-replay/archive-overlap DB CACHE MINT START END | archive-tip CACHE | archive-live DB CACHE START END SECONDS";
+const USAGE: &str = "usage: helius-indexer ingest DB CAPTURE [--metrics FILE] | query DB [MINT] | backfill DB MINT START END [--metrics FILE] | coverage DB MINT START END | live DB FROM_SLOT SECONDS | live-status DB | live-retry DB | summary DB MINT | overlap DB START END SECONDS | repair DB START END | repair-status DB START END | repair-history DB MINT START END | [feature archive] archive/archive-replay/archive-overlap DB CACHE MINT START END | bridge-plan DB CACHE MINT START | bridge DB CACHE MINT START | bridge-status DB MINT START | bridge-live DB CACHE START SECONDS | archive-tip CACHE | archive-live DB CACHE START END SECONDS";
 
 fn ingest(db: &str, input: &str, telemetry: &mut Telemetry) -> Result<serde_json::Value> {
     let started = Instant::now();
@@ -70,6 +70,46 @@ fn ingest(db: &str, input: &str, telemetry: &mut Telemetry) -> Result<serde_json
 
 fn run(args: &[String], telemetry: &mut Telemetry) -> Result<serde_json::Value> {
     match args {
+        #[cfg(feature = "archive")]
+        [command, db, cache, mint, start] if command == "bridge-plan" => {
+            helius_indexer::coordinator::bridge::plan(
+                Path::new(db),
+                Path::new(cache),
+                mint,
+                start.parse().map_err(|_| Error("invalid_bridge_plan"))?,
+                telemetry,
+            )
+        }
+        #[cfg(feature = "archive")]
+        [command, db, cache, mint, start] if command == "bridge" => {
+            helius_indexer::coordinator::bridge::run(
+                Path::new(db),
+                Path::new(cache),
+                mint,
+                start.parse().map_err(|_| Error("invalid_bridge_plan"))?,
+                None,
+                telemetry,
+            )
+        }
+        #[cfg(feature = "archive")]
+        [command, db, mint, start] if command == "bridge-status" => {
+            helius_indexer::coordinator::bridge::status(
+                Path::new(db),
+                mint,
+                start.parse().map_err(|_| Error("invalid_bridge_plan"))?,
+            )
+        }
+        #[cfg(feature = "archive")]
+        [command, db, cache, start, seconds] if command == "bridge-live" => {
+            helius_indexer::coordinator::bridge::run(
+                Path::new(db),
+                Path::new(cache),
+                helius_indexer::live::USDC,
+                start.parse().map_err(|_| Error("invalid_bridge_plan"))?,
+                Some(seconds.parse().map_err(|_| Error("invalid_live_bounds"))?),
+                telemetry,
+            )
+        }
         #[cfg(feature = "archive")]
         [command, cache] if command == "archive-tip" => {
             helius_indexer::archive::tip(Path::new(cache), telemetry)
