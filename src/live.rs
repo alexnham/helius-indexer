@@ -192,7 +192,7 @@ impl Intake {
         if !exists {
             return Ok(json!({"state":"uninitialized","verified_boundary":null}));
         }
-        let mut stmt=db.prepare("SELECT id,from_slot,status,reference_slot,reference_at,replay_first,replay_at FROM live_runs ORDER BY id DESC LIMIT 100").map_err(|_|Error("storage_read_failed"))?;
+        let mut stmt=db.prepare("SELECT id,from_slot,status,reference_slot,reference_at,replay_first,replay_at,mint,decoder FROM live_runs ORDER BY id DESC LIMIT 100").map_err(|_|Error("storage_read_failed"))?;
         let rows=stmt.query_map([],|r| {
             let from: i64=r.get(1)?;
             let reference: Option<i64>=r.get(3)?;
@@ -200,6 +200,7 @@ impl Intake {
             let first: Option<i64>=r.get(5)?;
             let replay_at: Option<i64>=r.get(6)?;
             Ok(json!({"run":r.get::<_,i64>(0)?,"from_slot":from,"state":r.get::<_,String>(2)?,
+                "mint":r.get::<_,String>(7)?,"decoder_version":r.get::<_,String>(8)?,
                 "reference_slot":reference,"reference_at":reference_at,
                 "reference_age_seconds":reference_at.and_then(age),
                 "replay_first":first,"replay_at":replay_at,"replay_info_age_seconds":replay_at.and_then(age),
@@ -531,6 +532,17 @@ mod tests {
             "unsupported_stored_proto_schema"
         );
         assert_eq!(Store::query(&path, Some(USDC), 100).unwrap().len(), 1);
+    }
+    #[test]
+    fn reports_preserve_the_stored_run_decoder_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("live.sqlite");
+        let intake = Intake::open(&path).unwrap();
+        intake.db.execute("INSERT INTO live_runs(from_slot,mint,decoder,status) VALUES(123,?1,'previous-decoder','time_limit')",[USDC]).unwrap();
+        let report = Intake::report(&path).unwrap();
+        assert_eq!(report["runs"][0]["decoder_version"], "previous-decoder");
+        assert_eq!(report["runs"][0]["mint"], USDC);
+        assert!(report["runs"][0]["verified_boundary"].is_null());
     }
     #[test]
     fn failed_output_write_preserves_retryable_raw_without_transfers() {
