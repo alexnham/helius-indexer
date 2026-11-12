@@ -73,8 +73,11 @@ Normalized capture and decoded transfers then use the existing atomic Store.
 Only afterward does raw status become `decoded`. A crash between those commits
 repeats decoding and existing stable transfer IDs deduplicate results immediately.
 Failures retain raw bytes and bounded classes; `live-retry` retries at most 100
-unresolved items without a provider. It is manual bounded recovery, not a durable
-scheduler. A stored schema identifier that differs from the pinned decoder is
+unresolved items without a provider. A durable scheduling cursor rotates through
+unresolved IDs across calls/restarts so an unsupported oldest batch cannot hide
+later recoverable input. It is manual bounded recovery, not a durable supervisor.
+See [the recovery runbook](recovery.md) for restart order, cursor semantics, and
+verified failure boundaries. A stored schema identifier that differs from the pinned decoder is
 rejected without interpreting the payload. Preserve the SQLite database; the stream cursor alone is insufficient.
 The additive `live_raw`/`live_runs` tables preserve existing offline tables;
 rollback consists of using the previous binary (which ignores the new tables).

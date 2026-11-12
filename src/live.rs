@@ -103,6 +103,7 @@ impl Intake {
             .map_err(|_| Error("storage_configuration_failed"))?;
         db.execute_batch("PRAGMA synchronous=FULL;
             CREATE TABLE IF NOT EXISTS live_raw(id INTEGER PRIMARY KEY, slot INTEGER NOT NULL, protobuf BLOB NOT NULL, proto_schema TEXT NOT NULL DEFAULT 'laserstream-core-proto/14.0.0', status TEXT NOT NULL, received_at INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS live_retry_cursor(singleton INTEGER PRIMARY KEY CHECK(singleton=1),last_id INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS live_runs(id INTEGER PRIMARY KEY, from_slot INTEGER NOT NULL, mint TEXT NOT NULL, decoder TEXT NOT NULL, status TEXT NOT NULL, reference_slot INTEGER, reference_at INTEGER, replay_first INTEGER, replay_at INTEGER);")
             .map_err(|_|Error("storage_configuration_failed"))?;
         Ok(Self { db, store })
@@ -140,18 +141,32 @@ impl Intake {
         result
     }
     pub fn retry(&mut self) -> Result<Value> {
+        let cursor: i64 = self
+            .db
+            .query_row(
+                "SELECT COALESCE(MAX(last_id),0) FROM live_retry_cursor",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|_| Error("storage_read_failed"))?;
+        let mut telemetry = crate::telemetry::Telemetry::default();
+        telemetry.set_context("live", "laserstream", "recovery");
+        telemetry.emit("retry_batch_started", "retry", "retry", None);
         let pending: Vec<i64> = {
             let mut s = self
                 .db
-                .prepare("SELECT id FROM live_raw WHERE status!='decoded' ORDER BY id LIMIT 100")
+                .prepare("SELECT id FROM live_raw WHERE status!='decoded' ORDER BY (id<=?1),id LIMIT 100")
                 .map_err(|_| Error("storage_read_failed"))?;
-            s.query_map([], |r| r.get(0))
+            s.query_map([cursor], |r| r.get(0))
                 .map_err(|_| Error("storage_read_failed"))?
                 .collect::<std::result::Result<_, _>>()
                 .map_err(|_| Error("storage_read_failed"))?
         };
         let mut success = 0;
         for id in &pending {
+            // Fairness only: a crash can delay this row until wraparound, never acknowledge it.
+            self.db.execute("INSERT INTO live_retry_cursor VALUES(1,?1) ON CONFLICT(singleton) DO UPDATE SET last_id=excluded.last_id", [id])
+                .map_err(|_| Error("storage_write_failed"))?;
             let (raw, schema): (Vec<u8>, String) = self
                 .db
                 .query_row(
@@ -170,7 +185,19 @@ impl Intake {
                 .map_err(|_| Error("stored_record_invalid"))?;
             success += usize::from(self.process(*id, &update).is_ok());
         }
-        Ok(json!({"attempted":pending.len(),"decoded":success,"coverage":"unknown"}))
+        telemetry.emit(
+            "retry_batch_completed",
+            "retry",
+            if success == pending.len() {
+                "success"
+            } else {
+                "partial"
+            },
+            (success != pending.len()).then_some("unresolved_decode_items"),
+        );
+        Ok(
+            json!({"attempted":pending.len(),"decoded":success,"failed":pending.len()-success,"retry_cursor":pending.last().copied().unwrap_or(cursor),"run_id":telemetry.run_id,"coverage":"unknown"}),
+        )
     }
     pub fn report(path: &Path) -> Result<Value> {
         if !path.exists() {
@@ -208,6 +235,21 @@ impl Intake {
         let runs = rows
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|_| Error("storage_read_failed"))?;
+        let has_cursor: bool = db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='live_retry_cursor')",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|_| Error("storage_read_failed"))?;
+        let retry_cursor: Option<i64> = if has_cursor {
+            db.query_row("SELECT MAX(last_id) FROM live_retry_cursor", [], |r| {
+                r.get(0)
+            })
+            .map_err(|_| Error("storage_read_failed"))?
+        } else {
+            None
+        };
         let pending: i64 = db
             .query_row(
                 "SELECT COUNT(*) FROM live_raw WHERE status!='decoded'",
@@ -223,7 +265,7 @@ impl Intake {
             )
             .map_err(|_| Error("storage_read_failed"))?;
         Ok(
-            json!({"oldest_unresolved_age_seconds":if pending==0{Some(0)}else{oldest.and_then(age)},"state":if runs.is_empty(){"uninitialized"}else{"partial"},"mint":USDC,"decoder_version":decoder::DECODER_VERSION,"verified_boundary":null,"coverage":"unknown","unresolved_items":pending,"runs":runs,"limit":100,"reason":"filtered_finalized_stream_has_no_validated_completion_evidence"}),
+            json!({"retry_cursor":retry_cursor,"retry_batch_limit":100,"oldest_unresolved_age_seconds":if pending==0{Some(0)}else{oldest.and_then(age)},"state":if runs.is_empty(){"uninitialized"}else{"partial"},"mint":USDC,"decoder_version":decoder::DECODER_VERSION,"verified_boundary":null,"coverage":"unknown","unresolved_items":pending,"runs":runs,"limit":100,"reason":"filtered_finalized_stream_has_no_validated_completion_evidence"}),
         )
     }
 }
@@ -472,6 +514,181 @@ mod tests {
             }),
         }
     }
+    // Only the spawned test process exits; no production fault-injection switch exists.
+    #[test]
+    #[ignore = "subprocess helper for process-exit recovery tests"]
+    fn process_exit_boundary_child() {
+        let path = std::env::var_os("INDEXER_TEST_RECOVERY_DB").unwrap();
+        let path = Path::new(&path);
+        let phase = std::env::var("INDEXER_TEST_RECOVERY_PHASE").unwrap();
+        let mut intake = Intake::open(path).unwrap();
+        let tx = update();
+        if phase == "before_raw" {
+            std::process::exit(77);
+        }
+        let id = intake.retain(&tx).unwrap();
+        if phase == "after_retry_cursor" {
+            intake
+                .db
+                .execute("INSERT INTO live_retry_cursor VALUES(1,?1)", [id])
+                .unwrap();
+            std::process::exit(77);
+        }
+        if phase == "broken_diagnostics" {
+            std::io::Read::read_exact(&mut std::io::stdin(), &mut [0]).unwrap();
+            assert_eq!(intake.retry().unwrap()["decoded"], 1);
+            std::process::exit(77);
+        }
+        if phase == "after_raw" {
+            std::process::exit(77);
+        }
+        if phase == "after_output" {
+            let raw = normalize(&tx).unwrap();
+            let capture = decoder::parse_capture(&raw).unwrap();
+            Store::open(path)
+                .unwrap()
+                .persist(&capture, &raw, &decoder::decode(&capture))
+                .unwrap();
+            std::process::exit(77);
+        }
+        assert_eq!(phase, "after_ack");
+        intake.process(id, &tx).unwrap();
+        std::process::exit(77);
+    }
+
+    #[test]
+    fn process_exit_recovery_preserves_raw_output_and_acknowledgment_boundaries() {
+        for phase in [
+            "before_raw",
+            "after_raw",
+            "after_output",
+            "after_ack",
+            "after_retry_cursor",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("live.sqlite");
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "live::tests::process_exit_boundary_child",
+                    "--ignored",
+                ])
+                .env("INDEXER_TEST_RECOVERY_DB", &path)
+                .env("INDEXER_TEST_RECOVERY_PHASE", phase)
+                .output()
+                .unwrap()
+                .status;
+            assert_eq!(status.code(), Some(77), "{phase}");
+            let before = Store::query(&path, Some(USDC), 100).unwrap();
+            assert_eq!(
+                before.len(),
+                usize::from(matches!(phase, "after_output" | "after_ack"))
+            );
+            let db = Connection::open(&path).unwrap();
+            let received: Option<i64> = db
+                .query_row("SELECT MIN(received_at) FROM live_raw", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(received.is_some(), phase != "before_raw");
+            let report = Intake::report(&path).unwrap();
+            assert_eq!(
+                report["unresolved_items"],
+                usize::from(matches!(
+                    phase,
+                    "after_raw" | "after_output" | "after_retry_cursor"
+                ))
+            );
+            assert!(report["verified_boundary"].is_null());
+            let mut intake = Intake::open(&path).unwrap();
+            intake.retry().unwrap();
+            // Unacknowledged input before raw persistence must arrive again from a source.
+            let tx = update();
+            let id = intake.retain(&tx).unwrap();
+            intake.process(id, &tx).unwrap();
+            assert_eq!(Store::summary(&path, USDC).unwrap()["transfer_count"], 1);
+            assert_eq!(
+                Store::summary(&path, USDC).unwrap()["known_volume_raw"],
+                "42"
+            );
+            assert_eq!(Intake::report(&path).unwrap()["unresolved_items"], 0);
+            if let Some(received) = received {
+                assert_eq!(
+                    db.query_row(
+                        "SELECT received_at FROM live_raw ORDER BY id LIMIT 1",
+                        [],
+                        |r| r.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                    received
+                );
+            }
+            assert!(Intake::report(&path).unwrap()["verified_boundary"].is_null());
+        }
+    }
+
+    #[test]
+    fn unresolved_prefix_cannot_starve_later_retryable_input_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("live.sqlite");
+        let mut intake = Intake::open(&path).unwrap();
+        let mut unsupported = update();
+        unsupported.transaction.as_mut().unwrap().meta = None;
+        for _ in 0..100 {
+            intake.retain(&unsupported).unwrap();
+        }
+        intake.retain(&update()).unwrap();
+        intake
+            .db
+            .execute("UPDATE live_raw SET received_at=1", [])
+            .unwrap();
+        assert_eq!(intake.retry().unwrap()["decoded"], 0);
+        drop(intake);
+        let mut intake = Intake::open(&path).unwrap();
+        assert_eq!(intake.retry().unwrap()["decoded"], 1);
+        assert_eq!(Store::summary(&path, USDC).unwrap()["transfer_count"], 1);
+        assert_eq!(Intake::report(&path).unwrap()["unresolved_items"], 100);
+        assert_eq!(
+            intake
+                .db
+                .query_row("SELECT MIN(received_at) FROM live_raw", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        drop(intake);
+        Connection::open(&path)
+            .unwrap()
+            .execute("DROP TABLE live_retry_cursor", [])
+            .unwrap();
+        assert!(Intake::report(&path).unwrap()["retry_cursor"].is_null());
+        Intake::open(&path).unwrap();
+        assert_eq!(Store::summary(&path, USDC).unwrap()["transfer_count"], 1);
+    }
+
+    #[test]
+    fn broken_diagnostics_pipe_does_not_block_durable_retry() {
+        use std::{io::Write, process::Stdio};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("live.sqlite");
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "live::tests::process_exit_boundary_child",
+                "--ignored",
+            ])
+            .env("INDEXER_TEST_RECOVERY_DB", &path)
+            .env("INDEXER_TEST_RECOVERY_PHASE", "broken_diagnostics")
+            .stdin(Stdio::piped())
+            .stderr(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        drop(child.stderr.take());
+        child.stdin.take().unwrap().write_all(&[1]).unwrap();
+        assert_eq!(child.wait().unwrap().code(), Some(77));
+        assert_eq!(Store::summary(&path, USDC).unwrap()["transfer_count"], 1);
+        assert_eq!(Intake::report(&path).unwrap()["unresolved_items"], 0);
+    }
+
     #[test]
     fn finalized_mint_request_and_version_flags() {
         let req = request(123);

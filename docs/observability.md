@@ -145,3 +145,15 @@ report `known_fees_raw` with `unknown_fee_count`; zero known fees with a nonzero
 unknown count is not a zero-fee total. Range coverage describes instruction
 indexing, not completeness of optional fee/owner metadata. Execution ambiguity and
 unsupported instructions still block verified range coverage.
+
+### Retained-input retry diagnostics
+
+`live-retry` exposes `attempted`, `decoded`, `failed`, `retry_cursor`, `run_id`,
+and unknown coverage per bounded batch. Its start/completion events use
+component `live`, source `laserstream`, and mode `recovery`; partial batches retain
+an unresolved error class. `live-status` separately exposes `retry_cursor` and
+`retry_batch_limit`. The cursor describes scheduling only, not durable chain
+progress or verified coverage. Input age is preserved through retries. Invalid
+stored payload/schema can terminate a batch; the command error and retained
+unresolved input remain visible. See [recovery](recovery.md) for tested boundaries
+and remaining monitoring gaps.
