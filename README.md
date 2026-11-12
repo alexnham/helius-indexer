@@ -146,10 +146,14 @@ and telemetry/redaction/export failures.
 ```sh
 # Public mainnet RPC is the default; SOLANA_RPC_URL optionally selects an existing HTTPS endpoint.
 # Keep credential-bearing URLs in environment variables, never arguments or committed files.
-cargo run --locked -- backfill data/index.sqlite EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v 468265447 468265447 --metrics data/history.prom
-cargo run --locked -- coverage data/index.sqlite EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v 468265447 468265447
-cargo run --locked -- query data/index.sqlite EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+cargo run --locked -- backfill data/history.sqlite EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v 468265447 468265447 --metrics data/history.prom
+cargo run --locked -- coverage data/history.sqlite EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v 468265447 468265447
+cargo run --locked -- query data/history.sqlite EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
 ```
+
+Use a separate validation database until cross-source metadata reconciliation is
+implemented in the overlap ticket. A previously stored same-signature capture
+with different metadata is deliberately rejected rather than overwritten.
 
 `backfill DB MINT START END [--metrics NEW_FILE]` processes an inclusive range of
 at most 128 slots with one blocking request/transaction at a time. Each response
