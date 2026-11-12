@@ -1,5 +1,6 @@
 use helius_indexer::{
     Error, Result,
+    backfill::{History, RpcSource},
     decoder::{self, MAX_CAPTURE_BYTES},
     storage::Store,
     telemetry::Telemetry,
@@ -14,7 +15,7 @@ use std::{
     time::Instant,
 };
 
-const USAGE: &str = "usage: helius-indexer ingest DB CAPTURE [--metrics FILE] | query DB [MINT]";
+const USAGE: &str = "usage: helius-indexer ingest DB CAPTURE [--metrics FILE] | query DB [MINT] | backfill DB MINT START END [--metrics FILE] | coverage DB MINT START END";
 
 fn ingest(db: &str, input: &str, telemetry: &mut Telemetry) -> Result<serde_json::Value> {
     let started = Instant::now();
@@ -69,6 +70,54 @@ fn ingest(db: &str, input: &str, telemetry: &mut Telemetry) -> Result<serde_json
 
 fn run(args: &[String], telemetry: &mut Telemetry) -> Result<serde_json::Value> {
     match args {
+        [command, db, mint, start, end] if command == "coverage" => {
+            let start = start
+                .parse()
+                .map_err(|_| Error("invalid_historical_range"))?;
+            let end = end.parse().map_err(|_| Error("invalid_historical_range"))?;
+            Ok(
+                serde_json::to_value(History::open(Path::new(db))?.coverage(mint, start, end)?)
+                    .map_err(|_| Error("serialization_failed"))?,
+            )
+        }
+        [command, db, mint, start, end, rest @ ..] if command == "backfill" => {
+            let metrics_file = match rest {
+                [] => None,
+                [flag, file] if flag == "--metrics" => Some(file),
+                _ => return Err(Error(USAGE)),
+            };
+            let start = start
+                .parse()
+                .map_err(|_| Error("invalid_historical_range"))?;
+            let end = end.parse().map_err(|_| Error("invalid_historical_range"))?;
+            telemetry.set_context("backfill", "rpc", "historical");
+            let mut history = History::open(Path::new(db))?;
+            telemetry.run_id = history.run_id().to_owned();
+            history.coverage(mint, start, end)?;
+            let endpoint = env::var("SOLANA_RPC_URL")
+                .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".into());
+            let cancel = env::var_os("BACKFILL_CANCEL_FILE");
+            let mut source = RpcSource::new(endpoint)?;
+            let (coverage, metrics) = history.run(mint, start, end, &mut source, || {
+                cancel.as_ref().is_some_and(|p| Path::new(p).exists())
+            })?;
+            if let Some(file) = metrics_file
+                && std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(file)
+                    .and_then(|mut f| f.write_all(metrics.prometheus(&coverage).as_bytes()))
+                    .is_err()
+            {
+                telemetry.emit(
+                    "metrics_export_failed",
+                    "metrics_export",
+                    "failed",
+                    Some("metrics_export_failed"),
+                );
+            }
+            Ok(json!({"coverage":coverage,"metrics":metrics}))
+        }
         [command, db, input] if command == "ingest" => ingest(db, input, telemetry),
         [command, db, input, flag, _] if command == "ingest" && flag == "--metrics" => {
             ingest(db, input, telemetry)
