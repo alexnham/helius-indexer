@@ -166,6 +166,7 @@ pub struct History {
     db: Connection,
     path: PathBuf,
     telemetry: crate::telemetry::Telemetry,
+    gate: std::sync::Arc<crate::coordinator::WriteGate>,
 }
 fn now() -> u64 {
     SystemTime::now()
@@ -180,7 +181,7 @@ fn write_error(_: rusqlite::Error) -> Error {
 fn read_error(_: rusqlite::Error) -> Error {
     Error("history_read_failed")
 }
-fn scope(mint: &str, start: u64, end: u64) -> Result<()> {
+pub(crate) fn scope(mint: &str, start: u64, end: u64) -> Result<()> {
     if start > end || end > i64::MAX as u64 || end - start >= MAX_SLOTS {
         return Err(Error("invalid_historical_range"));
     }
@@ -219,7 +220,11 @@ impl History {
             db,
             path: path.to_path_buf(),
             telemetry,
+            gate: std::sync::Arc::new(crate::coordinator::WriteGate::default()),
         })
+    }
+    pub fn set_gate(&mut self, gate: std::sync::Arc<crate::coordinator::WriteGate>) {
+        self.gate = gate;
     }
     pub fn run_id(&self) -> &str {
         &self.telemetry.run_id
@@ -284,6 +289,7 @@ impl History {
         error: Option<&str>,
         time: Option<i64>,
     ) -> Result<()> {
+        let _permit = self.gate.historical()?;
         self.db.execute("UPDATE historical_slots SET status=?1,error_class=?2,block_time=?3 WHERE mint=?4 AND decoder=?5 AND slot=?6",params![status,error,time,mint,decoder::DECODER_VERSION,slot as i64]).map_err(write_error)?;
         Ok(())
     }
@@ -299,11 +305,15 @@ impl History {
     ) -> Result<(Coverage, Metrics)> {
         scope(mint, start, end)?;
         for slot in start..=end {
+            let _permit = self.gate.historical()?;
             self.db.execute("INSERT OR IGNORE INTO historical_slots(mint,decoder,slot,status,first_pending) VALUES (?1,?2,?3,'unknown',?4)",params![mint,decoder::DECODER_VERSION,slot as i64,now() as i64]).map_err(write_error)?;
         }
         let started = Instant::now();
         let mut metrics = Metrics::default();
-        let mut store = Store::open(&self.path)?;
+        let mut store = {
+            let _permit = self.gate.historical()?;
+            Store::open(&self.path)?
+        };
         for slot in start..=end {
             if cancelled() {
                 metrics.cancelled = true;
@@ -325,7 +335,10 @@ impl History {
                     None,
                 );
             }
-            self.db.execute("UPDATE historical_slots SET attempts=attempts+1 WHERE mint=?1 AND decoder=?2 AND slot=?3",params![mint,decoder::DECODER_VERSION,slot as i64]).map_err(write_error)?;
+            {
+                let _permit = self.gate.historical()?;
+                self.db.execute("UPDATE historical_slots SET attempts=attempts+1 WHERE mint=?1 AND decoder=?2 AND slot=?3",params![mint,decoder::DECODER_VERSION,slot as i64]).map_err(write_error)?;
+            }
             let cached: Option<Vec<u8>> = if current.error_class.is_none()
                 || current.error_class.as_deref() == Some("cancelled")
                 || current
@@ -364,9 +377,13 @@ impl History {
             };
             metrics.input_bytes += raw.len() as u64;
             // Raw input acknowledgment precedes decoding. Every failed attempt remains reproducible.
-            self.db.execute("INSERT INTO historical_inputs VALUES (?1,?2,?3,?4,'finalized-mainnet-rpc',?5,?6)",params![mint,decoder::DECODER_VERSION,slot as i64,(current.attempts+1) as i64,now() as i64,raw]).map_err(write_error)?;
+            {
+                let _permit = self.gate.historical()?;
+                self.db.execute("INSERT INTO historical_inputs VALUES (?1,?2,?3,?4,'finalized-mainnet-rpc',?5,?6)",params![mint,decoder::DECODER_VERSION,slot as i64,(current.attempts+1) as i64,now() as i64,raw]).map_err(write_error)?;
+            }
             let failures_before = metrics.decode_failures;
-            let outcome = process_block(&raw, slot, &mut store, &mut metrics, &cancelled);
+            let outcome =
+                process_block(&raw, slot, &mut store, &mut metrics, &cancelled, &self.gate);
             match outcome {
                 Ok((parent, time)) => {
                     // A finalized child links directly to its parent; intermediate slots are skipped.
@@ -425,6 +442,7 @@ fn process_block(
     store: &mut Store,
     metrics: &mut Metrics,
     cancelled: &impl Fn() -> bool,
+    gate: &crate::coordinator::WriteGate,
 ) -> Result<(u64, Option<i64>)> {
     let value: Value = serde_json::from_slice(raw).map_err(|_| Error("invalid_block_json"))?;
     if value["jsonrpc"] != "2.0" || value["id"] != 1 || value.get("error").is_some() {
@@ -487,6 +505,7 @@ fn process_block(
         }
         let decoded = decoder::decode(&parsed);
         if decoded.is_ok() {
+            let _permit = gate.historical()?;
             store.persist(&parsed, &bytes, &decoded)?;
         }
         match decoded {

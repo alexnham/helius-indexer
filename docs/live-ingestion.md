@@ -30,8 +30,9 @@ This is a local validation slice for issue #2; production readiness is pending.
   than silently skipped. `getSlot(finalized)` records an independent reference.
 - [Plans](https://www.helius.dev/docs/billing/plans) and
   [credits](https://www.helius.dev/docs/billing/credits#laserstream-grpc) describe
-  paid mainnet access and metered streaming. No paid run or price/capacity
-  measurement was performed. Measured protobuf bytes are not billed bytes.
+  paid mainnet access and metered streaming. A bounded credentialed check is
+  recorded in the overlap validation results; provider price/capacity was not
+  benchmarked. Measured protobuf bytes are not billed bytes.
 
 The implementation uses the generated Helius protobuf client directly with
 Tonic TLS, rather than the SDK's automatic reconnect loop: SDK 2.0.0 resets its
@@ -54,7 +55,8 @@ cargo run --locked -- live-retry data/live.sqlite
 cargo run --locked -- query data/live.sqlite EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
 ```
 
-Use a separate validation database until the overlap ticket reconciles source metadata.
+Compatible sources can now share a validation database; use the combined overlap
+command when coordinated write priority is needed.
 Replace START_SLOT with an explicitly chosen replayable slot. Time must be 1–300
 seconds; intake stops at 10,000 received transactions even if time remains.
 Subscription attempts stop at three; connection timeout is five seconds,
@@ -94,9 +96,15 @@ open rather than guessed. There is no verified contiguous checkpoint to advance.
 
 Stream transactions have no block time. Normalized captures retain null time;
 raw protobuf remains sufficient to re-normalize after corroboration supplies
-historical block time. Overlapping RPC captures with differing result metadata
-currently produce `capture_conflict`, preserving both raw inputs for deliberate
-reconciliation. Do not treat this slice as the complete overlap/recovery ticket.
+historical block time. Compatible RPC observations now coalesce and can enrich the null timestamp;
+contradictory known identity or effect values remain quarantined conflicts.
+See [overlap validation](overlap.md) for exact compatibility and scope. Raw source
+inputs remain available. This does not establish full live-window coverage or
+implement decoder revision corrections.
+
+Both sources persist the same full supported transaction record set, including
+related mints; the USDC subscription selects candidates and query filters select
+returned assets. This avoids source-dependent record sets.
 
 JSON stderr events share run correlation, source context, timestamps and bounded
 error classes with terminal command failures. They cover startup/retry, connection end/error, unresolved decoding

@@ -124,12 +124,8 @@ impl Intake {
         let result = (|| {
             let raw = normalize(update)?;
             let capture = decoder::parse_capture(&raw)?;
-            let decoded = decoder::decode(&capture).map(|records| {
-                records
-                    .into_iter()
-                    .filter(|t| t.mint == USDC)
-                    .collect::<Vec<_>>()
-            });
+            // Persist the same complete record set as historical ingestion. Filter queries by mint.
+            let decoded = decoder::decode(&capture);
             let count = self.store.persist(&capture, &raw, &decoded)?;
             decoded?;
             Ok(count)
@@ -219,8 +215,15 @@ impl Intake {
                 |r| r.get(0),
             )
             .map_err(|_| Error("storage_read_failed"))?;
+        let oldest: Option<i64> = db
+            .query_row(
+                "SELECT MIN(received_at) FROM live_raw WHERE status!='decoded'",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|_| Error("storage_read_failed"))?;
         Ok(
-            json!({"state":if runs.is_empty(){"uninitialized"}else{"partial"},"mint":USDC,"decoder_version":decoder::DECODER_VERSION,"verified_boundary":null,"coverage":"unknown","unresolved_items":pending,"runs":runs,"limit":100,"reason":"filtered_finalized_stream_has_no_validated_completion_evidence"}),
+            json!({"oldest_unresolved_age_seconds":if pending==0{Some(0)}else{oldest.and_then(age)},"state":if runs.is_empty(){"uninitialized"}else{"partial"},"mint":USDC,"decoder_version":decoder::DECODER_VERSION,"verified_boundary":null,"coverage":"unknown","unresolved_items":pending,"runs":runs,"limit":100,"reason":"filtered_finalized_stream_has_no_validated_completion_evidence"}),
         )
     }
 }
@@ -236,13 +239,7 @@ fn now() -> i64 {
 }
 
 /// Only this explicitly opted-in command opens a provider connection.
-pub fn run(
-    path: &Path,
-    from: u64,
-    seconds: u64,
-    telemetry: &mut crate::telemetry::Telemetry,
-) -> Result<Value> {
-    telemetry.set_context("live_ingestion", "laserstream", "live");
+pub fn validate_options(from: u64, seconds: u64) -> Result<()> {
     if !(1..=300).contains(&seconds) || from > i64::MAX as u64 {
         return Err(Error("invalid_live_bounds"));
     }
@@ -253,19 +250,51 @@ pub fn run(
     if api_key.is_empty() {
         return Err(Error("missing_live_credentials"));
     }
+    Ok(())
+}
+pub fn run(
+    path: &Path,
+    from: u64,
+    seconds: u64,
+    telemetry: &mut crate::telemetry::Telemetry,
+) -> Result<Value> {
+    run_admitted(
+        path,
+        from,
+        seconds,
+        telemetry,
+        &crate::coordinator::WriteGate::default(),
+    )
+}
+pub fn run_admitted(
+    path: &Path,
+    from: u64,
+    seconds: u64,
+    telemetry: &mut crate::telemetry::Telemetry,
+    gate: &crate::coordinator::WriteGate,
+) -> Result<Value> {
+    telemetry.set_context("live_ingestion", "laserstream", "live");
+    validate_options(from, seconds)?;
+    let api_key = std::env::var("HELIUS_API_KEY").map_err(|_| Error("missing_live_credentials"))?;
     // Fixed canonical mainnet endpoint prevents credential-bearing URLs entering diagnostics/config.
     let token: tonic::metadata::MetadataValue<_> = api_key
         .parse()
         .map_err(|_| Error("invalid_live_credentials"))?;
-    let mut intake = Intake::open(path)?;
-    intake
-        .db
-        .execute(
-            "INSERT INTO live_runs(from_slot,mint,decoder,status) VALUES(?1,?2,?3,'running')",
-            params![from as i64, USDC, decoder::DECODER_VERSION],
-        )
-        .map_err(|_| Error("storage_write_failed"))?;
-    let run = intake.db.last_insert_rowid();
+    let mut intake = {
+        let _permit = gate.live()?;
+        Intake::open(path)?
+    };
+    let run = {
+        let _permit = gate.live()?;
+        intake
+            .db
+            .execute(
+                "INSERT INTO live_runs(from_slot,mint,decoder,status) VALUES(?1,?2,?3,'running')",
+                params![from as i64, USDC, decoder::DECODER_VERSION],
+            )
+            .map_err(|_| Error("storage_write_failed"))?;
+        intake.db.last_insert_rowid()
+    };
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -316,6 +345,7 @@ pub fn run(
                         if tx.slot<from {return Err(Error("unexpected_slot"));}
                         telemetry.slot=Some(tx.slot);
                         bytes=bytes.saturating_add(tx.encoded_len());
+                        let _permit=gate.live()?;
                         let operation=Instant::now();
                         let id=intake.retain(&tx)?;
                         raw_seconds+=operation.elapsed().as_secs_f64();
@@ -339,13 +369,16 @@ pub fn run(
         }).await.unwrap_or(Ok("time_limit"))
     });
     let status = result.as_ref().map_or_else(|e| e.0, |s| *s);
-    intake
-        .db
-        .execute(
-            "UPDATE live_runs SET status=?1 WHERE id=?2",
-            params![status, run],
-        )
-        .map_err(|_| Error("storage_write_failed"))?;
+    {
+        let _permit = gate.live()?;
+        intake
+            .db
+            .execute(
+                "UPDATE live_runs SET status=?1 WHERE id=?2",
+                params![status, run],
+            )
+            .map_err(|_| Error("storage_write_failed"))?;
+    }
     event(telemetry, "shutdown", status);
     let elapsed = started.elapsed().as_secs_f64();
     let report = json!({"status":status,"received":count,"unresolved_attempts":failures,"input_protobuf_bytes":bytes,"elapsed_seconds":elapsed,"reconnect_attempts":reconnects,"inserted_transfers":inserted,"input_transactions_per_second":count as f64/elapsed,"decoded_write_successes":output_successes,"coverage_valid":false,"verified_boundary":null,"freshness_seconds":null,"coverage":Intake::report(path)?});

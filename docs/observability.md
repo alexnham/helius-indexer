@@ -125,3 +125,13 @@ and margin; verified freshness/slot gap remain unknown and coverage-valid zero.
 Stderr write failure cannot undo durable input. Continuous refresh, histograms,
 backlog-age metrics and independent finalized completion evidence remain pending;
 see [live validation](live-ingestion.md).
+
+## Combined source validation
+
+The overlap command includes a terminal admission-gate snapshot: active writes,
+waiting live/historical operations, oldest wait age, admission counts and elapsed
+wait sums. A gate operation is not a unique transaction; deduplicated counts and
+volume come from the storage summary. Existing source reports retain separate
+durable input, decoded output, and verified coverage progress. The public gate
+snapshot is inspectable during embedded runs; no continuous monitoring endpoint
+is added. See [overlap validation](overlap.md) for scope and proof limits.
