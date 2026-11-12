@@ -4,7 +4,7 @@ use std::collections::HashSet;
 
 pub const SPL_TOKEN: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 pub const TOKEN_2022: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
-pub const DECODER_VERSION: &str = "token-transfers-v3";
+pub const DECODER_VERSION: &str = "token-transfers-v4";
 pub const MAX_CAPTURE_BYTES: usize = 16 * 1024 * 1024;
 
 pub fn parse_capture(bytes: &[u8]) -> Result<Capture> {
@@ -206,6 +206,17 @@ fn decode_instruction(
         .map_err(|_| Error("invalid_token_instruction"))?;
     let mut data = data;
     let mut fee_raw = if program == SPL_TOKEN { Some(0) } else { None };
+    // Harvesting withheld fees is mint-associated activity, not an instructed transfer edge.
+    if program == TOKEN_2022 && data.as_slice() == [26, 4] && !ix.accounts.is_empty() {
+        return Ok(());
+    }
+    // Unwrapping moves native lamports, which are outside the token-transfer index.
+    if data.first() == Some(&45)
+        && ix.accounts.len() >= 3
+        && (data.as_slice() == [45, 0] || (data.len() == 10 && data[1] == 1))
+    {
+        return Ok(());
+    }
     // A successful checked-with-fee call validates this fee against execution-time mint state.
     if program == TOKEN_2022 && data.first() == Some(&26) {
         if data.len() != 19 || data[1] != 1 {
@@ -256,9 +267,6 @@ fn decode_instruction(
         }
         if source == destination || amount_raw == 0 || tag == 3 {
             fee_raw = Some(0);
-        }
-        if fee_raw.is_none() {
-            return Err(Error("missing_historical_fee_evidence"));
         }
     }
     let signature = tx

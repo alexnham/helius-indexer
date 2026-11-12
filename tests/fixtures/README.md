@@ -53,3 +53,23 @@ were removed. It catches the former source discrepancy where live ingestion
 filtered records before persistence while historical ingestion stored both.
 The wire view used in tests is synthesized from these known fields, not presented
 as a raw captured gRPC packet. No credential-bearing transport data is included.
+
+## Three-slot coverage corpus
+
+`mainnet-coverage.json` contains 38 successful transactions from finalized RPC
+blocks 468377243–468377245 retained in the bounded 2026-11-12 validation. It includes
+97 classic SPL USDC instruction edges identified independently with Python
+base58/integer parsing, not Rust decoder output. Each expected edge fixes its
+signature/instruction identity, instructed amount, and source/destination token
+accounts. The corpus excludes transactions with runtime failure evidence.
+Application logs and return data were removed; runtime execution evidence and
+compiled instructions remain. This is a fixed regression corpus, not proof of
+all-chain completeness or Token-2022 fee configuration. `tests/coverage.rs` checks
+decoding, exact values, persisted uniqueness, and summary volume across retries.
+
+`mainnet-unwrap.json` is a finalized classic SPL UnwrapLamports capture from slot
+468377243. `mainnet-fee-maintenance.json` is a finalized Token-2022
+HarvestWithheldTokensToMint capture from slot 468522222, retained during the
+second five-second check. Both preserve runtime evidence with application logs
+and return data removed. Neither contains an ordinary instructed transfer edge;
+these are captured exclusions, not synthetic successful transfers.

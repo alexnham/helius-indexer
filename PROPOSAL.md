@@ -184,8 +184,9 @@ before decoding; finalized filtered delivery leaves slot coverage unknown pendin
 independent completion corroboration. This does not resolve production choices.
 
 The offline Token-2022 fee slice supports execution-validated explicit fees and
-known-zero cases; ordinary checked transfers without historical fee evidence
-remain durably unresolved. See the [support matrix](docs/token-2022-support.md)
+known-zero cases. Ordinary checked transfers retain their known instructed
+amount with a null fee when historical fee evidence is unavailable; summaries
+count those unknown fees separately. See the [support matrix](docs/token-2022-support.md)
 for exact variants and validation limits.
 
 The bounded overlap validation combines the two source workers with live-priority
