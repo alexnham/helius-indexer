@@ -1,0 +1,6 @@
+/target/
+/data/
+*.sqlite*
+.env
+.env.*
+!.env.example

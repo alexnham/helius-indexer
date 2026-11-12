@@ -1,0 +1,14 @@
+[package]
+name = "helius-indexer"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+
+[dependencies]
+bs58 = "0.5.1"
+rusqlite = { version = "0.42", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
