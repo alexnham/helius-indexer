@@ -15,7 +15,7 @@ use std::{
     time::Instant,
 };
 
-const USAGE: &str = "usage: helius-indexer ingest DB CAPTURE [--metrics FILE] | query DB [MINT] | backfill DB MINT START END [--metrics FILE] | coverage DB MINT START END | live DB FROM_SLOT SECONDS | live-status DB | live-retry DB";
+const USAGE: &str = "usage: helius-indexer ingest DB CAPTURE [--metrics FILE] | query DB [MINT] | backfill DB MINT START END [--metrics FILE] | coverage DB MINT START END | live DB FROM_SLOT SECONDS | live-status DB | live-retry DB | summary DB MINT | overlap DB START END SECONDS";
 
 fn ingest(db: &str, input: &str, telemetry: &mut Telemetry) -> Result<serde_json::Value> {
     let started = Instant::now();
@@ -70,6 +70,18 @@ fn ingest(db: &str, input: &str, telemetry: &mut Telemetry) -> Result<serde_json
 
 fn run(args: &[String], telemetry: &mut Telemetry) -> Result<serde_json::Value> {
     match args {
+        [command, db, mint] if command == "summary" => Store::summary(Path::new(db), mint),
+        [command, db, start, end, seconds] if command == "overlap" => {
+            helius_indexer::coordinator::run(
+                Path::new(db),
+                start
+                    .parse()
+                    .map_err(|_| Error("invalid_historical_range"))?,
+                end.parse().map_err(|_| Error("invalid_historical_range"))?,
+                seconds.parse().map_err(|_| Error("invalid_live_bounds"))?,
+                telemetry,
+            )
+        }
         [command, db, mint, start, end] if command == "coverage" => {
             let start = start
                 .parse()

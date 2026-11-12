@@ -42,3 +42,14 @@ committed files and never contact an RPC provider.
 
 The sanitized Token-2022 mainnet capture and its supported/unsupported evidence
 are documented in [the support matrix](../../docs/token-2022-support.md).
+
+## Mixed-token regression
+
+`mainnet-mixed-transfer.json` was retained from the bounded finalized RPC check
+recorded on 2026-11-12, slot 468377243. It contains a USDC transfer and a related
+classic SPL transfer for another mint in one transaction. Public instruction and
+execution evidence are preserved; free-form application logs and return data
+were removed. It catches the former source discrepancy where live ingestion
+filtered records before persistence while historical ingestion stored both.
+The wire view used in tests is synthesized from these known fields, not presented
+as a raw captured gRPC packet. No credential-bearing transport data is included.

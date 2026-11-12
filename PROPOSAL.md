@@ -187,3 +187,10 @@ The offline Token-2022 fee slice supports execution-validated explicit fees and
 known-zero cases; ordinary checked transfers without historical fee evidence
 remain durably unresolved. See the [support matrix](docs/token-2022-support.md)
 for exact variants and validation limits.
+
+The bounded overlap validation combines the two source workers with live-priority
+write admission and immediate compatible-observation coalescing. Its historical
+coverage is scoped to the requested finite range, while the stream tail remains
+unverified. See [overlap validation](docs/overlap.md) for measured evidence, storage
+semantics, and the bounded credentialed check with its remaining coverage gaps. This does not select
+a production architecture or establish production capacity.

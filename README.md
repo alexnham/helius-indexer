@@ -97,13 +97,13 @@ Bundled SQLite keeps local and CI behavior consistent. Raw capture, decode statu
 and all transfers commit in one transaction, with WAL and `synchronous=FULL`.
 Writes wait at most five seconds for contention.
 
-Identical result replay is a no-op, independent of capture source metadata.
-Conflicting results or decoder revisions for the same signature are rejected;
-the later correction ticket supplies deliberate replacement/removal semantics.
-No record silently overwrites a different transaction result. Current capture and
-transfer tables are the initial schema; production migration/version policy is
-not established. Database files and raw captures may contain public account data;
-keep operational databases outside version control.
+Compatible same-revision observations coalesce immediately by deterministic
+transfer identity. Unknown metadata may be enriched; contradictory known values
+or decoder revisions are quarantined/rejected. Raw source observations are
+retained in an additive audit table. See [overlap validation](docs/overlap.md)
+for compatibility, rollback, and storage-overhead limits. Decoder corrections
+that add/remove/change semantic transfers remain ticket #8. Keep operational
+databases outside version control.
 
 ## Telemetry
 
@@ -150,9 +150,9 @@ cargo run --locked -- coverage data/history.sqlite EPjFWdd5AufqSSqeM2qN1xzybapC8
 cargo run --locked -- query data/history.sqlite EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
 ```
 
-Use a separate validation database until cross-source metadata reconciliation is
-implemented in the overlap ticket. A previously stored same-signature capture
-with different metadata is deliberately rejected rather than overwritten.
+Compatible stream/RPC observations can share a validation database. Use the
+combined command below when write priority matters; contradictory semantic
+values remain errors rather than being silently overwritten.
 
 `backfill DB MINT START END [--metrics NEW_FILE]` processes an inclusive range of
 at most 128 slots with one blocking request/transaction at a time. Each response
@@ -187,8 +187,9 @@ An unsupported unrelated transaction conservatively blocks that entire slot.
 The historical tables retain full raw responses, receive times, source kind,
 attempt numbers and unresolved slot error classes. Failed candidates remain in
 those raw blocks rather than `captures`; enriched source metadata can repair them
-on retry. Successful decoded captures remain immutable under the existing store
-contract. No decoder revision correction/removal semantics are introduced.
+on retry. Successful effects keep their identity and known semantic values; compatible
+unknown metadata can be enriched. Decoder revision correction/removal semantics
+remain outside this slice.
 SQLite acknowledgment precedes coverage acknowledgment. A crash after raw/output
 writes leaves coverage unknown; restart reuses durable raw input after interruption
 and deduplicates output. Missing/unsupported metadata is refetched on retry.
@@ -212,7 +213,17 @@ A credential-configured opt-in LaserStream command now retains raw protobufs and
 decodes USDC candidates. See [live validation](docs/live-ingestion.md) for bounds,
 commands, verified provider sources, retry behavior and acceptance gaps. Queries
 include live-run diagnostics; finalized filtered intake alone leaves coverage
-unknown. No credentialed run or production readiness claim has been made.
+unknown. A bounded credentialed check and its coverage limitations are recorded
+in [validation results](docs/validation/2026-11-12-overlap.md); production readiness
+is not established.
 
 Token-2022 supported transfers and historical fee evidence are described in
 [the support matrix](docs/token-2022-support.md).
+
+## Combined overlap validation
+
+`overlap DB START_SLOT END_SLOT SECONDS` runs the bounded USDC live and historical
+workers with shared live-priority write admission. `summary DB MINT` reports exact
+unique-row counts and known volume/fees for all stored data. It does not apply the
+future production rolling window. Read [the overlap contract](docs/overlap.md)
+for opt-in commands, verified scope, tests, and remaining coverage gaps.

@@ -1,7 +1,9 @@
 pub mod backfill;
+pub mod coordinator;
 pub mod decoder;
 pub mod live;
 pub mod model;
+mod reconcile;
 pub mod storage;
 pub mod telemetry;
 

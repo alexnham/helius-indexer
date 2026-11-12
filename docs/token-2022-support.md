@@ -52,7 +52,8 @@ logs and return data were removed; public runtime evidence and compiled bytes
 remain. Fee-enabled cases in tests are synthetic instruction-layout regressions,
 not claimed on-chain fee captures or independent completeness validation.
 
-Storage schema is unchanged. New decoder revision intentionally conflicts with
+Fee support itself does not change storage schema; the overlap slice adds source
+auditing separately. The decoder revision intentionally conflicts with
 previously ingested same-signature captures: use a fresh offline database and
 reingest retained files. Automated revision replacement is pending #8. Existing
 JSON records remain readable. No production migration is implied.
