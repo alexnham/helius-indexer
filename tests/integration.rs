@@ -206,7 +206,7 @@ fn missing_or_invalid_metadata_never_silently_becomes_complete() {
 fn token_2022_unknown_opcodes_and_owner_changes_are_explicitly_unsupported() {
     let mut value = capture();
     value["result"]["transaction"]["message"]["accountKeys"][0] = json!(TOKEN_2022);
-    assert_eq!(decode(&value).unwrap_err().0, "unsupported_token_2022");
+    assert_eq!(decode(&value).unwrap_err().0, "conflicting_token_program");
     value = capture();
     value["result"]["transaction"]["message"]["instructions"][0] =
         instruction(255, 1, vec![1, 2, 4]);
@@ -530,4 +530,149 @@ fn every_failure_event_keeps_context_even_when_decode_and_storage_fail() {
     );
     assert!(events.iter().any(|e| e["event"] == "metrics_export_failed"));
     assert!(events.iter().any(|e| e["event"] == "command_failed"));
+}
+
+fn token_2022_capture(amount: u64, fee: Option<u64>) -> Value {
+    let mut value = capture();
+    value["result"]["transaction"]["message"]["accountKeys"][0] = json!(TOKEN_2022);
+    for field in ["preTokenBalances", "postTokenBalances"] {
+        for balance in value["result"]["meta"][field].as_array_mut().unwrap() {
+            balance["programId"] = json!(TOKEN_2022);
+        }
+    }
+    let mut bytes = if fee.is_some() { vec![26, 1] } else { vec![12] };
+    bytes.extend(amount.to_le_bytes());
+    bytes.push(6);
+    if let Some(fee) = fee {
+        bytes.extend(fee.to_le_bytes());
+    }
+    value["result"]["transaction"]["message"]["instructions"] = json!([
+        {"programIdIndex":0,"accounts":[1,3,2,4],"data":bs58::encode(bytes).into_string()}
+    ]);
+    value
+}
+
+#[test]
+fn token_2022_fee_evidence_survives_persistence_exactly() {
+    for (amount, fee) in [(u64::MAX, u64::MAX), (100, 1), (100, 0), (0, 0)] {
+        let mut value = token_2022_capture(amount, Some(fee));
+        let ix = value["result"]["transaction"]["message"]["instructions"][0].clone();
+        value["result"]["meta"]["innerInstructions"] = json!([{"index":0,"instructions":[ix]}]);
+        value["result"]["meta"]["logMessages"] = json!([
+            format!("Program {TOKEN_2022} invoke [1]"),
+            format!("Program {TOKEN_2022} invoke [2]"),
+            format!("Program {TOKEN_2022} success"),
+            format!("Program {TOKEN_2022} success")
+        ]);
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("fee.sqlite");
+        assert_eq!(persist(&db, &value).unwrap(), 2);
+        assert_eq!(persist(&db, &value).unwrap(), 0);
+        let rows = Store::query(&db, None, 1000).unwrap();
+        assert_eq!(rows.len(), 2);
+        for row in &rows {
+            assert_eq!(row.amount_raw, amount);
+            assert_eq!(row.fee_raw, Some(fee));
+            assert!(!row.confidential);
+        }
+        assert_eq!(rows[0].inner_instruction_index, None);
+        assert_eq!(rows[1].inner_instruction_index, Some(0));
+        assert_ne!(rows[0].transfer_id, rows[1].transfer_id);
+        value["result"]["meta"]["logMessages"] = json!([]);
+        assert_eq!(
+            decode(&value).unwrap_err().0,
+            "incomplete_execution_evidence"
+        );
+    }
+}
+
+#[test]
+fn missing_historical_fee_evidence_is_durable_and_zero_is_known() {
+    let dir = TempDir::new().unwrap();
+    let db = dir.path().join("unknown.sqlite");
+    let value = token_2022_capture(100, None);
+    assert_eq!(
+        persist(&db, &value).unwrap_err().0,
+        "missing_historical_fee_evidence"
+    );
+    assert!(Store::query(&db, None, 1000).unwrap().is_empty());
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let (status, raw): (String, Vec<u8>) = conn
+        .query_row("SELECT status,capture_json FROM captures", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(status, "missing_historical_fee_evidence");
+    assert_eq!(serde_json::from_slice::<Value>(&raw).unwrap(), value);
+    assert_eq!(
+        decode(&token_2022_capture(0, None)).unwrap()[0].fee_raw,
+        Some(0)
+    );
+    let mut self_transfer = token_2022_capture(100, Some(1));
+    self_transfer["result"]["transaction"]["message"]["instructions"][0]["accounts"][2] = json!(1);
+    assert_eq!(decode(&self_transfer).unwrap()[0].fee_raw, Some(0));
+    assert_eq!(
+        decode(&token_2022_capture(1, Some(2))).unwrap_err().0,
+        "invalid_transfer_fee"
+    );
+}
+
+#[test]
+fn captured_token_2022_mints_require_historical_fee_evidence() {
+    let capture =
+        decoder::parse_capture(include_bytes!("fixtures/mainnet-token-2022.json")).unwrap();
+    assert_eq!(capture.result.slot, 468265270);
+    assert_eq!(
+        decoder::decode(&capture).unwrap_err().0,
+        "missing_historical_fee_evidence"
+    );
+}
+
+#[test]
+fn token_2022_caught_parent_failure_and_metrics_are_bounded() {
+    let mut value = token_2022_capture(100, Some(1));
+    let ix = value["result"]["transaction"]["message"]["instructions"][0].clone();
+    value["result"]["meta"]["innerInstructions"] = json!([{"index":0,"instructions":[ix]}]);
+    value["result"]["meta"]["logMessages"] = json!([
+        format!("Program {TOKEN_2022} invoke [1]"),
+        format!("Program {TOKEN_2022} success"),
+        format!("Program {TOKEN_2022} invoke [2]"),
+        format!("Program {TOKEN_2022} success"),
+        format!("Program {} failed: caught parent failure", key(8))
+    ]);
+    assert_eq!(
+        decode(&value).unwrap_err().0,
+        "unsupported_caught_token_failure"
+    );
+    let dir = TempDir::new().unwrap();
+    let db = dir.path().join("failed.sqlite");
+    let input = dir.path().join("input.json");
+    let metrics = dir.path().join("metrics.prom");
+    std::fs::write(&input, serde_json::to_vec(&value).unwrap()).unwrap();
+    let result = cli(&[
+        "ingest",
+        db.to_str().unwrap(),
+        input.to_str().unwrap(),
+        "--metrics",
+        metrics.to_str().unwrap(),
+    ]);
+    assert!(!result.status.success());
+    assert!(Store::query(&db, None, 1000).unwrap().is_empty());
+    let text = std::fs::read_to_string(metrics).unwrap();
+    assert!(text.contains("failure_class=\"invalid_or_unsupported\""));
+    assert!(!text.contains(TOKEN_2022));
+    assert!(!text.contains(&signature()));
+}
+
+#[test]
+fn token_2022_unchecked_and_malformed_extension_boundaries() {
+    let mut value = token_2022_capture(42, None);
+    value["result"]["transaction"]["message"]["instructions"][0] =
+        instruction(3, 42, vec![1, 2, 4]);
+    assert_eq!(decode(&value).unwrap()[0].fee_raw, Some(0));
+    for bytes in [vec![26], vec![26, 1], vec![26, 5], vec![27], vec![37]] {
+        value["result"]["transaction"]["message"]["instructions"][0]["data"] =
+            json!(bs58::encode(bytes).into_string());
+        assert!(decode(&value).is_err());
+    }
 }
