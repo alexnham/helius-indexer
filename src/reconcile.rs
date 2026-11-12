@@ -61,22 +61,73 @@ pub fn compatible_results(prior: &Value, incoming: &Value) -> Result<()> {
 }
 
 /// Keep known optional identity metadata when a later source omits it.
-pub fn reference(prior: &Value, incoming: &Value) -> Value {
+fn retain(prior: &Value, incoming: &Value) -> Value {
     match (prior, incoming) {
         (_, Value::Null) => prior.clone(),
         (Value::Object(a), Value::Object(b)) => {
             let mut result = b.clone();
             for (key, old) in a {
-                result.insert(
-                    key.clone(),
-                    reference(old, b.get(key).unwrap_or(&Value::Null)),
-                );
+                result.insert(key.clone(), retain(old, b.get(key).unwrap_or(&Value::Null)));
             }
             Value::Object(result)
         }
         _ => incoming.clone(),
     }
 }
+pub fn reference(prior: &Value, incoming: &Value) -> Result<Value> {
+    let mut result = retain(prior, incoming);
+    for field in ["preTokenBalances", "postTokenBalances"] {
+        let pointer = format!("/meta/{field}");
+        if let (Some(a), Some(b)) = (
+            prior.pointer(&pointer).and_then(Value::as_array),
+            incoming.pointer(&pointer).and_then(Value::as_array),
+        ) {
+            let mut balances = std::collections::BTreeMap::new();
+            for value in a {
+                let index = value["accountIndex"]
+                    .as_u64()
+                    .filter(|n| *n < 256)
+                    .ok_or(Error("invalid_token_balance_index"))?;
+                if balances.insert(index, value.clone()).is_some() {
+                    return Err(Error("invalid_token_balance_index"));
+                }
+            }
+            let mut seen = std::collections::HashSet::new();
+            for value in b {
+                let index = value["accountIndex"]
+                    .as_u64()
+                    .filter(|n| *n < 256)
+                    .ok_or(Error("invalid_token_balance_index"))?;
+                if !seen.insert(index) {
+                    return Err(Error("invalid_token_balance_index"));
+                }
+                if let Some(old) = balances.get(&index) {
+                    for path in [
+                        "/mint",
+                        "/owner",
+                        "/programId",
+                        "/uiTokenAmount/decimals",
+                        "/uiTokenAmount/amount",
+                    ] {
+                        if let (Some(a), Some(b)) = (
+                            old.pointer(path).filter(|v| !v.is_null()),
+                            value.pointer(path).filter(|v| !v.is_null()),
+                        ) && a != b
+                        {
+                            return Err(Error("capture_conflict"));
+                        }
+                    }
+                    balances.insert(index, retain(old, value));
+                } else {
+                    balances.insert(index, value.clone());
+                }
+            }
+            result["meta"][field] = Value::Array(balances.into_values().collect());
+        }
+    }
+    Ok(result)
+}
+
 fn instructions(values: &[Value]) -> Vec<Value> {
     values.iter().map(|v|json!({"programIdIndex":v["programIdIndex"],"accounts":v["accounts"],"data":v["data"]})).collect()
 }

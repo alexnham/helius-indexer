@@ -72,6 +72,7 @@ impl Store {
             Ok(_) => "decoded",
             Err(e) => e.0,
         };
+        let mut repaired = None;
         if let Some((prior, version, prior_status)) = prior {
             let prior_value: serde_json::Value =
                 serde_json::from_str(&prior).map_err(|_| Error("stored_record_invalid"))?;
@@ -80,10 +81,33 @@ impl Store {
             } else {
                 reconcile::compatible_results(&prior_value, &value["result"])
             };
+            let mut reference = None;
+            if outcome.is_ok() {
+                outcome = (|| {
+                    let mut combined = reconcile::reference(&prior_value, &value["result"])?;
+                    if decoded.is_err() && !prior_value["meta"]["logMessages"].is_null() {
+                        combined["meta"]["logMessages"] =
+                            prior_value["meta"]["logMessages"].clone();
+                    }
+                    let mut envelope = value.clone();
+                    envelope["result"] = combined.clone();
+                    let raw =
+                        serde_json::to_vec(&envelope).map_err(|_| Error("serialization_failed"))?;
+                    let combined_capture = crate::decoder::parse_capture(&raw)?;
+                    if decoded.is_ok() {
+                        repaired = Some(crate::decoder::decode(&combined_capture)?);
+                    }
+                    reference = Some(
+                        serde_json::to_string(&combined)
+                            .map_err(|_| Error("serialization_failed"))?,
+                    );
+                    Ok(())
+                })();
+            }
             let mut updates = Vec::new();
             if outcome.is_ok()
                 && prior_status == "decoded"
-                && let Ok(incoming) = decoded
+                && let Some(incoming) = repaired.as_ref()
             {
                 let mut statement = transaction
                     .prepare("SELECT transfer_id,record_json FROM transfers WHERE signature=?1")
@@ -123,20 +147,13 @@ impl Store {
                     .map_err(|_| Error("storage_commit_failed"))?;
                 return Err(error);
             }
+            transaction
+                .execute(
+                    "UPDATE captures SET result_json=?1 WHERE signature=?2",
+                    params![reference, signature],
+                )
+                .map_err(|_| Error("storage_write_failed"))?;
             if prior_status == "decoded" || prior_status == "failed_transaction" {
-                if decoded.is_ok() {
-                    let reference = serde_json::to_string(&reconcile::reference(
-                        &prior_value,
-                        &value["result"],
-                    ))
-                    .map_err(|_| Error("serialization_failed"))?;
-                    transaction
-                        .execute(
-                            "UPDATE captures SET result_json=?1 WHERE signature=?2",
-                            params![reference, signature],
-                        )
-                        .map_err(|_| Error("storage_write_failed"))?;
-                }
                 for merged in updates {
                     let text = serde_json::to_string(&merged)
                         .map_err(|_| Error("serialization_failed"))?;
@@ -159,7 +176,12 @@ impl Store {
                     .map_err(|_| Error("storage_commit_failed"))?;
                 return Ok(0);
             }
-            transaction.execute("UPDATE captures SET result_json=?1,capture_json=?2,status=?3 WHERE signature=?4",params![result_json,raw,status,signature]).map_err(|_|Error("storage_write_failed"))?;
+            transaction
+                .execute(
+                    "UPDATE captures SET capture_json=?1,status=?2 WHERE signature=?3",
+                    params![raw, status, signature],
+                )
+                .map_err(|_| Error("storage_write_failed"))?;
         } else {
             transaction
                 .execute(
@@ -170,7 +192,7 @@ impl Store {
             transaction.execute("UPDATE capture_inputs SET status=?1 WHERE signature=?2 AND source=?3 AND result_json=?4",params![status,signature,capture.source,result_json]).map_err(|_|Error("storage_write_failed"))?;
         }
         let mut inserted = 0;
-        if let Ok(transfers) = decoded {
+        if let Some(transfers) = repaired.as_ref().or_else(|| decoded.as_ref().ok()) {
             for transfer in transfers {
                 let json =
                     serde_json::to_string(transfer).map_err(|_| Error("serialization_failed"))?;

@@ -270,6 +270,88 @@ fn metadata_enrichment_repairs_same_revision_failures_but_not_decoder_correction
     assert_eq!(Store::summary(&path, MINT).unwrap()["transfer_count"], 2);
 }
 #[test]
+fn unresolved_observations_retain_evidence_through_sparse_repair() {
+    let dir = tempfile::tempdir().unwrap();
+    for accumulate in [false, true] {
+        let path = dir.path().join(format!("{accumulate}.sqlite"));
+        let known = fixture();
+        let mut pending = known.clone();
+        pending["result"]["meta"]["innerInstructions"] = Value::Null;
+        if accumulate {
+            let mut sparse = pending.clone();
+            sparse["result"]["blockTime"] = Value::Null;
+            sparse["result"]["transaction"]["message"]
+                .as_object_mut()
+                .unwrap()
+                .remove("recentBlockhash");
+            assert!(persist(&path, &sparse).is_err());
+        }
+        assert!(persist(&path, &pending).is_err());
+        let mut contradictory_pending = pending.clone();
+        contradictory_pending["result"]["blockTime"] = json!(1);
+        assert_eq!(
+            persist(&path, &contradictory_pending).unwrap_err().0,
+            "capture_conflict"
+        );
+        let mut repaired = known.clone();
+        repaired["result"]["blockTime"] = Value::Null;
+        repaired["result"]["transaction"]["message"]
+            .as_object_mut()
+            .unwrap()
+            .remove("recentBlockhash");
+        assert_eq!(persist(&path, &repaired).unwrap(), 2);
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let record: String = conn
+            .query_row("SELECT record_json FROM transfers LIMIT 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let record: Value = serde_json::from_str(&record).unwrap();
+        assert_eq!(record["block_time"], known["result"]["blockTime"]);
+        let mut conflict = known.clone();
+        conflict["result"]["transaction"]["message"]["recentBlockhash"] = json!("contradictory");
+        assert_eq!(persist(&path, &conflict).unwrap_err().0, "capture_conflict");
+    }
+}
+#[test]
+fn complementary_decodable_owner_evidence_enriches_existing_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("index.sqlite");
+    let mut first = fixture();
+    let mut second = fixture();
+    for balance in first["result"]["meta"]["postTokenBalances"]
+        .as_array_mut()
+        .unwrap()
+    {
+        balance.as_object_mut().unwrap().remove("owner");
+    }
+    for balance in second["result"]["meta"]["preTokenBalances"]
+        .as_array_mut()
+        .unwrap()
+    {
+        balance.as_object_mut().unwrap().remove("owner");
+    }
+    assert_eq!(persist(&path, &first).unwrap(), 2);
+    assert_eq!(persist(&path, &second).unwrap(), 0);
+    let expected =
+        decoder::decode(&decoder::parse_capture(&serde_json::to_vec(&fixture()).unwrap()).unwrap())
+            .unwrap();
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    for transfer in expected {
+        let actual: String = conn
+            .query_row(
+                "SELECT record_json FROM transfers WHERE transfer_id=?1",
+                [&transfer.transfer_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&actual).unwrap(),
+            serde_json::to_value(transfer).unwrap()
+        );
+    }
+}
+#[test]
 fn legacy_raw_is_preserved_and_u128_summary_is_exact() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("index.sqlite");
