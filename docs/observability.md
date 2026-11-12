@@ -94,3 +94,14 @@ Include applicable telemetry in each behavior ticket rather than deferring it to
 - **Benchmark/readiness:** exported measurements, dashboard evidence, measured telemetry overhead, label-cardinality checks, tested alerts and recovery actions, plus chosen owners/destinations/thresholds.
 
 Tests verify counter/gauge semantics, retry-versus-unique counts, unknown-state handling, and redaction. Simulate a telemetry backend outage and buffer exhaustion to verify bounded resource use and continued ingestion correctness. Documentation-only changes need link/content checks, not a live monitoring deployment.
+
+## Bounded live slice status
+
+The opt-in LaserStream command now emits connection/retry/end/failure events and
+a bounded JSON invocation snapshot with protobuf input bytes, transaction attempts,
+decode failures, raw/decode-write duration sums, output successes, reconnect
+attempts and input rate. `live-status` provides observed reference/replay ages
+and margin; verified freshness/slot gap remain unknown and coverage-valid zero.
+Stderr write failure cannot undo durable input. Continuous refresh, histograms,
+backlog-age metrics and independent finalized completion evidence remain pending;
+see [live validation](live-ingestion.md).

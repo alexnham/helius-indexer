@@ -5,7 +5,7 @@ SPL Token instructions, atomically stores captured inputs and transfers in
 SQLite, and queries persisted results from a separate process. Implementation
 starts with [ticket #1](https://github.com/alexnham/helius-indexer/issues/1).
 
-The [proposal](PROPOSAL.md) defines the full index. Live ingestion, historical
+The [proposal](PROPOSAL.md) defines the full index. Historical
 backfill, verified slot coverage, Token-2022, confidential transfers, rolling
 retention, and production analytics are subsequent tickets. This CLI is a bounded
 inspection tool, not a production 30-day API. Its responses report coverage as
@@ -140,3 +140,11 @@ transaction, synthetic boundary cases, exact u64 serialization, malformed data,
 unsupported execution, versioned addresses, duplicate ingestion, separate-process
 querying, atomic rollback under a failed database write, retained decode failures,
 and telemetry/redaction/export failures.
+
+## Bounded live intake
+
+A credential-configured opt-in LaserStream command now retains raw protobufs and
+decodes USDC candidates. See [live validation](docs/live-ingestion.md) for bounds,
+commands, verified provider sources, retry behavior and acceptance gaps. Queries
+include live-run diagnostics; finalized filtered intake alone leaves coverage
+unknown. No credentialed run or production readiness claim has been made.

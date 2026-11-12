@@ -24,7 +24,10 @@ pub fn parse_capture(bytes: &[u8]) -> Result<Capture> {
     {
         return Err(Error("unsupported_capture_contract"));
     }
-    if !matches!(capture.source.as_str(), "solana-mainnet-rpc" | "fixture") {
+    if !matches!(
+        capture.source.as_str(),
+        "solana-mainnet-rpc" | "fixture" | "helius-laserstream"
+    ) {
         return Err(Error("unsupported_capture_source"));
     }
     let tx = &capture.result;
