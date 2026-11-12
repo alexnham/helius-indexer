@@ -101,9 +101,10 @@ Compatible same-revision observations coalesce immediately by deterministic
 transfer identity. Unknown metadata may be enriched; contradictory known values
 or decoder revisions are quarantined/rejected. Raw source observations are
 retained in an additive audit table. See [overlap validation](docs/overlap.md)
-for compatibility, rollback, and storage-overhead limits. Decoder corrections
-that add/remove/change semantic transfers remain ticket #8. Keep operational
-databases outside version control.
+for compatibility, rollback, and storage-overhead limits. Explicit
+[decoder revision repair](docs/decoder-repair.md) can add, change, or remove
+semantic transfers from retained inputs. Keep operational databases outside
+version control.
 
 ## Telemetry
 
@@ -230,3 +231,10 @@ for opt-in commands, verified scope, tests, and remaining coverage gaps.
 
 Recovery commands, process-exit validation, and remaining outage-repair limits are
 documented in [the recovery runbook](docs/recovery.md).
+
+Decoder revisions can be repaired offline with `repair DB START END`, inspected
+with `repair-status DB START END`, and historical coverage reverified with
+`repair-history DB MINT START END` using retained full blocks only. Back up before
+in-place correction; successful replacement removes obsolete output. See
+[decoder repair](docs/decoder-repair.md) for the full procedure, partial-query
+semantics, input bounds, and rollback requirements.

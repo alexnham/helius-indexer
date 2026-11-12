@@ -15,7 +15,7 @@ use std::{
     time::Instant,
 };
 
-const USAGE: &str = "usage: helius-indexer ingest DB CAPTURE [--metrics FILE] | query DB [MINT] | backfill DB MINT START END [--metrics FILE] | coverage DB MINT START END | live DB FROM_SLOT SECONDS | live-status DB | live-retry DB | summary DB MINT | overlap DB START END SECONDS";
+const USAGE: &str = "usage: helius-indexer ingest DB CAPTURE [--metrics FILE] | query DB [MINT] | backfill DB MINT START END [--metrics FILE] | coverage DB MINT START END | live DB FROM_SLOT SECONDS | live-status DB | live-retry DB | summary DB MINT | overlap DB START END SECONDS | repair DB START END | repair-status DB START END | repair-history DB MINT START END";
 
 fn ingest(db: &str, input: &str, telemetry: &mut Telemetry) -> Result<serde_json::Value> {
     let started = Instant::now();
@@ -70,6 +70,26 @@ fn ingest(db: &str, input: &str, telemetry: &mut Telemetry) -> Result<serde_json
 
 fn run(args: &[String], telemetry: &mut Telemetry) -> Result<serde_json::Value> {
     match args {
+        [command, db, mint, start, end] if command == "repair-history" => {
+            let start = start.parse().map_err(|_| Error("invalid_repair_range"))?;
+            let end = end.parse().map_err(|_| Error("invalid_repair_range"))?;
+            let cancel = env::var_os("REPAIR_CANCEL_FILE");
+            helius_indexer::repair::history(Path::new(db), telemetry, mint, start, end, || {
+                cancel.as_ref().is_some_and(|p| Path::new(p).exists())
+            })
+        }
+        [command, db, start, end] if command == "repair" || command == "repair-status" => {
+            let start = start.parse().map_err(|_| Error("invalid_repair_range"))?;
+            let end = end.parse().map_err(|_| Error("invalid_repair_range"))?;
+            if command == "repair-status" {
+                helius_indexer::repair::status(Path::new(db), start, end)
+            } else {
+                let cancel = env::var_os("REPAIR_CANCEL_FILE");
+                helius_indexer::repair::run(Path::new(db), start, end, telemetry, || {
+                    cancel.as_ref().is_some_and(|p| Path::new(p).exists())
+                })
+            }
+        }
         [command, db, mint] if command == "summary" => Store::summary(Path::new(db), mint),
         [command, db, start, end, seconds] if command == "overlap" => {
             helius_indexer::coordinator::run(

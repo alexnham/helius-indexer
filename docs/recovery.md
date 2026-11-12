@@ -83,4 +83,5 @@ These checks do not simulate power loss, storage hardware corruption, SIGKILL
 inside SQLite's own commit code, or production failover. This is a partial slice
 of ticket #5. A real provider replay-boundary outage recovery, independent source
 bridge (#17), automated repair supervision, and continuously refreshed recovery
-monitoring remain open. Decoder revision replacement is separate ticket #8.
+monitoring remain open. Decoder revision replacement is handled by the explicit
+[offline repair commands](decoder-repair.md); it does not certify full live coverage.
