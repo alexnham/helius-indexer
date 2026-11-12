@@ -48,12 +48,13 @@ at a time; there is no unbounded transaction/telemetry queue.
 
 ```sh
 # Set HELIUS_API_KEY securely in the process environment; do not put it in argv.
-INDEXER_LIVE_OPT_IN=1 cargo run --locked -- live data/index.sqlite START_SLOT 30
-cargo run --locked -- live-status data/index.sqlite
-cargo run --locked -- live-retry data/index.sqlite
-cargo run --locked -- query data/index.sqlite EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+INDEXER_LIVE_OPT_IN=1 cargo run --locked -- live data/live.sqlite START_SLOT 30
+cargo run --locked -- live-status data/live.sqlite
+cargo run --locked -- live-retry data/live.sqlite
+cargo run --locked -- query data/live.sqlite EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
 ```
 
+Use a separate validation database until the overlap ticket reconciles source metadata.
 Replace START_SLOT with an explicitly chosen replayable slot. Time must be 1–300
 seconds; intake stops at 10,000 received transactions even if time remains.
 Subscription attempts stop at three; connection timeout is five seconds,
