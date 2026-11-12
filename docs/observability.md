@@ -1,6 +1,6 @@
 # Observability contract
 
-Status: the offline capture slice implements structured stage events and per-invocation metric snapshots. Long-running collection, tracing, dashboards, and alerts remain pending. This contract supplements the correctness requirements in `../PROPOSAL.md`. Monitoring backends remain an architecture choice.
+Status: the capture and bounded historical slices implement structured stage events and per-invocation metric snapshots. Long-running collection, tracing, dashboards, and alerts remain pending. This contract supplements the correctness requirements in `../PROPOSAL.md`. Monitoring backends remain an architecture choice.
 
 ## Operational questions
 
@@ -94,3 +94,23 @@ Include applicable telemetry in each behavior ticket rather than deferring it to
 - **Benchmark/readiness:** exported measurements, dashboard evidence, measured telemetry overhead, label-cardinality checks, tested alerts and recovery actions, plus chosen owners/destinations/thresholds.
 
 Tests verify counter/gauge semantics, retry-versus-unique counts, unknown-state handling, and redaction. Simulate a telemetry backend outage and buffer exhaustion to verify bounded resource use and continued ingestion correctness. Documentation-only changes need link/content checks, not a live monitoring deployment.
+
+## Bounded historical snapshots
+
+The historical CLI exports metrics for its explicitly requested mint/decoder/slot
+scope, identified in the accompanying coverage report rather than metric labels.
+`indexer_missing_ranges` counts unresolved contiguous intervals in that scope;
+it does not describe the full retained window. `indexer_backlog_items` counts
+unverified slots. Pending age uses the first durable scheduling time across
+retries, is zero for an observed empty backlog, and is omitted for unscheduled
+work. Live freshness/reference/replay gauges are not fabricated by this worker.
+
+`indexer_stage_duration_seconds` observes one `historical_range` operation per
+invocation (sum/count and the infinite bucket); finite buckets await measurements.
+The bounded diagnostic additions `indexer_historical_source_errors_total`,
+`indexer_historical_write_errors_total`, `indexer_historical_elapsed_seconds`, and
+`indexer_historical_transactions_per_second` have no unbounded labels. The rate
+counts successful decode attempts divided by invocation elapsed time, including
+source/storage time, and is not a benchmark. Failed candidates are retained in
+historical raw blocks with scoped durable error/retry state. Snapshot counters
+are attempts; replay does not imply new unique query results.
