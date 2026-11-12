@@ -1,7 +1,7 @@
 //! Two bounded workers share a write admission gate; live work has priority.
 use crate::{
     Error, Result,
-    backfill::{History, RpcSource},
+    backfill::{BlockSource, History, RpcSource},
     live,
     storage::Store,
     telemetry::Telemetry,
@@ -104,11 +104,31 @@ pub fn run(
     telemetry.set_context("coordinator", "combined", "validation");
     crate::backfill::scope(live::USDC, start, end)?;
     live::validate_options(start, seconds)?;
+    let endpoint = std::env::var("SOLANA_RPC_URL")
+        .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".into());
+    run_with_source(
+        path,
+        start,
+        end,
+        seconds,
+        telemetry,
+        RpcSource::new(endpoint)?,
+    )
+}
+
+pub(crate) fn run_with_source<S: BlockSource + Send>(
+    path: &Path,
+    start: u64,
+    end: u64,
+    seconds: u64,
+    telemetry: &mut Telemetry,
+    mut source: S,
+) -> Result<Value> {
+    crate::backfill::scope(live::USDC, start, end)?;
+    live::validate_options(start, seconds)?;
     let gate = Arc::new(WriteGate::default());
     let mut history = History::open(path)?;
     history.set_gate(Arc::clone(&gate));
-    let endpoint = std::env::var("SOLANA_RPC_URL")
-        .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".into());
     let cancel = std::env::var_os("BACKFILL_CANCEL_FILE");
     let began = Instant::now();
     let parent_id = telemetry.run_id.clone();
@@ -121,7 +141,6 @@ pub fn run(
             live::run_admitted(path, start, seconds, &mut context, &live_gate)
         });
         let historical_worker = threads.spawn(move || {
-            let mut source = RpcSource::new(endpoint)?;
             let (coverage, metrics) = history.run(live::USDC, start, end, &mut source, || {
                 began.elapsed() >= Duration::from_secs(seconds)
                     || cancel.as_ref().is_some_and(|p| Path::new(p).exists())

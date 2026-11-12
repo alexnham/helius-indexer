@@ -238,3 +238,11 @@ with `repair-status DB START END`, and historical coverage reverified with
 in-place correction; successful replacement removes obsolete output. See
 [decoder repair](docs/decoder-repair.md) for the full procedure, partial-query
 semantics, input bounds, and rollback requirements.
+
+## Archive adapter
+
+The optional `archive` feature provides bounded Old Faithful reads, offline CAR
+replay, archive/RPC overlap checks and a measured tip snapshot. See
+[commands, limits, provenance and actual validation gaps](docs/archive.md).
+The archive feature requires Rust 1.98.1+ and adds substantial Agave dependencies;
+the default build remains the smaller offline validation tool.

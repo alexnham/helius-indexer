@@ -203,3 +203,13 @@ is incremental, and historical completion requires full-block re-verification;
 retained-block replay can recover candidates rejected by an earlier revision
 without fetching the same history again. See [decoder repair](docs/decoder-repair.md)
 for compatibility, backup/rollback requirements, and validation limits.
+
+## Bounded archive validation (2026-11-12)
+
+The optional maintained Jetstreamer firehose adapter now normalizes Old Faithful
+CAR ranges into the shared decoder, SQLite storage and coverage contracts.
+[Measured results and limits](docs/archive.md) include legacy/v0/v1 mainnet input
+and an archive freshness snapshot. RPC truncation and unsupported instructions
+prevent verified bridge coverage in some sampled ranges; slot 468265451 passed
+both sources with 51 deduplicated transfer records. This does not select
+production infrastructure or authorize a full-window backfill.

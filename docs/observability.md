@@ -176,3 +176,18 @@ prior output from normal reads while preserving it physically. Summary fields
 output during a partial repair. Current-revision historical completion is
 invalidated by correction and must be reverified from complete retained blocks.
 See [decoder repair](decoder-repair.md) for commands and limits.
+
+## Optional archive source
+
+Archive runs reuse historical telemetry with `archive` input-byte labels. The
+final report includes bounded HTTP request/body-byte/cache-hit counts, configured
+limits, pinned reader revision and source diagnostics. Cache write failures count
+as write failures; corrupt CAR/metadata, HTTP and budget failures retain explicit
+error classes. Capture provenance includes epoch, slot range and raw SHA-256.
+Archive/RPC reports separate `overlap_verified` from the last source coverage;
+unknown live coverage remains visible. Tip snapshots report probe states and
+freshness gap, never infer absence from an unknown response or claim measured
+publication delay. See [archive validation](archive.md) for actual results and
+remaining decoder gaps. Archive unit tests check zero-network replay, both source
+orders, duplicate replay, integrity failure and conflicting immutable block
+identity including migration from retained historical inputs.

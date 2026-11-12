@@ -14,3 +14,17 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --offline --locked --all-targets -- -D warnings
       - run: cargo test --offline --locked
+  archive:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: cargo fetch --locked
+      - run: cargo clippy --features archive --offline --locked --all-targets -- -D warnings
+      - run: cargo test --features archive --offline --locked
