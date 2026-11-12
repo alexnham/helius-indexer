@@ -178,6 +178,11 @@ The total acceptable monthly budget remains unresolved. Production mint selectio
 
 Use this proposal as the requirements baseline. The first captured-transfer slice now provides local decoding, provisional SQLite persistence, a bounded query CLI, and basic telemetry; see `README.md` for commands and limitations. Continue the approved tickets toward the representative end-to-end validation and use its evidence for production architecture and targets. No production infrastructure has been provisioned.
 
+The bounded opt-in live transport slice is documented in
+[the live validation notes](docs/live-ingestion.md). It preserves raw protobuf
+before decoding; finalized filtered delivery leaves slot coverage unknown pending
+independent completion corroboration. This does not resolve production choices.
+
 The offline Token-2022 fee slice supports execution-validated explicit fees and
 known-zero cases; ordinary checked transfers without historical fee evidence
 remain durably unresolved. See the [support matrix](docs/token-2022-support.md)
