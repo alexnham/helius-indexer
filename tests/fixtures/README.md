@@ -39,3 +39,6 @@ Verified **2026-11-11** against primary sources:
 
 Capture acquisition is a bounded, manual development step. Normal tests read
 committed files and never contact an RPC provider.
+
+The sanitized Token-2022 mainnet capture and its supported/unsupported evidence
+are documented in [the support matrix](../../docs/token-2022-support.md).

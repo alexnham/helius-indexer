@@ -4,7 +4,7 @@ use std::collections::HashSet;
 
 pub const SPL_TOKEN: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 pub const TOKEN_2022: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
-pub const DECODER_VERSION: &str = "spl-token-v2";
+pub const DECODER_VERSION: &str = "token-transfers-v3";
 pub const MAX_CAPTURE_BYTES: usize = 16 * 1024 * 1024;
 
 pub fn parse_capture(bytes: &[u8]) -> Result<Capture> {
@@ -106,38 +106,40 @@ pub fn decode(capture: &Capture) -> Result<Vec<Transfer>> {
         }
     }
     let mut output = Vec::new();
-    let has_inner_token = groups.iter().flat_map(|g| &g.instructions).any(|ix| {
-        keys.get(ix.program_id_index)
-            .is_some_and(|p| p == SPL_TOKEN)
-    });
-    if has_inner_token {
-        let logs = tx
-            .meta
-            .log_messages
-            .as_ref()
-            .ok_or(Error("missing_execution_evidence"))?;
-        let invoke_prefix = format!("Program {SPL_TOKEN} invoke [");
-        let success = format!("Program {SPL_TOKEN} success");
-        let expected = message
-            .instructions
-            .iter()
-            .chain(groups.iter().flat_map(|g| &g.instructions))
-            .filter(|ix| {
-                keys.get(ix.program_id_index)
-                    .is_some_and(|p| p == SPL_TOKEN)
-            })
-            .count();
-        if logs.iter().any(|line| runtime_failure(line)) {
-            return Err(Error("unsupported_caught_token_failure"));
-        }
-        if logs
-            .iter()
-            .filter(|line| line.starts_with(&invoke_prefix))
-            .count()
-            != expected
-            || logs.iter().filter(|line| *line == &success).count() != expected
-        {
-            return Err(Error("incomplete_execution_evidence"));
+    for token_program in [SPL_TOKEN, TOKEN_2022] {
+        let has_inner_token = groups.iter().flat_map(|g| &g.instructions).any(|ix| {
+            keys.get(ix.program_id_index)
+                .is_some_and(|p| p == token_program)
+        });
+        if has_inner_token {
+            let logs = tx
+                .meta
+                .log_messages
+                .as_ref()
+                .ok_or(Error("missing_execution_evidence"))?;
+            let invoke_prefix = format!("Program {token_program} invoke [");
+            let success = format!("Program {token_program} success");
+            let expected = message
+                .instructions
+                .iter()
+                .chain(groups.iter().flat_map(|g| &g.instructions))
+                .filter(|ix| {
+                    keys.get(ix.program_id_index)
+                        .is_some_and(|p| p == token_program)
+                })
+                .count();
+            if logs.iter().any(|line| runtime_failure(line)) {
+                return Err(Error("unsupported_caught_token_failure"));
+            }
+            if logs
+                .iter()
+                .filter(|line| line.starts_with(&invoke_prefix))
+                .count()
+                != expected
+                || logs.iter().filter(|line| *line == &success).count() != expected
+            {
+                return Err(Error("incomplete_execution_evidence"));
+            }
         }
     }
     for (outer, instruction) in message.instructions.iter().enumerate() {
@@ -190,10 +192,7 @@ fn decode_instruction(
     if ix.accounts.iter().any(|&a| a >= keys.len()) {
         return Err(Error("invalid_instruction_index"));
     }
-    if program == TOKEN_2022 {
-        return Err(Error("unsupported_token_2022"));
-    }
-    if program != SPL_TOKEN {
+    if program != SPL_TOKEN && program != TOKEN_2022 {
         return Ok(());
     }
     if ix.data.len() > 2048 {
@@ -202,6 +201,16 @@ fn decode_instruction(
     let data = bs58::decode(&ix.data)
         .into_vec()
         .map_err(|_| Error("invalid_token_instruction"))?;
+    let mut data = data;
+    let mut fee_raw = if program == SPL_TOKEN { Some(0) } else { None };
+    // A successful checked-with-fee call validates this fee against execution-time mint state.
+    if program == TOKEN_2022 && data.first() == Some(&26) {
+        if data.len() != 19 || data[1] != 1 {
+            return Err(Error("unsupported_transfer_fee_instruction"));
+        }
+        fee_raw = Some(u64::from_le_bytes(data[11..19].try_into().unwrap()));
+        data = [&[12], &data[2..11]].concat();
+    }
     let tag = *data.first().ok_or(Error("invalid_token_instruction"))?;
     let (source, destination, explicit) = match tag {
         3 if data.len() == 9 && ix.accounts.len() >= 3 => (ix.accounts[0], ix.accounts[1], None),
@@ -221,7 +230,7 @@ fn decode_instruction(
     for index in [source, destination] {
         for pre in [true, false] {
             if let Some(b) = balance(&tx.meta, index, pre) {
-                if b.program_id.as_deref().is_some_and(|p| p != SPL_TOKEN) {
+                if b.program_id.as_deref().is_some_and(|p| p != program) {
                     return Err(Error("conflicting_token_program"));
                 }
                 let observed = (b.mint.clone(), b.ui_token_amount.decimals);
@@ -238,6 +247,17 @@ fn decode_instruction(
             .try_into()
             .map_err(|_| Error("invalid_transfer_instruction"))?,
     );
+    if program == TOKEN_2022 {
+        if fee_raw.is_some_and(|fee| fee > amount_raw) {
+            return Err(Error("invalid_transfer_fee"));
+        }
+        if source == destination || amount_raw == 0 || tag == 3 {
+            fee_raw = Some(0);
+        }
+        if fee_raw.is_none() {
+            return Err(Error("missing_historical_fee_evidence"));
+        }
+    }
     let signature = tx
         .transaction
         .signatures
@@ -259,7 +279,7 @@ fn decode_instruction(
         destination_owner: owner(&tx.meta, destination),
         amount_raw,
         decimals,
-        fee_raw: Some(0),
+        fee_raw,
         confidential: false,
         decoder_version: DECODER_VERSION.to_owned(),
     });
