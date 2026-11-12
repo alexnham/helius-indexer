@@ -111,12 +111,16 @@ mixed-token regression covers both source orders.
 Offline replay of those retained inputs observed 26 decoded transactions from
 both sources with zero quarantined conflicts and stable duplicate-free summaries.
 An independent Python instruction parser found 97 classic SPL USDC edges in the
-three sampled finalized blocks; 18 are currently stored, with zero mismatched or
-extra stored edges. The other 79 remain missing because unsupported transaction
-cases, especially unavailable Token-2022 fee evidence, block whole-transaction
-decoding. Historical coverage correctly stays incomplete. This is evidence of
-compatible supported records, not complete transfer coverage. See the
-[recorded validation results](validation/2026-11-12-overlap.md).
+three sampled finalized blocks; v3 stored 18, with zero mismatched or
+extra stored edges. The other 79 were missing because unavailable Token-2022 fee evidence blocked
+whole-transaction decoding. Revision v4 retains known gross amounts and null
+unknown fees, recovering all 97 independently checked edges. Retained replay
+now has 55 shared decoded transactions, no conflicts, and no historical decode
+failures across the three blocks after native unwrapping is recognized as an
+excluded SOL movement. All three sampled historical slots are complete.
+The stream tail remains unverified. See the
+[original validation results](validation/2026-11-12-overlap.md) and the
+[v4 coverage validation](validation/2026-11-12-decoder-coverage.md).
 
 No full backfill, production infrastructure, or throughput/cost benchmark was
 initiated. Credential values remain local and are excluded from repository and

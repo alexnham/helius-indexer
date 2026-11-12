@@ -135,3 +135,13 @@ volume come from the storage summary. Existing source reports retain separate
 durable input, decoded output, and verified coverage progress. The public gate
 snapshot is inspectable during embedded runs; no continuous monitoring endpoint
 is added. See [overlap validation](overlap.md) for scope and proof limits.
+
+### Unknown transfer fees
+
+Decoder v4 indexes ordinary Token-2022 checked transfers whose gross amount is
+known even when the historical withheld fee is unavailable. Such rows are decoded,
+not unresolved decode items. Query/summary diagnostics preserve null fees and
+report `known_fees_raw` with `unknown_fee_count`; zero known fees with a nonzero
+unknown count is not a zero-fee total. Range coverage describes instruction
+indexing, not completeness of optional fee/owner metadata. Execution ambiguity and
+unsupported instructions still block verified range coverage.

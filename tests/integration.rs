@@ -587,22 +587,25 @@ fn token_2022_fee_evidence_survives_persistence_exactly() {
 }
 
 #[test]
-fn missing_historical_fee_evidence_is_durable_and_zero_is_known() {
+fn unknown_fee_preserves_transfer_and_zero_remains_known() {
     let dir = TempDir::new().unwrap();
     let db = dir.path().join("unknown.sqlite");
     let value = token_2022_capture(100, None);
-    assert_eq!(
-        persist(&db, &value).unwrap_err().0,
-        "missing_historical_fee_evidence"
-    );
-    assert!(Store::query(&db, None, 1000).unwrap().is_empty());
+    assert_eq!(persist(&db, &value).unwrap(), 1);
+    let rows = Store::query(&db, None, 1000).unwrap();
+    assert_eq!(rows[0].amount_raw, 100);
+    assert_eq!(rows[0].fee_raw, None);
+    let summary = Store::summary(&db, &rows[0].mint).unwrap();
+    assert_eq!(summary["known_volume_raw"], "100");
+    assert_eq!(summary["known_fees_raw"], "0");
+    assert_eq!(summary["unknown_fee_count"], 1);
     let conn = rusqlite::Connection::open(&db).unwrap();
     let (status, raw): (String, Vec<u8>) = conn
         .query_row("SELECT status,capture_json FROM captures", [], |r| {
             Ok((r.get(0)?, r.get(1)?))
         })
         .unwrap();
-    assert_eq!(status, "missing_historical_fee_evidence");
+    assert_eq!(status, "decoded");
     assert_eq!(serde_json::from_slice::<Value>(&raw).unwrap(), value);
     assert_eq!(
         decode(&token_2022_capture(0, None)).unwrap()[0].fee_raw,
@@ -618,13 +621,15 @@ fn missing_historical_fee_evidence_is_durable_and_zero_is_known() {
 }
 
 #[test]
-fn captured_token_2022_mints_require_historical_fee_evidence() {
+fn captured_token_2022_transfers_preserve_unknown_fees() {
     let capture =
         decoder::parse_capture(include_bytes!("fixtures/mainnet-token-2022.json")).unwrap();
     assert_eq!(capture.result.slot, 468265270);
-    assert_eq!(
-        decoder::decode(&capture).unwrap_err().0,
-        "missing_historical_fee_evidence"
+    let rows = decoder::decode(&capture).unwrap();
+    assert!(!rows.is_empty());
+    assert!(
+        rows.iter()
+            .any(|r| r.token_program == TOKEN_2022 && r.fee_raw.is_none())
     );
 }
 
@@ -675,4 +680,46 @@ fn token_2022_unchecked_and_malformed_extension_boundaries() {
             json!(bs58::encode(bytes).into_string());
         assert!(decode(&value).is_err());
     }
+}
+
+#[test]
+fn nontransfer_exclusions_require_known_program_and_instruction_shape() {
+    for program in [SPL_TOKEN, TOKEN_2022] {
+        for data in [vec![45, 0], [&[45, 1][..], &42u64.to_le_bytes()].concat()] {
+            let mut value = capture();
+            value["result"]["transaction"]["message"]["accountKeys"][0] = json!(program);
+            value["result"]["transaction"]["message"]["instructions"][0]["data"] =
+                json!(bs58::encode(&data).into_string());
+            assert!(decode(&value).unwrap().is_empty());
+            let mut malformed = data;
+            malformed.push(0);
+            value["result"]["transaction"]["message"]["instructions"][0]["data"] =
+                json!(bs58::encode(malformed).into_string());
+            assert!(decode(&value).is_err());
+        }
+    }
+    let mut value = token_2022_capture(42, None);
+    value["result"]["transaction"]["message"]["instructions"][0]["data"] =
+        json!(bs58::encode([26, 4]).into_string());
+    assert!(decode(&value).unwrap().is_empty());
+    value["result"]["transaction"]["message"]["instructions"][0]["data"] =
+        json!(bs58::encode([26, 4, 0]).into_string());
+    assert!(decode(&value).is_err());
+    value["result"]["transaction"]["message"]["instructions"][0]["data"] =
+        json!(bs58::encode([26, 4]).into_string());
+    value["result"]["transaction"]["message"]["accountKeys"][0] = json!(SPL_TOKEN);
+    assert!(decode(&value).is_err());
+    let mut mixed = capture();
+    mixed["result"]["transaction"]["message"]["accountKeys"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!(TOKEN_2022));
+    mixed["result"]["transaction"]["message"]["instructions"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"programIdIndex":5,"accounts":[1],"data":bs58::encode([26,4]).into_string()}));
+    let rows = decode(&mixed).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].amount_raw, 42);
+    assert_eq!(rows[0].token_program, SPL_TOKEN);
 }
