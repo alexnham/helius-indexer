@@ -18,7 +18,7 @@ const USAGE: &str = "usage: helius-indexer ingest DB CAPTURE [--metrics FILE] | 
 
 fn ingest(db: &str, input: &str, telemetry: &mut Telemetry) -> Result<serde_json::Value> {
     let started = Instant::now();
-    let parsed = (|| {
+    let parsed: Result<_> = (|| {
         let file = File::open(input).map_err(|_| Error("capture_open_failed"))?;
         let mut raw = Vec::new();
         file.take(MAX_CAPTURE_BYTES as u64 + 1)
@@ -36,6 +36,7 @@ fn ingest(db: &str, input: &str, telemetry: &mut Telemetry) -> Result<serde_json
             "rejected"
         },
         started.elapsed().as_secs_f64(),
+        parsed.as_ref().err().map(|e| e.0),
     );
     let (capture, raw) = parsed?;
     telemetry.slot = Some(capture.result.slot);
@@ -47,6 +48,7 @@ fn ingest(db: &str, input: &str, telemetry: &mut Telemetry) -> Result<serde_json
         "decode",
         if decoded.is_ok() { "success" } else { "failed" },
         started.elapsed().as_secs_f64(),
+        telemetry.decode_failure,
     );
     let started = Instant::now();
     let stored =
@@ -55,6 +57,7 @@ fn ingest(db: &str, input: &str, telemetry: &mut Telemetry) -> Result<serde_json
         "storage",
         if stored.is_ok() { "success" } else { "failed" },
         started.elapsed().as_secs_f64(),
+        stored.as_ref().err().map(|e| e.0),
     );
     let inserted = stored?;
     let transfers = decoded?;
@@ -96,10 +99,11 @@ fn main() -> ExitCode {
             .is_err()
     {
         // Diagnostics failure is reported, but cannot undo successful ingestion.
-        let _ = writeln!(
-            std::io::stderr().lock(),
-            "{}",
-            json!({"event":"metrics_export_failed","severity":"error"})
+        telemetry.emit(
+            "metrics_export_failed",
+            "metrics_export",
+            "failed",
+            Some("metrics_export_failed"),
         );
     }
     match result {
@@ -110,11 +114,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(error) => {
-            let _ = writeln!(
-                std::io::stderr().lock(),
-                "{}",
-                json!({"event":"command_failed","severity":"error","error_class":error.0})
-            );
+            telemetry.emit("command_failed", "command", "failed", Some(error.0));
             ExitCode::FAILURE
         }
     }

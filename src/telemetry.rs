@@ -32,16 +32,32 @@ impl Default for Telemetry {
 }
 
 impl Telemetry {
-    pub fn observe(&mut self, stage: &'static str, outcome: &'static str, seconds: f64) {
+    pub fn observe(
+        &mut self,
+        stage: &'static str,
+        outcome: &'static str,
+        seconds: f64,
+        error_class: Option<&'static str>,
+    ) {
         self.stages.push((stage, outcome, seconds));
+        self.emit("stage_completed", stage, outcome, error_class);
+    }
+
+    pub fn emit(
+        &self,
+        event: &'static str,
+        operation: &'static str,
+        outcome: &'static str,
+        error_class: Option<&'static str>,
+    ) {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis();
         let event = json!({"timestamp_unix_ms":timestamp,"severity":if outcome=="success" {"info"} else {"error"},
-            "component":"offline_indexer","operation":stage,"outcome":outcome,
+            "component":"offline_indexer","operation":operation,"outcome":outcome,"error_class":error_class,
             "run_id":self.run_id,"slot":self.slot,"decoder_version":crate::decoder::DECODER_VERSION,
-            "source_kind":"capture","mode":"offline","event":"stage_completed"});
+            "source_kind":"capture","mode":"offline","event":event});
         // A broken diagnostics pipe must not interrupt a durable transaction write.
         let _ = writeln!(std::io::stderr().lock(), "{event}");
     }

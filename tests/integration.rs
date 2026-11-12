@@ -456,3 +456,78 @@ fn unavailable_stderr_does_not_abort_ingestion() {
     assert!(child.wait().unwrap().success());
     assert_eq!(Store::query(&db, None, 1000).unwrap().len(), 1);
 }
+
+#[test]
+fn application_failure_messages_are_not_runtime_failures() {
+    let mut value: Value =
+        serde_json::from_slice(include_bytes!("fixtures/mainnet-transfer.json")).unwrap();
+    let expected = decode(&value).unwrap();
+    value["result"]["meta"]["logMessages"]
+        .as_array_mut()
+        .unwrap()
+        .extend([
+            json!("Program log: failed: user message"),
+            json!(
+                "Program log: nested Program 11111111111111111111111111111111 failed: user message"
+            ),
+            json!("Program not-a-program-id failed: user message"),
+        ]);
+    assert_eq!(decode(&value).unwrap(), expected);
+    value["result"]["meta"]["logMessages"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!(format!("Program {} failed: caught CPI", key(8))));
+    assert_eq!(
+        decode(&value).unwrap_err().0,
+        "unsupported_caught_token_failure"
+    );
+}
+
+#[test]
+fn every_failure_event_keeps_context_even_when_decode_and_storage_fail() {
+    let dir = TempDir::new().unwrap();
+    let input = dir.path().join("capture.json");
+    let mut value = capture();
+    value["result"]["transaction"]["message"]["instructions"][0] =
+        instruction(255, 1, vec![1, 2, 4]);
+    std::fs::write(&input, serde_json::to_vec(&value).unwrap()).unwrap();
+    // A directory cannot be opened as a SQLite database or as a new metrics file.
+    let result = cli(&[
+        "ingest",
+        dir.path().to_str().unwrap(),
+        input.to_str().unwrap(),
+        "--metrics",
+        dir.path().to_str().unwrap(),
+    ]);
+    assert!(!result.status.success());
+    let events: Vec<Value> = String::from_utf8(result.stderr)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let run_id = events[0]["run_id"].clone();
+    for event in &events {
+        assert_eq!(event["run_id"], run_id);
+        assert!(event["timestamp_unix_ms"].is_number());
+        assert_eq!(event["component"], "offline_indexer");
+        assert_eq!(event["decoder_version"], decoder::DECODER_VERSION);
+        assert!(event["operation"].is_string());
+        if event["outcome"] == "failed" {
+            assert_eq!(event["slot"], 123);
+            assert!(event["error_class"].is_string());
+        }
+    }
+    assert!(
+        events
+            .iter()
+            .any(|e| e["operation"] == "decode"
+                && e["error_class"] == "unsupported_token_instruction")
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| e["operation"] == "storage" && e["error_class"] == "storage_open_failed")
+    );
+    assert!(events.iter().any(|e| e["event"] == "metrics_export_failed"));
+    assert!(events.iter().any(|e| e["event"] == "command_failed"));
+}

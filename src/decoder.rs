@@ -4,7 +4,7 @@ use std::collections::HashSet;
 
 pub const SPL_TOKEN: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 pub const TOKEN_2022: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
-pub const DECODER_VERSION: &str = "spl-token-v1";
+pub const DECODER_VERSION: &str = "spl-token-v2";
 pub const MAX_CAPTURE_BYTES: usize = 16 * 1024 * 1024;
 
 pub fn parse_capture(bytes: &[u8]) -> Result<Capture> {
@@ -118,7 +118,6 @@ pub fn decode(capture: &Capture) -> Result<Vec<Transfer>> {
             .ok_or(Error("missing_execution_evidence"))?;
         let invoke_prefix = format!("Program {SPL_TOKEN} invoke [");
         let success = format!("Program {SPL_TOKEN} success");
-        let failure = format!("Program {SPL_TOKEN} failed:");
         let expected = message
             .instructions
             .iter()
@@ -128,10 +127,7 @@ pub fn decode(capture: &Capture) -> Result<Vec<Transfer>> {
                     .is_some_and(|p| p == SPL_TOKEN)
             })
             .count();
-        if logs.iter().any(|line| {
-            line.starts_with(&failure)
-                || (line.starts_with("Program ") && line.contains(" failed:"))
-        }) {
+        if logs.iter().any(|line| runtime_failure(line)) {
             return Err(Error("unsupported_caught_token_failure"));
         }
         if logs
@@ -153,6 +149,12 @@ pub fn decode(capture: &Capture) -> Result<Vec<Transfer>> {
         }
     }
     Ok(output)
+}
+
+fn runtime_failure(line: &str) -> bool {
+    line.strip_prefix("Program ")
+        .and_then(|rest| rest.split_once(" failed:"))
+        .is_some_and(|(program, _)| validate_base58(program, 32).is_ok())
 }
 
 fn balance(meta: &Meta, index: usize, pre: bool) -> Option<&TokenBalance> {
