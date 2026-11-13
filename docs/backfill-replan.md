@@ -44,6 +44,15 @@ can supply an interval, persist and display that gap; keep live intake running.
 Do not skip ahead and call the gap repaired. RPC fallback requires a separately
 visible, bounded action rather than an automatic unbounded scan.
 
+Expect that gap routinely, not as an exception: archives publish at epoch end
+plus a delay, while replay holds roughly 48 hours, so for part of each epoch
+neither source supplies the interval between them. **Unresolved decision:** whether
+a bounded RPC fill of exactly that measured interval may run automatically, or
+always needs an operator action. Until decided, it needs the operator action.
+
+Schedule the oldest replayable pending interval first, ahead of archive work.
+Replay availability only moves forward; archive availability does not expire.
+
 The first recent-only test remains **50 slots**, supplied by replay. It need not
 fetch archive data merely to exercise an archive code path. Validate archive
 routing separately against a small older range and the measured source handoff.
@@ -67,6 +76,16 @@ Each job durably records:
 - Separately acknowledged raw input, decoded output and any verified coverage.
 - Consumed requests/bytes/attempts and elapsed budgets. Claim bounded work before
   issuing requests so a crash/restart cannot reset its resource allowance.
+
+Rules the abandoned RPC experiment broke, which the job model must enforce:
+
+- Reject a scope whose requested range cannot finish within its maximum budget,
+  or let an explicit, recorded operator action replenish the budget. A job must
+  not be accepted and then end only in permanent exhaustion.
+- Compare a request with the existing job before writing anything. A rejected or
+  conflicting request leaves budgets, job rows and other plans unchanged.
+- Re-attempting or repairing a slot under the same decoder invalidates its
+  processing receipt; a receipt names the attempt it describes.
 
 Adding a mint or deliberately requesting a different range creates a new scope.
 A decoder correction invalidates applicable evidence rather than inheriting
@@ -116,7 +135,10 @@ Deliver three coherent milestones, with checks alongside their behavior. Do not
 add more prerequisites to the existing open PR stack before reconciling its bases.
 Existing RPC/archive validation commands and evidence remain available.
 
-1. **Replay recovery and durable jobs.** Establish the pinned provider contract;
+1. **Replay recovery and durable jobs.** First, as its own small change, establish
+   the pinned provider contract: whether filtered replay can distinguish an empty
+   slot from an unobserved one. If it cannot, record which source supplies
+   coverage evidence before building the job model. Then, as separate PRs,
    implement bounded replay for recent requested ranges, immutable job scopes,
    durable recovery/processing state and independent live/history scheduling.
    Verify with real SQLite: duplicates, out-of-order input, decoder failures,
@@ -168,7 +190,10 @@ No corrected runtime, schema migration or backfill was deployed as part of this
 replan. Preserve other work in the checkout and keep credentials/data out of commits.
 
 The next code change is milestone 1. It must be designed against this source
-contract, rather than expanding the RPC validation command again. Ship additive
+contract, rather than expanding the RPC validation command again. `src/live.rs`
+already subscribes with `from_slot` and `match_mints`, checks
+`SubscribeReplayInfo.first_available` and records it in `live_runs`; extend that
+intake with a finite end instead of adding a parallel replay path. Ship additive
 job state with an explicit backup/rollback policy; older binaries cannot enforce
 new replay-job/receipt semantics merely because they can open the database.
 
