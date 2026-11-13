@@ -237,3 +237,13 @@ URLs never become diagnostic/metric labels. Frozen-plan status distinguishes
 `overlap_verified`, `overlap_recovered` and `boundary_ready`; the live tail stays
 unknown. SQLite crash/restart tests verify the proof boundary and no duplicate
 query output. See [evidence recovery](rpc-evidence-recovery.md).
+
+
+## Container console health
+
+`/healthz` reports console availability and a readable existing transfer table,
+with captured-data mode and unknown coverage. Failure returns unavailable without
+creating a database or exposing a path/error payload. It never substitutes for
+verified coverage/freshness gauges. Persistent initialization publishes its receipt
+only after replay checks pass; startup/restart and native CLI event logs remain
+separate. See [Docker operation](docker.md) for scope and validation.

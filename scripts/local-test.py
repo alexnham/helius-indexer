@@ -6,6 +6,9 @@ import json
 import os
 import re
 import shutil
+import signal
+import sqlite3
+from contextlib import closing, contextmanager
 import subprocess
 import sys
 import tempfile
@@ -48,10 +51,14 @@ def captures():
 
 
 def seed(session, binary):
-    shutil.copyfile(binary, session / "helius-indexer")
-    (session / "helius-indexer").chmod(0o700)
+    target = session / "helius-indexer"
+    if Path(binary).resolve() != target.resolve():
+        temporary = session / ".binary.tmp"
+        shutil.copyfile(binary, temporary)
+        temporary.chmod(0o700)
+        temporary.replace(target)
     inputs = session / "captures"
-    inputs.mkdir()
+    inputs.mkdir(exist_ok=True)
     database = session / "index.sqlite"
     files = []
     for index, capture in enumerate(captures()):
@@ -77,8 +84,39 @@ def seed(session, binary):
         "slot_start": min(row["slot"] for row in after["transfers"]),
         "slot_end": max(row["slot"] for row in after["transfers"]),
     }
-    (session / "session.json").write_text(json.dumps(metadata, indent=2) + "\n")
+    receipt = session / ".session.tmp"
+    receipt.write_text(json.dumps(metadata, indent=2) + "\n")
+    receipt.replace(session / "session.json")
     return metadata
+
+
+@contextmanager
+def persistent_session(path, binary):
+    # Hold one local filesystem lock across initialization and the server lifetime.
+    import fcntl
+    session = Path(path).resolve()
+    session.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with (session / ".console.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise RuntimeError("This persistent session is already open") from error
+        receipt = session / "session.json"
+        if receipt.exists():
+            metadata = json.loads(receipt.read_text())
+            if not (session / "index.sqlite").is_file() or not (session / "helius-indexer").is_file():
+                raise RuntimeError("Persistent session is incomplete; restore its backup")
+        else:
+            stored_binary = session / "helius-indexer"
+            metadata = seed(session, stored_binary if stored_binary.exists() else binary)
+        yield session, metadata
+
+
+def readiness(session):
+    json.loads((session / "session.json").read_text())
+    with closing(sqlite3.connect((session / "index.sqlite").resolve().as_uri() + "?mode=ro", uri=True, timeout=2)) as db:
+        db.execute("SELECT transfer_id FROM transfers LIMIT 1").fetchone()
+    return {"status": "ready", "mode": "captured data", "coverage": "unknown"}
 
 
 def handler_for(session, port):
@@ -112,6 +150,11 @@ def handler_for(session, port):
             url = urlsplit(self.path)
             if url.path == "/":
                 self.send(200, (ROOT / "scripts/local-console/index.html").read_bytes(), "text/html")
+            elif url.path == "/healthz":
+                try:
+                    self.send(200, readiness(session))
+                except (OSError, ValueError, sqlite3.Error):
+                    self.send(503, {"status": "unavailable"})
             elif url.path == "/api/session":
                 self.send(200, json.loads((session / "session.json").read_text()))
             elif url.path == "/api/transfers":
@@ -137,13 +180,21 @@ def handler_for(session, port):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--port", type=int, default=8765)
-    parser.add_argument("--session", type=Path, help="Reopen an existing local test session")
+    parser.add_argument("--port", type=int, default=os.environ.get("INDEXER_CONSOLE_PORT", 8765))
+    parser.add_argument("--bind", choices=["127.0.0.1", "0.0.0.0"], default="127.0.0.1")
+    sessions = parser.add_mutually_exclusive_group()
+    sessions.add_argument("--session", type=Path, help="Reopen an existing local test session")
+    sessions.add_argument("--persistent-session", type=Path, help="Initialize once and resume; never reset existing data")
     parser.add_argument("--binary", type=Path, help="Use an existing build instead of building")
     parser.add_argument("--seed-only", action="store_true", help="Create/check a session without starting HTTP")
     args = parser.parse_args()
     if not 1024 <= args.port <= 65535:
         parser.error("port must be between 1024 and 65535")
+    if args.persistent_session:
+        binary = args.binary.resolve() if args.binary else ROOT / "target/debug/helius-indexer"
+        with persistent_session(args.persistent_session, binary) as (session, metadata):
+            serve(session, metadata, args)
+        return
     if args.session:
         session = args.session.resolve()
         if not all((session / name).is_file() for name in ["session.json", "index.sqlite", "helius-indexer"]):
@@ -162,12 +213,19 @@ def main():
         session = Path(tempfile.mkdtemp(prefix="run-", dir=base))
         print("Seeding captured transfers and checking replay…", flush=True)
         metadata = seed(session, binary)
+    serve(session, metadata, args)
+
+
+def serve(session, metadata, args):
     print(f"Ready: {metadata['transfer_count']} unique transfers / {metadata['fixture_count']} captures. Replay verified.")
     print(f"Session: {session}")
     print(f"CLI: {session / 'helius-indexer'} query {session / 'index.sqlite'}")
     if args.seed_only:
         return
-    server = HTTPServer(("127.0.0.1", args.port), handler_for(session, args.port))
+    server = HTTPServer((args.bind, args.port), handler_for(session, args.port))
+    def stop(_signum, _frame):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, stop)
     print(f"Open http://127.0.0.1:{args.port} — captured data; coverage unknown. Ctrl+C stops the console.", flush=True)
     try:
         server.serve_forever()
