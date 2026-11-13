@@ -14,6 +14,7 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --offline --locked --all-targets -- -D warnings
       - run: cargo test --offline --locked
+      - run: python3 -m unittest discover -s tests -p local_console_test.py
   archive:
     runs-on: ubuntu-latest
     env:
