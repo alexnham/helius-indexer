@@ -1,6 +1,8 @@
 //! Two bounded workers share a write admission gate; live work has priority.
 #[cfg(feature = "archive")]
 pub mod bridge;
+#[cfg(feature = "archive")]
+pub(crate) mod evidence;
 use crate::{
     Error, Result,
     backfill::{BlockSource, History, RpcSource},

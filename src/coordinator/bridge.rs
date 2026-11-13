@@ -138,14 +138,23 @@ struct Progress {
     unfinished: Vec<Interval>,
     ranges_truncated: bool,
     overlap_verified: bool,
+    overlap_recovered: bool,
+    boundary_ready: bool,
     oldest_pending_age_seconds: Option<u64>,
 }
 fn progress(db: &Connection, plan: &Plan) -> Result<Progress> {
     // Tie overlap proof to the exact durable attempt generation; retries invalidate it.
-    let overlap:bool=db.query_row("SELECT COUNT(DISTINCT source_kind)=2 FROM historical_source_slots s JOIN historical_slots h USING(mint,decoder,slot) WHERE s.mint=?1 AND s.decoder=?2 AND s.slot=?3 AND h.status='complete' AND EXISTS(SELECT 1 FROM bridge_overlap_proofs p WHERE p.mint=h.mint AND p.decoder=h.decoder AND p.slot=h.slot AND p.verified_attempt=h.attempts) AND s.status='complete' AND s.source_kind IN ('old-faithful-jetstreamer','finalized-mainnet-rpc')",params![plan.mint,decoder::DECODER_VERSION,plan.tip as i64],|r|r.get(0)).map_err(|_|Error("storage_read_failed"))?;
+    let proof:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM bridge_overlap_proofs p JOIN historical_slots h USING(mint,decoder,slot) WHERE p.mint=?1 AND p.decoder=?2 AND p.slot=?3 AND p.verified_attempt=h.attempts AND h.status='complete')",params![plan.mint,decoder::DECODER_VERSION,plan.tip as i64],|r|r.get(0)).map_err(|_|Error("storage_read_failed"))?;
+    let completed = |source: &str| -> Result<bool> {
+        db.query_row("SELECT EXISTS(SELECT 1 FROM historical_source_slots WHERE mint=?1 AND decoder=?2 AND slot=?3 AND source_kind=?4 AND status='complete')",params![plan.mint,decoder::DECODER_VERSION,plan.tip as i64,source],|r|r.get(0)).map_err(|_|Error("storage_read_failed"))
+    };
+    let archive_complete = completed(archive::SOURCE)?;
+    let overlap = proof && archive_complete && completed("finalized-mainnet-rpc")?;
+    let recovered = proof && archive_complete && !overlap && completed(super::evidence::SOURCE)?;
+    let ready = overlap || recovered;
     // The immutable identity ledger protects anchors; capture reconciliation
     // protects execution context. The boundary worker compares before either ack.
-    let mut query=db.prepare("SELECT h.slot FROM historical_slots h WHERE h.mint=?1 AND h.decoder=?2 AND h.slot BETWEEN ?3 AND ?4 AND (h.status='skipped' OR (h.status='complete' AND EXISTS(SELECT 1 FROM historical_source_slots s WHERE s.mint=h.mint AND s.decoder=h.decoder AND s.slot=h.slot AND s.status='complete' AND s.source_kind=CASE WHEN h.slot<=?5 THEN 'old-faithful-jetstreamer' ELSE 'finalized-mainnet-rpc' END))) ORDER BY h.slot").map_err(|_|Error("storage_read_failed"))?;
+    let mut query=db.prepare("SELECT h.slot FROM historical_slots h WHERE h.mint=?1 AND h.decoder=?2 AND h.slot BETWEEN ?3 AND ?4 AND (h.status='skipped' OR (h.status='complete' AND EXISTS(SELECT 1 FROM historical_source_slots s WHERE s.mint=h.mint AND s.decoder=h.decoder AND s.slot=h.slot AND s.status='complete' AND (s.source_kind=CASE WHEN h.slot<=?5 THEN 'old-faithful-jetstreamer' ELSE 'finalized-mainnet-rpc' END OR (h.slot>?5 AND s.source_kind='archive-rpc-corroborated' AND EXISTS(SELECT 1 FROM bridge_overlap_proofs p WHERE p.mint=h.mint AND p.decoder=h.decoder AND p.slot=h.slot AND p.verified_attempt=h.attempts)))))) ORDER BY h.slot").map_err(|_|Error("storage_read_failed"))?;
     let rows = query
         .query_map(
             params![
@@ -178,6 +187,8 @@ fn progress(db: &Connection, plan: &Plan) -> Result<Progress> {
         unfinished: vec![],
         ranges_truncated: false,
         overlap_verified: overlap,
+        overlap_recovered: recovered,
+        boundary_ready: ready,
         oldest_pending_age_seconds: None,
     };
     let mut next = plan.start;
@@ -208,7 +219,7 @@ fn progress(db: &Connection, plan: &Plan) -> Result<Progress> {
     for row in rows {
         let slot = u64::try_from(row.map_err(|_| Error("storage_read_failed"))?)
             .map_err(|_| Error("invalid_bridge_plan"))?;
-        if slot == plan.tip && !overlap {
+        if slot == plan.tip && !ready {
             continue;
         }
         if next < slot {
@@ -356,32 +367,19 @@ fn boundary<A: BlockSource, R: BlockSource>(
     rpc: &mut R,
     cancelled: &impl Fn() -> bool,
 ) -> Result<Vec<Metrics>> {
-    // Invalidate first: a failed comparison or crash must not preserve readiness.
     history.reverify(&plan.mint, plan.tip, plan.tip)?;
     let a = archive.block(plan.tip)?;
     if cancelled() {
         return Err(Error("cancelled"));
     }
     let b = rpc.block(plan.tip)?;
-    archive::compare_blocks(&a, &b, plan.tip)?;
-    let mut outcomes = vec![];
-    for (raw, is_archive) in [(a, true), (b, false)] {
-        history.reverify(&plan.mint, plan.tip, plan.tip)?;
-        let mut source = archive::Observation {
-            slot: plan.tip,
-            raw,
-            archive: is_archive,
-        };
-        let (coverage, metrics) =
-            history.run(&plan.mint, plan.tip, plan.tip, &mut source, cancelled)?;
-        outcomes.push(metrics);
-        if !coverage.complete {
-            return Err(Error("bridge_boundary_incomplete"));
-        }
+    let result = super::evidence::ingest(history, &plan.mint, plan.tip, a, b, cancelled)?;
+    if !result.ready() {
+        return Err(Error("bridge_boundary_incomplete"));
     }
-    history.acknowledge_bridge_overlap(&plan.mint, plan.tip)?;
-    Ok(outcomes)
+    Ok(result.metrics)
 }
+
 pub fn run(
     path: &Path,
     cache: &Path,

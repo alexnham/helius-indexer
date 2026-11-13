@@ -192,6 +192,7 @@ pub struct Coverage {
 pub struct Metrics {
     pub input_bytes: u64,
     pub archive_input: bool,
+    pub corroborated_input: bool,
     pub source_diagnostics: Value,
     pub source_attempts: u64,
     pub cached_blocks: u64,
@@ -241,6 +242,9 @@ impl Metrics {
         output.push_str(&format!("indexer_missing_ranges{{mode=\"historical\"}} {missing_ranges}\nindexer_stage_duration_seconds_sum{{operation=\"historical_range\"}} {}\nindexer_stage_duration_seconds_count{{operation=\"historical_range\"}} 1\nindexer_stage_duration_seconds_bucket{{operation=\"historical_range\",le=\"+Inf\"}} 1\n",self.elapsed_seconds));
         if self.archive_input {
             output = output.replace("source_kind=\"rpc\"", "source_kind=\"archive\"");
+        }
+        if self.corroborated_input {
+            output = output.replace("source_kind=\"rpc\"", "source_kind=\"corroborated\"");
         }
         output
     }
@@ -303,7 +307,8 @@ impl History {
                 PRIMARY KEY(mint,decoder,slot,source_kind));
             CREATE TABLE IF NOT EXISTS historical_block_identity (
                 slot INTEGER PRIMARY KEY,blockhash TEXT NOT NULL,parent_slot INTEGER NOT NULL,previous_blockhash TEXT NOT NULL,
-                transaction_ids_hash BLOB NOT NULL,block_time INTEGER);",
+                transaction_ids_hash BLOB NOT NULL,block_time INTEGER);
+            CREATE TABLE IF NOT EXISTS bridge_overlap_proofs(mint TEXT NOT NULL,decoder TEXT NOT NULL,slot INTEGER NOT NULL,verified_attempt INTEGER NOT NULL,PRIMARY KEY(mint,decoder,slot));",
         )
         .map_err(write_error)?;
         let mut telemetry = crate::telemetry::Telemetry::default();
@@ -351,6 +356,13 @@ impl History {
         let _permit = self.gate.historical()?;
         self.db.execute("INSERT INTO bridge_overlap_proofs SELECT mint,decoder,slot,attempts FROM historical_slots WHERE mint=?1 AND decoder=?2 AND slot=?3 AND status='complete' ON CONFLICT(mint,decoder,slot) DO UPDATE SET verified_attempt=excluded.verified_attempt",params![mint,decoder::DECODER_VERSION,slot as i64]).map_err(write_error)?;
         Ok(())
+    }
+    #[cfg(feature = "archive")]
+    pub(crate) fn retained_input(&self, mint: &str, slot: u64, source: &str) -> Result<Vec<u8>> {
+        scope(mint, slot, slot)?;
+        let raw:Option<Option<Vec<u8>>>=self.db.query_row("SELECT CASE WHEN length(response)<=67108864 THEN response END FROM historical_inputs WHERE mint=?1 AND slot=?2 AND source_kind=?3 ORDER BY received_at DESC,attempt DESC,decoder DESC LIMIT 1",params![mint,slot as i64,source],|r|r.get(0)).optional().map_err(read_error)?;
+        raw.ok_or(Error("retained_block_unavailable"))?
+            .ok_or(Error("block_too_large"))
     }
     pub fn set_gate(&mut self, gate: std::sync::Arc<crate::coordinator::WriteGate>) {
         self.gate = gate;
@@ -444,11 +456,15 @@ impl History {
         let started = Instant::now();
         let mut metrics = Metrics {
             archive_input: source.capture_source() == "old-faithful-jetstreamer",
+            corroborated_input: source.capture_source() == "archive-rpc-corroborated",
             ..Metrics::default()
         };
         if metrics.archive_input && !self.revision_repair {
             self.telemetry
                 .set_context("backfill", "archive", "historical");
+        } else if metrics.corroborated_input && !self.revision_repair {
+            self.telemetry
+                .set_context("backfill", "corroborated", "historical");
         } else if !self.revision_repair {
             self.telemetry.set_context("backfill", "rpc", "historical");
         }
@@ -691,7 +707,10 @@ fn process_block(
         object.insert("slot".into(), json!(slot));
         object.insert("blockTime".into(), block["blockTime"].clone());
         let mut capture = json!({"schema_version":1,"cluster":"mainnet-beta","commitment":"finalized","source":capture_source,"result":result});
-        if let Some(provenance) = value.get("archive_provenance") {
+        if let Some(provenance) = value
+            .get("archive_provenance")
+            .or_else(|| value.get("evidence_provenance"))
+        {
             capture["source_provenance"] = provenance.clone();
         }
         let bytes = serde_json::to_vec(&capture).map_err(|_| Error("invalid_block_transaction"))?;

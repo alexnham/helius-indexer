@@ -1,5 +1,6 @@
 //! Bounded Old Faithful source. Public-network use is opt-in; caches replay offline.
 mod decode;
+use crate::coordinator::evidence;
 mod transport;
 pub use decode::{decode_slot, normalize_transaction};
 pub use transport::{ArchiveSource, Limits};
@@ -68,9 +69,11 @@ pub fn overlap(
     let mut archive = ArchiveSource::new(cache, true, Limits::default())?;
     let endpoint = std::env::var("SOLANA_RPC_URL")
         .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".into());
-    let mut rpc = RpcSource::new(endpoint)?;
+    let mut rpc = RpcSource::bounded(endpoint, began + Duration::from_secs(120))?;
     let mut history = History::open(path)?;
     let mut verified = 0;
+    let mut recovered = 0;
+    let mut observations = Vec::new();
     let mut rpc_bytes = 0usize;
     for slot in start..=end {
         if began.elapsed() >= Duration::from_secs(120)
@@ -86,30 +89,59 @@ pub fn overlap(
         if rpc_bytes > 8 * crate::backfill::MAX_BLOCK_BYTES {
             return Err(Error("archive_bridge_byte_limit"));
         }
-        compare_blocks(&archive_raw, &rpc_raw, slot)?;
-        let mut archive_block = Observation {
-            slot,
-            raw: archive_raw,
-            archive: true,
-        };
-        let mut rpc_block = Observation {
-            slot,
-            raw: rpc_raw,
-            archive: false,
-        };
-        let mut complete = true;
-        for observation in [&mut archive_block, &mut rpc_block] {
-            history.reverify(mint, slot, slot)?;
-            let (coverage, _) = history.run(mint, slot, slot, observation, || {
-                began.elapsed() >= Duration::from_secs(120)
-                    || cancel.as_ref().is_some_and(|p| Path::new(p).exists())
-            })?;
-            complete &= coverage.complete;
-        }
-        verified += u64::from(complete);
+        let outcome = evidence::ingest(&mut history, mint, slot, archive_raw, rpc_raw, &|| {
+            began.elapsed() >= Duration::from_secs(120)
+                || cancel.as_ref().is_some_and(|p| Path::new(p).exists())
+        })?;
+        verified += u64::from(outcome.archive_complete && outcome.rpc_complete);
+        recovered += u64::from(outcome.recovered);
+        observations.push(json!({"slot":slot,"outcome":outcome}));
     }
     Ok(
-        json!({"run_id":telemetry.run_id,"overlap_verified":verified==end-start+1,"verified_slots":verified,"start":start,"end":end,"jetstreamer_revision":JETSTREAMER_REVISION,"archive":archive.stats,"rpc_response_body_bytes":rpc_bytes,"coverage":history.coverage(mint,start,end)?,"summary":crate::storage::Store::summary(path,mint)?,"live_coverage":"unknown"}),
+        json!({"run_id":telemetry.run_id,"overlap_verified":verified==end-start+1,"boundary_ready":verified+recovered==end-start+1,"verified_slots":verified,"corroborated_slots":recovered,"observations":observations,"start":start,"end":end,"jetstreamer_revision":JETSTREAMER_REVISION,"archive":archive.stats,"rpc_response_body_bytes":rpc_bytes,"coverage":history.coverage(mint,start,end)?,"summary":crate::storage::Store::summary(path,mint)?,"live_coverage":"unknown"}),
+    )
+}
+
+/// Bounded recovery from both original normalized observations, without network access.
+pub fn replay_overlap(
+    path: &Path,
+    mint: &str,
+    start: u64,
+    end: u64,
+    telemetry: &mut Telemetry,
+) -> Result<Value> {
+    range(mint, start, end)?;
+    telemetry.set_context("archive_bridge", "retained_pair", "recovery");
+    let mut history = History::open(path)?;
+    let began = Instant::now();
+    let cancel = std::env::var_os("BACKFILL_CANCEL_FILE");
+    let cancelled = || {
+        began.elapsed() >= Duration::from_secs(120)
+            || cancel.as_ref().is_some_and(|p| Path::new(p).exists())
+    };
+    let mut observations = Vec::new();
+    let mut verified = 0;
+    let mut recovered = 0;
+    for slot in start..=end {
+        if cancelled() {
+            break;
+        }
+        let a = history.retained_input(mint, slot, SOURCE)?;
+        let b = history.retained_input(mint, slot, "finalized-mainnet-rpc")?;
+        let outcome = evidence::ingest(&mut history, mint, slot, a, b, &cancelled)?;
+        verified += u64::from(outcome.archive_complete && outcome.rpc_complete);
+        recovered += u64::from(outcome.recovered);
+        observations.push(json!({"slot":slot,"outcome":outcome}));
+    }
+    let ready = verified + recovered == end - start + 1;
+    telemetry.emit(
+        "overlap_recovery_finished",
+        "retained_overlap",
+        if ready { "success" } else { "incomplete" },
+        None,
+    );
+    Ok(
+        json!({"run_id":telemetry.run_id,"overlap_verified":verified==end-start+1,"boundary_ready":ready,"verified_slots":verified,"corroborated_slots":recovered,"observations":observations,"coverage":history.coverage(mint,start,end)?,"summary":crate::storage::Store::summary(path,mint)?,"network_requests":0,"live_coverage":"unknown"}),
     )
 }
 

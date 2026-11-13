@@ -98,3 +98,17 @@ revision field to change; its two transfer IDs/amounts remain unchanged.
 The first maintenance case also includes one sanitized finalized RPC observation
 of the same signature, for identical-output and both-arrival-order reconciliation
 checks. There are 11 unique transactions and 12 source observations in total.
+
+## Explicit RPC truncation pairs
+
+`mainnet-truncated-rpc.json` contains two matched finalized archive/RPC transaction
+pairs at slot 468265447, each with 18 independently enumerated ordinary transfer
+edges. Original archive logs had 194 entries and RPC logs 130, including a literal
+truncation marker at position 127 and subsequent observed lines. The captures
+preserve signatures, compiled bytes, token metadata, runtime evidence and the
+marker; free-form application logs/return data were removed. Fixture log counts
+are smaller after sanitation; `original_log_lines` records original counts.
+Expected IDs, raw amounts, fees and positions come from compiled transfer operands,
+not balance deltas or generated Rust output. Synthetic block headers used by
+adapter tests are not claimed as captured block anchors. Full-block retained-input
+recovery evidence and limitations are in `docs/rpc-evidence-recovery.md`.

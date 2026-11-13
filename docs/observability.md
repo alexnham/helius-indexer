@@ -224,3 +224,16 @@ revision-scoped coverage. Reports add `source_kind` (`archive` or `rpc`) alongsi
 `retained_blocks_only`; cached blocks and zero source requests distinguish offline
 reverification from fetching. Original repair age is preserved. No new metric
 labels are introduced. See [decoder maintenance evidence](validation/2026-11-12-decoder-maintenance.md).
+
+## Corroborated RPC execution evidence
+
+Recovery keeps native archive/RPC completion, recovery attempts/errors, repaired
+transaction counts and generation-bound readiness separate. Native RPC failures
+remain observable even after the corroborated input succeeds. The bounded metric
+source label `corroborated` measures reconstructed normalized bytes and repeated
+decoding attempts, not provider-billed/downloaded bytes or unique transfers.
+Capture provenance retains both input SHA-256 references; raw logs and endpoint
+URLs never become diagnostic/metric labels. Frozen-plan status distinguishes
+`overlap_verified`, `overlap_recovered` and `boundary_ready`; the live tail stays
+unknown. SQLite crash/restart tests verify the proof boundary and no duplicate
+query output. See [evidence recovery](rpc-evidence-recovery.md).

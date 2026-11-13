@@ -15,7 +15,7 @@ use std::{
     time::Instant,
 };
 
-const USAGE: &str = "usage: helius-indexer ingest DB CAPTURE [--metrics FILE] | query DB [MINT] | backfill DB MINT START END [--metrics FILE] | coverage DB MINT START END | live DB FROM_SLOT SECONDS | live-status DB | live-retry DB | summary DB MINT | overlap DB START END SECONDS | repair DB START END | repair-status DB START END | repair-history-archive DB MINT START END | repair-history DB MINT START END | [feature archive] archive/archive-replay/archive-overlap DB CACHE MINT START END | bridge-plan DB CACHE MINT START | bridge DB CACHE MINT START | bridge-status DB MINT START | bridge-live DB CACHE START SECONDS | archive-tip CACHE | archive-live DB CACHE START END SECONDS";
+const USAGE: &str = "usage: helius-indexer ingest DB CAPTURE [--metrics FILE] | query DB [MINT] | backfill DB MINT START END [--metrics FILE] | coverage DB MINT START END | live DB FROM_SLOT SECONDS | live-status DB | live-retry DB | summary DB MINT | overlap DB START END SECONDS | repair DB START END | repair-status DB START END | repair-history-archive DB MINT START END | repair-history DB MINT START END | [feature archive] archive/archive-replay/archive-overlap DB CACHE MINT START END | bridge-plan DB CACHE MINT START | bridge DB CACHE MINT START | bridge-status DB MINT START | bridge-live DB CACHE START SECONDS | archive-overlap-replay DB MINT START END | archive-tip CACHE | archive-live DB CACHE START END SECONDS";
 
 fn ingest(db: &str, input: &str, telemetry: &mut Telemetry) -> Result<serde_json::Value> {
     let started = Instant::now();
@@ -70,6 +70,16 @@ fn ingest(db: &str, input: &str, telemetry: &mut Telemetry) -> Result<serde_json
 
 fn run(args: &[String], telemetry: &mut Telemetry) -> Result<serde_json::Value> {
     match args {
+        #[cfg(feature = "archive")]
+        [command, db, mint, start, end] if command == "archive-overlap-replay" => {
+            helius_indexer::archive::replay_overlap(
+                Path::new(db),
+                mint,
+                start.parse().map_err(|_| Error("invalid_archive_range"))?,
+                end.parse().map_err(|_| Error("invalid_archive_range"))?,
+                telemetry,
+            )
+        }
         #[cfg(feature = "archive")]
         [command, db, cache, mint, start] if command == "bridge-plan" => {
             helius_indexer::coordinator::bridge::plan(

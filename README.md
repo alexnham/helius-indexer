@@ -259,3 +259,9 @@ explicit offline re-verification of normalized archive receipts already retained
 in SQLite. It needs no CAR cache or optional SDK feature. See the
 [decoder maintenance validation](docs/validation/2026-11-12-decoder-maintenance.md)
 and back up the database before in-place repair.
+
+The optional archive feature also supports
+`archive-overlap-replay DB MINT START END` for bounded offline recovery of explicit
+RPC log truncation from complete matching archive evidence. Both originals remain
+retained; native RPC stays incomplete and reports expose corroborated readiness.
+See [RPC evidence recovery](docs/rpc-evidence-recovery.md) for limits and rollback.

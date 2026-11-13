@@ -26,7 +26,11 @@ pub fn parse_capture(bytes: &[u8]) -> Result<Capture> {
     }
     if !matches!(
         capture.source.as_str(),
-        "solana-mainnet-rpc" | "fixture" | "helius-laserstream" | "old-faithful-jetstreamer"
+        "solana-mainnet-rpc"
+            | "fixture"
+            | "helius-laserstream"
+            | "old-faithful-jetstreamer"
+            | "archive-rpc-corroborated"
     ) {
         return Err(Error("unsupported_capture_source"));
     }
