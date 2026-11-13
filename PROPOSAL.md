@@ -256,3 +256,21 @@ The runtime now continues live intake in resumable cycles and keeps only the new
 1,000 transfers (configurable), pruning older inputs and coverage to `unknown`.
 This count-based cap is a local-testing retention choice only; the 30-day query
 window and 37-day raw retention above remain the production requirement.
+
+## Corrected backfill implementation direction (2026-11-13)
+
+The normal backfill path follows the original brief: Old Faithful through the
+maintained Jetstreamer adapter for older available history, and LaserStream
+historical replay for recent history and outage recovery, transitioning to live
+intake. Bounded RPC commands remain verification/fallback tools, not the normal
+recent-history source. Measure archive availability and actual replay availability;
+expose an uncovered interval rather than assuming their windows overlap.
+
+Durable historical jobs must retain their requested scope and processing state
+across restarts and live cycles. Preserve live priority. Keep processing receipts
+separate from verified coverage and from data still retained after the approved
+local 1,000-transfer cap. Filtered replay receipt or a later observed slot alone
+must not advance verified slot coverage. The current first-cycle RPC Docker
+implementation does not satisfy this target. Follow the staged
+[corrected backfill plan](docs/backfill-replan.md); a full-window run and paid
+infrastructure remain separately authorized actions.
