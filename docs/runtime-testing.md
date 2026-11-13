@@ -85,6 +85,11 @@ not an unbounded RPC scan or a full 30-day job started by this service.
 The browser refreshes every five seconds while visible. It displays the newest
 1,000 rows (optionally filtered by mint), exact raw amounts, separate fees, worker
 state, unique persisted count, unresolved live input and the scoped history report.
+An "Ingestion pipeline" panel maps the designed stages (sources, producer, queue,
+consumer, store, checkpoints) onto what this runtime really runs and names each
+unbuilt candidate (Kafka, PostgreSQL, ClickHouse, Old Faithful). Its transaction
+and transfer counts are from the last completed cycle; slot, queue and store
+values are current. It shows activity, not verified coverage.
 Use the address filter to locate a signature among loaded rows; it is not a search
 of the whole database. Export downloads the current loaded query.
 
