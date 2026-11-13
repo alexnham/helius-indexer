@@ -21,5 +21,43 @@ services:
     pids_limit: 64
     stop_grace_period: 20s
 
+  runtime:
+    profiles: [live]
+    image: helius-indexer-console:local
+    build:
+      context: .
+      target: console
+    entrypoint: [python3, /app/scripts/indexer-runtime.py]
+    environment:
+      INDEXER_CONSOLE_PORT: ${INDEXER_RUNTIME_PORT:-8767}
+      INDEXER_RUN: ${INDEXER_RUN:-1}
+      INDEXER_MINT: ${INDEXER_MINT:-EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v}
+      INDEXER_LIVE_SECONDS: ${INDEXER_LIVE_SECONDS:-60}
+      INDEXER_BACKFILL_SLOTS: ${INDEXER_BACKFILL_SLOTS:-50}
+      INDEXER_BACKFILL_START: ${INDEXER_BACKFILL_START:-}
+      INDEXER_BACKFILL_END: ${INDEXER_BACKFILL_END:-}
+      INDEXER_LIVE_FROM: ${INDEXER_LIVE_FROM:-}
+      INDEXER_KEEP_TRANSFERS: ${INDEXER_KEEP_TRANSFERS:-1000}
+    ports:
+      - "127.0.0.1:${INDEXER_RUNTIME_PORT:-8767}:${INDEXER_RUNTIME_PORT:-8767}"
+    secrets: [helius]
+    volumes:
+      - runtime-data:/app/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    init: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    cpus: 1.0
+    mem_limit: 768m
+    pids_limit: 64
+    stop_grace_period: 20s
+
+secrets:
+  helius:
+    file: ${INDEXER_SECRET_FILE:-.env}
+
 volumes:
   console-data:
+  runtime-data:

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Offline cross-check of classic SPL USDC edges against retained RPC blocks.
 
-Usage: python3 scripts/compare-captured-usdc.py RAW_INPUT_DB INDEX_DB
+Usage: python3 scripts/compare-captured-usdc.py RAW_INPUT_DB INDEX_DB [--sample]
 Reads at most 16 retained blocks / 64 MiB and 100,000 stored USDC rows.
 The independent parser excludes transactions with runtime failure evidence.
 It does not certify Token-2022 transfers or full-chain/provider completeness.
@@ -38,11 +38,12 @@ def readonly(path):
     return sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True)
 
 
-def compare(source, destination):
+def compare(source, destination, sample=False):
     blocks = {}
     size = 0
     for count, (slot, raw) in enumerate(source.execute(
-        "SELECT slot,response FROM historical_inputs ORDER BY slot,attempt LIMIT 33"
+        "SELECT slot,response FROM historical_inputs ORDER BY slot,attempt LIMIT ?",
+        (16 if sample else 33,),
     ), start=1):
         assert count <= 32, "too many retained block observations"
         size += len(raw)
@@ -112,7 +113,7 @@ def compare(source, destination):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 3:
+    if len(sys.argv) not in (3, 4) or (len(sys.argv) == 4 and sys.argv[3] != "--sample"):
         sys.exit(__doc__)
     with readonly(sys.argv[1]) as source, readonly(sys.argv[2]) as destination:
-        sys.exit(compare(source, destination))
+        sys.exit(compare(source, destination, sample=len(sys.argv) == 4))

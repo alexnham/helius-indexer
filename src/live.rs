@@ -19,6 +19,10 @@ const MAX_MESSAGES: usize = 10_000;
 const PROTO_SCHEMA: &str = "laserstream-core-proto/14.0.0";
 
 pub fn request(from: u64) -> SubscribeRequest {
+    request_mint(from, USDC)
+}
+
+pub fn request_mint(from: u64, mint: &str) -> SubscribeRequest {
     SubscribeRequest {
         commitment: Some(CommitmentLevel::Finalized as i32),
         from_slot: Some(from),
@@ -27,7 +31,7 @@ pub fn request(from: u64) -> SubscribeRequest {
             SubscribeRequestFilterTransactions {
                 vote: Some(false),
                 failed: Some(false),
-                account_include: vec![USDC.into()],
+                account_include: vec![mint.into()],
                 match_mints: true,
                 ..Default::default()
             },
@@ -264,8 +268,11 @@ impl Intake {
                 |r| r.get(0),
             )
             .map_err(|_| Error("storage_read_failed"))?;
+        let last_received_slot: Option<i64> = db
+            .query_row("SELECT MAX(slot) FROM live_raw", [], |r| r.get(0))
+            .map_err(|_| Error("storage_read_failed"))?;
         Ok(
-            json!({"retry_cursor":retry_cursor,"retry_batch_limit":100,"oldest_unresolved_age_seconds":if pending==0{Some(0)}else{oldest.and_then(age)},"state":if runs.is_empty(){"uninitialized"}else{"partial"},"mint":USDC,"decoder_version":decoder::DECODER_VERSION,"verified_boundary":null,"coverage":"unknown","unresolved_items":pending,"runs":runs,"limit":100,"reason":"filtered_finalized_stream_has_no_validated_completion_evidence"}),
+            json!({"last_received_slot":last_received_slot,"retry_cursor":retry_cursor,"retry_batch_limit":100,"oldest_unresolved_age_seconds":if pending==0{Some(0)}else{oldest.and_then(age)},"state":if runs.is_empty(){"uninitialized"}else{"partial"},"mint":runs.first().and_then(|r|r.get("mint")),"decoder_version":decoder::DECODER_VERSION,"verified_boundary":null,"coverage":"unknown","unresolved_items":pending,"runs":runs,"limit":100,"reason":"filtered_finalized_stream_has_no_validated_completion_evidence"}),
         )
     }
 }
@@ -300,10 +307,21 @@ pub fn run(
     seconds: u64,
     telemetry: &mut crate::telemetry::Telemetry,
 ) -> Result<Value> {
-    run_admitted(
+    run_mint(path, from, seconds, USDC, telemetry)
+}
+
+pub fn run_mint(
+    path: &Path,
+    from: u64,
+    seconds: u64,
+    mint: &str,
+    telemetry: &mut crate::telemetry::Telemetry,
+) -> Result<Value> {
+    run_mint_admitted(
         path,
         from,
         seconds,
+        mint,
         telemetry,
         &crate::coordinator::WriteGate::default(),
     )
@@ -315,6 +333,18 @@ pub fn run_admitted(
     telemetry: &mut crate::telemetry::Telemetry,
     gate: &crate::coordinator::WriteGate,
 ) -> Result<Value> {
+    run_mint_admitted(path, from, seconds, USDC, telemetry, gate)
+}
+
+pub fn run_mint_admitted(
+    path: &Path,
+    from: u64,
+    seconds: u64,
+    mint: &str,
+    telemetry: &mut crate::telemetry::Telemetry,
+    gate: &crate::coordinator::WriteGate,
+) -> Result<Value> {
+    crate::backfill::scope(mint, from, from)?;
     telemetry.set_context("live_ingestion", "laserstream", "live");
     validate_options(from, seconds)?;
     let api_key = std::env::var("HELIUS_API_KEY").map_err(|_| Error("missing_live_credentials"))?;
@@ -332,7 +362,7 @@ pub fn run_admitted(
             .db
             .execute(
                 "INSERT INTO live_runs(from_slot,mint,decoder,status) VALUES(?1,?2,?3,'running')",
-                params![from as i64, USDC, decoder::DECODER_VERSION],
+                params![from as i64, mint, decoder::DECODER_VERSION],
             )
             .map_err(|_| Error("storage_write_failed"))?;
         intake.db.last_insert_rowid()
@@ -371,7 +401,7 @@ pub fn run_admitted(
                 if reference>i64::MAX as u64 || replay>i64::MAX as u64 {return Err(Error("unsupported_slot"));}
                 intake.db.execute("UPDATE live_runs SET reference_slot=?1,reference_at=?2,replay_first=?3,replay_at=?2 WHERE id=?4",params![reference as i64,now(),replay as i64,run]).map_err(|_|Error("storage_write_failed"))?;
                 let (sender,receiver)=tokio::sync::mpsc::channel(1);
-                sender.send(request(from)).await.map_err(|_|Error("subscription_failed"))?;
+                sender.send(request_mint(from,mint)).await.map_err(|_|Error("subscription_failed"))?;
                 let mut stream=client.subscribe(tokio_stream::wrappers::ReceiverStream::new(receiver)).await.map_err(|_|Error("subscription_failed"))?.into_inner();
                 loop {
                     if started.elapsed()>=Duration::from_secs(seconds) {return Ok("time_limit");}
@@ -699,6 +729,12 @@ mod tests {
             check_replay(122, 123).unwrap_err().0,
             "outside_replay_window"
         );
+        let custom = request_mint(42, "So11111111111111111111111111111111111111112");
+        assert_eq!(
+            custom.transactions["usdc"].account_include,
+            ["So11111111111111111111111111111111111111112"]
+        );
+        assert!(custom.transactions["usdc"].match_mints);
         assert!(req.transactions["usdc"].match_mints);
         assert_eq!(req.transactions["usdc"].account_include, [USDC]);
         let mut tx = update();

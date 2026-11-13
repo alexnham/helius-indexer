@@ -6,6 +6,8 @@
 !src/**
 !scripts/
 !scripts/local-test.py
+!scripts/indexer-runtime.py
+!scripts/compare-captured-usdc.py
 !scripts/local-console/
 !scripts/local-console/**
 !tests/

@@ -146,6 +146,7 @@ fn failed_decode_hides_stale_output_but_keeps_original_input_rows_and_pending_ag
     let db = Connection::open(&path).unwrap();
     insert(&db, &false_row);
     assert_eq!(run(&path)["unresolved"], 1);
+    assert!(Store::query_recent(&path, None, 1000).unwrap().is_empty());
     assert!(rows(&path).is_empty());
     assert_eq!(
         Store::summary(&path, &false_row.mint).unwrap()["transfer_count"],

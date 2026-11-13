@@ -143,10 +143,59 @@ pub(crate) fn run_with_source<S: BlockSource + Send>(
     })
 }
 
+pub struct MonitorConfig<'a> {
+    pub mint: &'a str,
+    pub live_from: u64,
+    pub start: u64,
+    pub end: u64,
+    pub seconds: u64,
+}
+
+/// Configurable bounded live intake and a separate historical range, sharing admission.
+pub fn monitor(path: &Path, config: MonitorConfig<'_>, telemetry: &mut Telemetry) -> Result<Value> {
+    crate::backfill::scope(config.mint, config.start, config.end)?;
+    crate::backfill::scope(config.mint, config.live_from, config.live_from)?;
+    live::validate_options(config.live_from, config.seconds)?;
+    let endpoint = std::env::var("SOLANA_RPC_URL")
+        .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".into());
+    let mut source = RpcSource::new(endpoint)?;
+    telemetry.set_context("coordinator", "combined", "validation");
+    run_with_mint_job(
+        path,
+        config.live_from,
+        config.seconds,
+        config.mint,
+        telemetry,
+        |gate| {
+            let mut history = History::open(path)?;
+            history.set_gate(gate);
+            let began = Instant::now();
+            let cancel = std::env::var_os("BACKFILL_CANCEL_FILE");
+            let (coverage, metrics) =
+                history.run(config.mint, config.start, config.end, &mut source, || {
+                    began.elapsed() >= Duration::from_secs(config.seconds)
+                        || cancel.as_ref().is_some_and(|p| Path::new(p).exists())
+                })?;
+            Ok(json!({"run_id":history.run_id(),"coverage":coverage,"metrics":metrics}))
+        },
+    )
+}
+
 pub(crate) fn run_with_job(
     path: &Path,
     live_from: u64,
     seconds: u64,
+    telemetry: &mut Telemetry,
+    job: impl FnOnce(Arc<WriteGate>) -> Result<Value> + Send,
+) -> Result<Value> {
+    run_with_mint_job(path, live_from, seconds, live::USDC, telemetry, job)
+}
+
+fn run_with_mint_job(
+    path: &Path,
+    live_from: u64,
+    seconds: u64,
+    mint: &str,
     telemetry: &mut Telemetry,
     job: impl FnOnce(Arc<WriteGate>) -> Result<Value> + Send,
 ) -> Result<Value> {
@@ -159,7 +208,7 @@ pub(crate) fn run_with_job(
         let live_worker = threads.spawn(move || {
             let mut context = Telemetry::default();
             context.run_id = format!("{parent_id}:live");
-            live::run_admitted(path, live_from, seconds, &mut context, &live_gate)
+            live::run_mint_admitted(path, live_from, seconds, mint, &mut context, &live_gate)
         });
         let history_gate = Arc::clone(&gate);
         let historical_worker = threads.spawn(move || job(history_gate));
@@ -193,7 +242,7 @@ pub(crate) fn run_with_job(
     );
     Ok(
         json!({"run_id":telemetry.run_id,"historical_run_id":history_id,"live":wrap(live_result),"historical":wrap(history_result),"writes":gate.snapshot()?,
-        "summary":Store::summary(path,live::USDC)?,"coverage":"inspect_scoped_historical_report","elapsed_seconds":began.elapsed().as_secs_f64(),
+        "summary":Store::summary(path,mint)?,"coverage":"inspect_scoped_historical_report","elapsed_seconds":began.elapsed().as_secs_f64(),
         "note":"reported workers do not imply complete coverage; stream tail remains unverified"}),
     )
 }
