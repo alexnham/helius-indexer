@@ -109,6 +109,19 @@ Treat archive publication lag, Jetstreamer interfaces, and compatibility with re
 
 Target operation by one engineer. Prefer managed services where their cost is justified, and avoid separate services or databases without demonstrated need.
 
+### Selected direction (2026-11-13)
+
+The owner chose to build for horizontal scale ahead of measured need, superseding the "demonstrated need" rule above for these choices:
+
+- **PostgreSQL** for transfers, checkpoints, coverage, and range leases, replacing SQLite outside offline tests. Partition transfers for retention and add rollups for aggregates.
+- **Kafka** as the durable raw intake log with a parallel consumer group. Consumers commit offsets only after the PostgreSQL write is durable; Kafka retention must satisfy the raw-retention requirements until object storage holds replay inputs.
+- **Compressed object storage** for long-term raw retention, added after the above.
+- **ClickHouse** deferred until query volume or all-mint row counts require it.
+
+Locally these run in Docker; production uses managed equivalents through configuration. Supporting load figures: [USDC load measurement](docs/validation/2026-11-13-usdc-load.md). Each step still needs the crash, duplicate, and coverage checks in this proposal.
+
+Unresolved: matched transactions currently persist transfers of every mint they contain (about 40% were USDC in the measured sample). Decide whether to filter to configured mints at write time or keep related-mint transfers.
+
 ## Rust package organization
 
 Start with one Rust package. Modules express responsibilities; extract crates only when independent builds or concrete reuse justify them. Separate commands or binaries can run workers independently without introducing a crate per worker.
