@@ -14,7 +14,7 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --offline --locked --all-targets -- -D warnings
       - run: cargo test --offline --locked
-      - run: python3 -m unittest discover -s tests -p local_console_test.py
+      - run: python3 -m unittest discover -s tests -p '*console_test.py'
   archive:
     runs-on: ubuntu-latest
     env:
@@ -29,3 +29,11 @@ jobs:
       - run: cargo fetch --locked
       - run: cargo clippy --features archive --offline --locked --all-targets -- -D warnings
       - run: cargo test --features archive --offline --locked
+  docker-console:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker compose config --quiet
+      - run: docker compose build
+      - run: python3 scripts/docker-smoke.py

@@ -1,0 +1,25 @@
+services:
+  console:
+    image: helius-indexer-console:local
+    build:
+      context: .
+      target: console
+    environment:
+      INDEXER_CONSOLE_PORT: ${INDEXER_CONSOLE_PORT:-8765}
+    ports:
+      - "127.0.0.1:${INDEXER_CONSOLE_PORT:-8765}:${INDEXER_CONSOLE_PORT:-8765}"
+    volumes:
+      - console-data:/app/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    init: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    cpus: 1.0
+    mem_limit: 512m
+    pids_limit: 64
+    stop_grace_period: 20s
+
+volumes:
+  console-data:
