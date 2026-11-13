@@ -342,3 +342,50 @@ fn missing_interval_samples_truncate_without_losing_total_counts() {
     assert_eq!(report.pending_slots, 57);
     assert_eq!(report.contiguous_through, None);
 }
+
+#[test]
+fn corroborated_boundary_is_ready_but_native_rpc_stays_incomplete_even_after_restart() {
+    let (_dir, path, plan, mut a, mut r) = setup(15);
+    let cases: Vec<Value> = serde_json::from_slice(include_bytes!(
+        "../../../tests/fixtures/mainnet-truncated-rpc.json"
+    ))
+    .unwrap();
+    for (source, capture) in [(&mut a, &cases[0]["archive"]), (&mut r, &cases[0]["rpc"])] {
+        let mut value: Value = serde_json::from_slice(&block(12, 11, false)).unwrap();
+        value["result"]["transactions"] = json!([capture["result"]]);
+        source
+            .blocks
+            .insert(12, serde_json::to_vec(&value).unwrap());
+    }
+    let db = database(&path).unwrap();
+    db.execute_batch("CREATE TRIGGER fail_pair_proof BEFORE INSERT ON bridge_overlap_proofs BEGIN SELECT RAISE(FAIL,'injected'); END;").unwrap();
+    let interrupted = work(&path, &plan, &mut a, &mut r);
+    assert_eq!(interrupted["historical"]["boundary_ready"], false);
+    assert_eq!(interrupted["historical"]["complete"], false);
+    assert!(!Store::query(&path, None, 100).unwrap().is_empty());
+    db.execute_batch("DROP TRIGGER fail_pair_proof;").unwrap();
+    let ready = work(&path, &plan, &mut a, &mut r);
+    assert_eq!(ready["historical"]["boundary_ready"], true);
+    assert_eq!(ready["historical"]["complete"], true);
+    assert_eq!(ready["historical"]["overlap_verified"], false);
+    assert_eq!(ready["historical"]["overlap_recovered"], true);
+    assert_eq!(ready["live_tail"]["coverage"], "unknown");
+    let native:String=db.query_row("SELECT status FROM historical_source_slots WHERE slot=12 AND source_kind='finalized-mainnet-rpc'",[],|r|r.get(0)).unwrap();
+    assert_eq!(native, "unknown");
+    assert_eq!(
+        status(&path, &plan.mint, 10).unwrap()["historical"]["boundary_ready"],
+        true
+    );
+    db.execute(
+        "UPDATE historical_slots SET attempts=attempts+1 WHERE slot=12",
+        [],
+    )
+    .unwrap();
+    assert_eq!(
+        status(&path, &plan.mint, 10).unwrap()["historical"]["boundary_ready"],
+        false
+    );
+    let count = Store::query(&path, None, 100).unwrap().len();
+    work(&path, &plan, &mut a, &mut r);
+    assert_eq!(Store::query(&path, None, 100).unwrap().len(), count);
+}

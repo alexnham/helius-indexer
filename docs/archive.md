@@ -144,3 +144,9 @@ The [source-boundary coordinator](source-boundary.md) now supplies a frozen
 measured plan, source routing, durable retry scheduling and unfinished-interval
 reporting. Its newer bounded mainnet check intentionally retains unsupported
 boundary decoding as incomplete. Continuous operation remains unvalidated.
+
+The [explicit RPC evidence recovery](rpc-evidence-recovery.md) path can now
+corroborate some truncated RPC observations with full matching archive runtime
+logs. Reports retain native overlap verification separately from recovered
+readiness. `archive-overlap-replay DB MINT START END` checks retained original
+pairs offline, with no CAR download or provider fallback.

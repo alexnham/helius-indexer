@@ -153,3 +153,13 @@ range in [archive validation](archive.md) remains the positive mainnet overlap
 example. Fixing unsupported authority changes and validating a production
 scheduler/continuous boundary extension remain separate work. Inspect specific
 bounded gaps with the existing `coverage DB MINT START END` command.
+
+### Explicit corroborated readiness
+
+[RPC evidence recovery](rpc-evidence-recovery.md) adds a separate readiness path
+for explicit log truncation with complete matching archive evidence. Native
+`overlap_verified` stays false in that case; `overlap_recovered` and `boundary_ready`
+identify recovered readiness. The native RPC source audit stays unknown. Proofs
+still bind to the current attempt generation, and the live tail stays unverified.
+The earlier mainnet snapshot above records the behavior before this recovery path;
+it is not relabeled retroactively.

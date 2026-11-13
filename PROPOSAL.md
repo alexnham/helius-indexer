@@ -230,3 +230,12 @@ even if transaction-boundary owners agree. Fee collection does not establish an
 ordinary transfer fee or a new transfer edge. The [support matrix](docs/token-2022-support.md)
 and [retained-input validation](docs/validation/2026-11-12-decoder-maintenance.md)
 record exact supported variants, explicit repair requirements and remaining gaps.
+
+Explicit RPC log truncation can now be resolved with matching complete archive
+execution evidence. This alternative boundary-readiness mode retains both original
+observations and a separate corroborated input/proof. It never marks native RPC
+execution complete: reports distinguish native verification from recovered
+readiness, and the live tail remains unknown. Recovery requires matching block/
+transaction/known metadata, an exact observed log prefix plus consistent suffix,
+and unchanged strict decoding of complete evidence. See
+[RPC evidence recovery](docs/rpc-evidence-recovery.md) for trust limits and tests.
