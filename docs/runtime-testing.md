@@ -58,10 +58,11 @@ Counts can temporarily exceed the cap while a cycle is ingesting.
 After every cycle the runtime keeps only the newest `INDEXER_KEEP_TRANSFERS`
 (default 1,000) transfers across all mints and deletes raw inputs, captures and
 historical progress for older slots. Pruned slots, including a partially retained boundary slot, report `unknown`,
-never `complete`, and their data cannot be repaired or re-verified without fetching it
-again. At USDC volume 1,000 transfers is only a few seconds of chain activity, so
+never `complete`. Older deleted raw data needs backup or refetch for repair.
+Evidence still retained at the boundary can be reverified, potentially restoring
+rows that a later prune removes again. At USDC volume 1,000 transfers is only a few seconds of chain activity, so
 the initial backfill is usually pruned after the first cycle. SQLite reuses freed
-pages, rather than shrinking the file; the transfer count is not a hard disk-byte cap;
+pages rather than shrinking the file. The transfer count is not a hard disk-byte cap;
 lower `INDEXER_LIVE_SECONDS` to lower that peak, or `down --volumes` to reclaim it.
 Continuous LaserStream usage is metered by Helius. The initial sample retained
 about 54 MB of protobuf in a minute; this is not billed bandwidth or an authoritative
