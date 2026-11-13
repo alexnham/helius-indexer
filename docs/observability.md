@@ -207,3 +207,20 @@ reported as zero. `bridge_batch_finished` includes run, mint/range/tip and pendi
 scope in the diagnostic event, with no new high-cardinality metric labels.
 Tests distinguish interrupted proof acknowledgment, a failed source, scheduler
 rotation and durable completion. See [source-boundary operation](source-boundary.md).
+
+
+### Decoder v5 maintenance and archive repair
+
+Base authority changes and withheld-fee maintenance no longer create unsupported
+failures for recognized layouts. Malformed layouts retain the bounded classes
+`invalid_authority_instruction` and `invalid_fee_maintenance_instruction`; unknown
+extension authority/configuration types remain unsupported. Owner uncertainty is
+represented by null, never by a guessed authority. Unknown ordinary transfer fees
+remain null after fee maintenance. Captured and synthetic telemetry/storage
+checks preserve attempts-versus-unique semantics and source failure visibility.
+
+`repair-history-archive` uses the existing retained-block repair context and
+revision-scoped coverage. Reports add `source_kind` (`archive` or `rpc`) alongside
+`retained_blocks_only`; cached blocks and zero source requests distinguish offline
+reverification from fetching. Original repair age is preserved. No new metric
+labels are introduced. See [decoder maintenance evidence](validation/2026-11-12-decoder-maintenance.md).

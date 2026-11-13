@@ -73,3 +73,28 @@ HarvestWithheldTokensToMint capture from slot 468522222, retained during the
 second five-second check. Both preserve runtime evidence with application logs
 and return data removed. Neither contains an ordinary instructed transfer edge;
 these are captured exclusions, not synthetic successful transfers.
+
+
+## Authority / fee maintenance corpus
+
+`mainnet-maintenance.json` contains 11 successful finalized public mainnet captures
+retained during bounded archive/RPC validation on 2026-11-12. Each case includes
+its source kind, signature, slot, compiled instructions, token metadata, runtime
+execution evidence and independently enumerated ordinary transfer expectations.
+Archive receipts include epoch/range/digest/revision when available. Application
+logs and return data were removed; runtime failure reasons were stripped. Raw
+CARs, provider endpoints and credentials are not included.
+
+Captured slots: 468265446 (four fee-withdrawal cases), 468265448 (two close-
+authority cases), 468265450 (one), 468287999 (two), 468288003 and 468288004 (one
+each). The 61 expected edges come from inspecting compiled Transfer / TransferChecked
+instructions and metadata, without treating withdrawals or balance deltas as
+ordinary transfer edges. The first nine captures came from Old Faithful via the
+pinned maintained Jetstreamer adapter; the last two came from finalized mainnet
+RPC blocks. AccountOwner changes and mint-fee withdrawals are synthetic tests,
+not additional captured examples. Decoder v5 requires `mainnet-expected.json`'s
+revision field to change; its two transfer IDs/amounts remain unchanged.
+
+The first maintenance case also includes one sanitized finalized RPC observation
+of the same signature, for identical-output and both-arrival-order reconciliation
+checks. There are 11 unique transactions and 12 source observations in total.

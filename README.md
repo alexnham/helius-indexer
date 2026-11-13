@@ -251,3 +251,11 @@ The [source-boundary coordinator](docs/source-boundary.md) adds `bridge-plan`,
 `bridge`, `bridge-status` and `bridge-live`: a frozen measured boundary, eight-slot
 resumable batches, source-specific unfinished intervals and an unverified live
 tail. Create a plan explicitly before running either worker command.
+
+
+Decoder v5 supports base authority changes and withheld-fee collection without
+losing unrelated transfers. Use `repair-history-archive DB MINT START END` for
+explicit offline re-verification of normalized archive receipts already retained
+in SQLite. It needs no CAR cache or optional SDK feature. See the
+[decoder maintenance validation](docs/validation/2026-11-12-decoder-maintenance.md)
+and back up the database before in-place repair.

@@ -19,6 +19,8 @@ cargo run --offline --locked -- repair-status DB START_SLOT END_SLOT
 cargo run --offline --locked -- repair DB START_SLOT END_SLOT
 # Repeat bounded capture batches while observing progress.
 cargo run --offline --locked -- repair-history DB MINT START_SLOT END_SLOT
+# Select normalized archive receipts instead of RPC receipts:
+cargo run --offline --locked -- repair-history-archive DB MINT START_SLOT END_SLOT
 cargo run --offline --locked -- live-retry DB
 cargo run --offline --locked -- coverage DB MINT START_SLOT END_SLOT
 ```
@@ -31,7 +33,12 @@ already verified by capture repair is skipped by later capture batches. Current-
 revision unresolved markers remain eligible: compatible metadata arriving through
 ordinary ingestion does not remove the marker until explicit repair reverifies it.
 
-`repair-history` processes the selected full retained RPC blocks. It can import
+`repair-history` processes the selected full retained RPC blocks.
+`repair-history-archive` selects full normalized archive blocks in the same
+SQLite history, preserving archive provenance. It requires neither the optional
+archive SDK feature nor a CAR cache; missing archived blocks remain unknown.
+Source selection is explicit, so missing RPC input does not silently fall back
+to a different source. It can import
 transactions rejected by an earlier decoder that never reached the capture table.
 It can also use compatible richer block metadata to resolve old captures. It has
 no network fallback: missing retained blocks remain unknown with
