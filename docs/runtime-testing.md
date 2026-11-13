@@ -159,3 +159,16 @@ and [replay availability](https://www.helius.dev/docs/api-reference/laserstream/
 
 See [measured runtime validation](validation/2026-11-13-docker-runtime.md) for the
 initial incomplete 50-slot result, independent comparison gaps and offline checks.
+
+For an explicitly chosen compatible CLI update (same decoder/schema), stop the
+runtime first, preserve its previous binary, then replace it atomically from the
+new image. This does not migrate decoder revisions or restore pruned data:
+
+```sh
+docker compose stop runtime
+docker compose run --rm --no-deps --entrypoint python3 runtime -c "from pathlib import Path; import shutil; p=Path('/app/data/runtime'); shutil.copy2(p/'helius-indexer',p/'helius-indexer.previous'); shutil.copyfile('/usr/local/bin/helius-indexer',p/'.upgrade.tmp'); (p/'.upgrade.tmp').chmod(0o700); (p/'.upgrade.tmp').replace(p/'helius-indexer')"
+docker compose --profile live up -d --force-recreate runtime
+```
+
+Keep the previous binary only for compatible rollback. Back up the whole stopped
+session separately before a decoder/schema migration.
