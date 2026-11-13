@@ -26,11 +26,40 @@ pub trait BlockSource {
     fn block(&mut self, slot: u64) -> Result<Vec<u8>>;
 }
 
+#[derive(Default)]
+struct RpcDiagnostics {
+    requests: u64,
+    request_failures: u64,
+    read_failures: u64,
+    oversized_responses: u64,
+    response_body_bytes_read: u64,
+}
+fn read_rpc_body(
+    reader: impl Read,
+    max: usize,
+    too_large: Error,
+    stats: &mut RpcDiagnostics,
+) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let read = reader.take(max as u64 + 1).read_to_end(&mut bytes);
+    stats.response_body_bytes_read += bytes.len() as u64;
+    if read.is_err() {
+        stats.read_failures += 1;
+        return Err(Error("rpc_read_failed"));
+    }
+    if bytes.len() > max {
+        stats.oversized_responses += 1;
+        return Err(too_large);
+    }
+    Ok(bytes)
+}
+
 pub struct RpcSource {
     endpoint: String,
     agent: ureq::Agent,
     verified: bool,
     deadline: Option<Instant>,
+    diagnostics: RpcDiagnostics,
 }
 impl RpcSource {
     pub fn new(endpoint: String) -> Result<Self> {
@@ -48,6 +77,7 @@ impl RpcSource {
             agent,
             verified: false,
             deadline: None,
+            diagnostics: RpcDiagnostics::default(),
         })
     }
     #[cfg(feature = "archive")]
@@ -67,22 +97,36 @@ impl RpcSource {
         }
         Ok(timeout)
     }
-    fn verify_mainnet(&mut self) -> Result<()> {
-        let mut response = self
+    fn request_raw(&mut self, payload: Value, max: usize, too_large: Error) -> Result<Vec<u8>> {
+        let timeout = self.request_timeout()?;
+        self.diagnostics.requests += 1;
+        let response = self
             .agent
             .post(&self.endpoint)
             .config()
-            .timeout_global(Some(self.request_timeout()?))
+            .timeout_global(Some(timeout))
             .build()
-            .send_json(json!({"jsonrpc":"2.0","id":1,"method":"getGenesisHash"}))
-            .map_err(|_| Error("rpc_request_failed"))?;
-        let mut bytes = Vec::new();
-        response
-            .body_mut()
-            .as_reader()
-            .take(4097)
-            .read_to_end(&mut bytes)
-            .map_err(|_| Error("rpc_read_failed"))?;
+            .send_json(payload);
+        let mut response = match response {
+            Ok(response) => response,
+            Err(_) => {
+                self.diagnostics.request_failures += 1;
+                return Err(Error("rpc_request_failed"));
+            }
+        };
+        read_rpc_body(
+            response.body_mut().as_reader(),
+            max,
+            too_large,
+            &mut self.diagnostics,
+        )
+    }
+    fn verify_mainnet(&mut self) -> Result<()> {
+        let bytes = self.request_raw(
+            json!({"jsonrpc":"2.0","id":1,"method":"getGenesisHash"}),
+            4096,
+            Error("rpc_mainnet_required"),
+        )?;
         let value: Value =
             serde_json::from_slice(&bytes).map_err(|_| Error("invalid_rpc_response"))?;
         if bytes.len() > 4096
@@ -100,25 +144,12 @@ impl RpcSource {
 impl RpcSource {
     pub fn finalized_reference(&mut self) -> Result<(u64, Option<i64>)> {
         self.verify_mainnet()?;
-        let request = |method: &str, params: Value| -> Result<Value> {
-            let mut response = self
-                .agent
-                .post(&self.endpoint)
-                .config()
-                .timeout_global(Some(self.request_timeout()?))
-                .build()
-                .send_json(json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}))
-                .map_err(|_| Error("rpc_request_failed"))?;
-            let mut raw = Vec::new();
-            response
-                .body_mut()
-                .as_reader()
-                .take(4097)
-                .read_to_end(&mut raw)
-                .map_err(|_| Error("rpc_read_failed"))?;
-            if raw.len() > 4096 {
-                return Err(Error("invalid_rpc_response"));
-            }
+        let mut request = |method: &str, params: Value| -> Result<Value> {
+            let raw = self.request_raw(
+                json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}),
+                4096,
+                Error("invalid_rpc_response"),
+            )?;
             let value: Value =
                 serde_json::from_slice(&raw).map_err(|_| Error("invalid_rpc_response"))?;
             if value["id"] != 1 || value["jsonrpc"] != "2.0" || value.get("error").is_some() {
@@ -138,33 +169,15 @@ impl RpcSource {
     }
 }
 impl BlockSource for RpcSource {
+    fn diagnostics(&self) -> Value {
+        json!({"measurement":"response body bytes consumed; excludes request/headers/TLS and billing","requests":self.diagnostics.requests,"request_failures":self.diagnostics.request_failures,"read_failures":self.diagnostics.read_failures,"oversized_responses":self.diagnostics.oversized_responses,"response_body_bytes_read":self.diagnostics.response_body_bytes_read})
+    }
     fn block(&mut self, slot: u64) -> Result<Vec<u8>> {
         if !self.verified {
             self.verify_mainnet()?;
         }
-        let mut response = self
-            .agent
-            .post(&self.endpoint)
-            .config()
-            .timeout_global(Some(self.request_timeout()?))
-            .build()
-            .send_json(json!({
-                "jsonrpc":"2.0","id":1,"method":"getBlock","params":[slot,{
-                    "commitment":"finalized","encoding":"json","transactionDetails":"full",
-                    "maxSupportedTransactionVersion":1,"rewards":false}]
-            }))
-            .map_err(|_| Error("rpc_request_failed"))?;
-        let mut bytes = Vec::new();
-        response
-            .body_mut()
-            .as_reader()
-            .take(MAX_BLOCK_BYTES as u64 + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|_| Error("rpc_read_failed"))?;
-        if bytes.len() > MAX_BLOCK_BYTES {
-            return Err(Error("block_too_large"));
-        }
-        Ok(bytes)
+        self.request_raw(json!({"jsonrpc":"2.0","id":1,"method":"getBlock","params":[slot,{
+            "commitment":"finalized","encoding":"json","transactionDetails":"full","maxSupportedTransactionVersion":1,"rewards":false}]}),MAX_BLOCK_BYTES,Error("block_too_large"))
     }
 }
 
@@ -773,4 +786,56 @@ fn event(
     event["slot"] = json!(slot);
     event["mint"] = json!(mint);
     let _ = writeln!(std::io::stderr().lock(), "{event}");
+}
+
+#[cfg(test)]
+mod rpc_diagnostics_tests {
+    use super::*;
+    #[test]
+    fn consumed_bodies_include_small_responses_and_oversize_sentinel() {
+        let mut stats = RpcDiagnostics::default();
+        assert_eq!(
+            read_rpc_body(&b"genesis"[..], 4096, Error("oversized"), &mut stats).unwrap(),
+            b"genesis"
+        );
+        assert_eq!(
+            read_rpc_body(&b"abcdef"[..], 3, Error("oversized"), &mut stats)
+                .unwrap_err()
+                .0,
+            "oversized"
+        );
+        assert_eq!(stats.response_body_bytes_read, 11);
+        assert_eq!(stats.oversized_responses, 1);
+    }
+    #[test]
+    fn partial_read_failures_keep_consumed_byte_accounting_and_diagnostics_are_redacted() {
+        struct Partial(bool);
+        impl Read for Partial {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                if self.0 {
+                    return Err(std::io::Error::other("private transport detail"));
+                }
+                self.0 = true;
+                buffer[..3].copy_from_slice(b"abc");
+                Ok(3)
+            }
+        }
+        let mut source = RpcSource::new("https://example.invalid/?api-key=private".into()).unwrap();
+        assert_eq!(
+            read_rpc_body(
+                Partial(false),
+                100,
+                Error("oversized"),
+                &mut source.diagnostics
+            )
+            .unwrap_err()
+            .0,
+            "rpc_read_failed"
+        );
+        let diagnostic = source.diagnostics();
+        assert_eq!(diagnostic["response_body_bytes_read"], 3);
+        assert_eq!(diagnostic["read_failures"], 1);
+        assert!(!diagnostic.to_string().contains("private"));
+        assert!(!diagnostic.to_string().contains("example.invalid"));
+    }
 }

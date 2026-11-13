@@ -98,7 +98,7 @@ pub fn overlap(
         observations.push(json!({"slot":slot,"outcome":outcome}));
     }
     Ok(
-        json!({"run_id":telemetry.run_id,"overlap_verified":verified==end-start+1,"boundary_ready":verified+recovered==end-start+1,"verified_slots":verified,"corroborated_slots":recovered,"observations":observations,"start":start,"end":end,"jetstreamer_revision":JETSTREAMER_REVISION,"archive":archive.stats,"rpc_response_body_bytes":rpc_bytes,"coverage":history.coverage(mint,start,end)?,"summary":crate::storage::Store::summary(path,mint)?,"live_coverage":"unknown"}),
+        json!({"run_id":telemetry.run_id,"overlap_verified":verified==end-start+1,"boundary_ready":verified+recovered==end-start+1,"verified_slots":verified,"corroborated_slots":recovered,"observations":observations,"start":start,"end":end,"jetstreamer_revision":JETSTREAMER_REVISION,"archive":archive.stats,"rpc_response_body_bytes":rpc_bytes,"rpc_transport":rpc.diagnostics(),"coverage":history.coverage(mint,start,end)?,"summary":crate::storage::Store::summary(path,mint)?,"live_coverage":"unknown"}),
     )
 }
 
@@ -243,7 +243,8 @@ pub fn tip(cache: &Path, telemetry: &mut Telemetry) -> Result<Value> {
     let mut archive = ArchiveSource::new(cache, true, Limits::default())?;
     let endpoint = std::env::var("SOLANA_RPC_URL")
         .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".into());
-    let (reference, time) = RpcSource::new(endpoint)?.finalized_reference()?;
+    let mut rpc = RpcSource::new(endpoint)?;
+    let (reference, time) = rpc.finalized_reference()?;
     let epoch = reference / 432000;
     let mut probes = Vec::new();
     let mut uncertain = false;
@@ -263,7 +264,7 @@ pub fn tip(cache: &Path, telemetry: &mut Telemetry) -> Result<Value> {
                     .and_then(|now| now.checked_sub(tip_time))
                     .filter(|lag| *lag >= 0);
                 return Ok(
-                    json!({"run_id":telemetry.run_id,"reference_slot":reference,"reference_block_time":time,"available_epoch":candidate,"last_observed_archive_slot":tip,"archive_block_time":tip_time,"slot_gap":reference-tip,"observed_freshness_gap_seconds":lag,"tip_exact_within_probed_epochs":!uncertain,"publication_delay_after_epoch_end":"not_measured","probes":probes,"archive":archive.stats,"jetstreamer_revision":JETSTREAMER_REVISION}),
+                    json!({"run_id":telemetry.run_id,"rpc_transport":rpc.diagnostics(),"reference_slot":reference,"reference_block_time":time,"available_epoch":candidate,"last_observed_archive_slot":tip,"archive_block_time":tip_time,"slot_gap":reference-tip,"observed_freshness_gap_seconds":lag,"tip_exact_within_probed_epochs":!uncertain,"publication_delay_after_epoch_end":"not_measured","probes":probes,"archive":archive.stats,"jetstreamer_revision":JETSTREAMER_REVISION}),
                 );
             }
             Ok(false) => probes.push(json!({"epoch":candidate,"state":"not_found"})),
@@ -274,6 +275,6 @@ pub fn tip(cache: &Path, telemetry: &mut Telemetry) -> Result<Value> {
         }
     }
     Ok(
-        json!({"run_id":telemetry.run_id,"reference_slot":reference,"last_observed_archive_slot":null,"archive_tip":"unknown","probes":probes,"archive":archive.stats}),
+        json!({"run_id":telemetry.run_id,"rpc_transport":rpc.diagnostics(),"reference_slot":reference,"last_observed_archive_slot":null,"archive_tip":"unknown","probes":probes,"archive":archive.stats}),
     )
 }

@@ -265,3 +265,8 @@ The optional archive feature also supports
 RPC log truncation from complete matching archive evidence. Both originals remain
 retained; native RPC stays incomplete and reports expose corroborated readiness.
 See [RPC evidence recovery](docs/rpc-evidence-recovery.md) for limits and rollback.
+
+RPC source reports now include consumed response-body bytes and request/read/
+oversize failures, separately from normalized input and stored transfer counts.
+These measurements include small reference/genesis responses and partial reads;
+they are not provider-billed or full wire bytes. See [telemetry](docs/observability.md#rpc-response-body-accounting).
