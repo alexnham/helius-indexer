@@ -113,7 +113,7 @@ Target operation by one engineer. Prefer managed services where their cost is ju
 
 The owner chose to build for horizontal scale ahead of measured need, superseding the "demonstrated need" rule above for these choices:
 
-- **PostgreSQL** for transfers, checkpoints, coverage, and range leases, replacing SQLite outside offline tests. Partition transfers for retention and add rollups for aggregates.
+- **PostgreSQL** for transfers, checkpoints, coverage, and range leases, replacing SQLite entirely. Ordinary tests use a local PostgreSQL container (offline: no provider calls); hosted databases are for opt-in checks only. Existing SQLite sessions are test data and are reset rather than migrated. Partition transfers for retention and add rollups for aggregates.
 - **Kafka** as the durable raw intake log with a parallel consumer group. Consumers commit offsets only after the PostgreSQL write is durable; Kafka retention must satisfy the raw-retention requirements until object storage holds replay inputs.
 - **Compressed object storage** for long-term raw retention, added after the above.
 - **ClickHouse** deferred until query volume or all-mint row counts require it.
