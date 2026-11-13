@@ -1,5 +1,19 @@
 # helius-indexer
 
+## Start testing
+
+```sh
+python3 scripts/local-test.py
+```
+
+Open **http://127.0.0.1:8765** for the local captured-transfer console. Startup
+seeds 303 unique transfers from 50 captures, checks replay, and keeps all test
+data in a fresh ignored session. No provider credentials or Docker needed.
+See [the local testing guide](docs/local-testing.md) for prerequisites, checks,
+restart instructions and current limits. This is a read-only captured-data test
+console; live and 30-day coverage remain unverified.
+
+
 Offline validation slice for a Solana token transfer index. It decodes compiled
 SPL Token instructions, atomically stores captured inputs and transfers in
 SQLite, and queries persisted results from a separate process. Implementation
@@ -80,14 +94,16 @@ have a known zero transfer fee and `confidential: false`.
 Inner instruction metadata must be present. Transactions containing inner SPL
 Token instructions also require matching runtime invocation/success evidence.
 Truncated/missing evidence or any caught CPI failure leaves the transaction
-unsupported rather than incorrectly indexing rolled-back effects. Unknown SPL opcodes and authority-change transactions are explicitly unsupported
-in this slice. Owners are reported only when both pre/post observations agree;
+unsupported rather than incorrectly indexing rolled-back effects. Unknown SPL opcodes and unsupported extension authority types remain unresolved.
+Base authority operations and withheld-fee maintenance are recognized; see the
+[Token-2022 support matrix](docs/token-2022-support.md). Owners are reported only
+when both pre/post observations agree and no account-owner change makes them ambiguous;
 otherwise they are null. The decoder makes no network or database calls.
 
 A structurally valid capture that fails decoding is retained with a bounded error
 class, with no partial transfer records, and the command exits unsuccessfully.
-Malformed envelopes fail before persistence. Decoder correction/retry scheduling
-is a later ticket; retained failure records do not imply verified coverage.
+Malformed envelopes fail before persistence. Explicit [decoder repair](docs/decoder-repair.md) is available; retained failure
+records do not imply verified coverage.
 
 ## Provisional persistence
 
