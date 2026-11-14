@@ -16,7 +16,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     && mkdir -p /app/data && chown 10001:10001 /app/data
 WORKDIR /app
 COPY --from=build /build/target/release/helius-indexer /usr/local/bin/helius-indexer
-COPY scripts/local-test.py ./scripts/local-test.py
+COPY scripts/local-test.py scripts/indexer-runtime.py scripts/compare-captured-usdc.py ./scripts/
 COPY scripts/local-console ./scripts/local-console
 COPY tests/fixtures ./tests/fixtures
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 INDEXER_CONSOLE_PORT=8765

@@ -293,3 +293,10 @@ The optional archive feature also supports
 RPC log truncation from complete matching archive evidence. Both originals remain
 retained; native RPC stays incomplete and reports expose corroborated readiness.
 See [RPC evidence recovery](docs/rpc-evidence-recovery.md) for limits and rollback.
+
+For **real provider-backed live intake and configurable backfill**, use the
+[opt-in runtime console](docs/runtime-testing.md):
+`docker compose --profile live up --build -d runtime`, then open
+http://127.0.0.1:8767. It needs a local Helius secret, starts a 50-slot backfill
+alongside live intake, then continues live intake in 60-second cycles, and keeps only the newest 1,000
+transfers; it does not seed fixtures.

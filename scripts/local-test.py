@@ -31,11 +31,11 @@ def valid_mint(value):
     return len(value) - len(value.lstrip("1")) + (number.bit_length() + 7) // 8 == 32
 
 
-def command(session, *args):
+def command(session, *args, timeout=30):
     with (session / "events.jsonl").open("ab") as log:
         result = subprocess.run(
             [str(session / "helius-indexer"), *map(str, args)],
-            stdout=subprocess.PIPE, stderr=log, timeout=30, check=False,
+            stdout=subprocess.PIPE, stderr=log, timeout=timeout, check=False,
         )
     if result.returncode:
         raise RuntimeError("Indexer command failed; inspect the session events.jsonl")
@@ -116,10 +116,11 @@ def readiness(session):
     json.loads((session / "session.json").read_text())
     with closing(sqlite3.connect((session / "index.sqlite").resolve().as_uri() + "?mode=ro", uri=True, timeout=2)) as db:
         db.execute("SELECT transfer_id FROM transfers LIMIT 1").fetchone()
-    return {"status": "ready", "mode": "captured data", "coverage": "unknown"}
+    metadata = json.loads((session / "session.json").read_text())
+    return {"status": "ready", "mode": metadata.get("mode", "captured data"), "coverage": "unknown"}
 
 
-def handler_for(session, port):
+def handler_for(session, port, runtime_status=None):
     class Handler(BaseHTTPRequestHandler):
         def setup(self):
             super().setup()
@@ -157,6 +158,11 @@ def handler_for(session, port):
                     self.send(503, {"status": "unavailable"})
             elif url.path == "/api/session":
                 self.send(200, json.loads((session / "session.json").read_text()))
+            elif url.path == "/api/status" and runtime_status:
+                try:
+                    self.send(200, runtime_status())
+                except (RuntimeError, subprocess.TimeoutExpired, ValueError, OSError):
+                    self.send(503, {"error": "Status unavailable"})
             elif url.path == "/api/transfers":
                 try:
                     query = parse_qs(url.query, keep_blank_values=True, max_num_fields=4)
@@ -168,7 +174,7 @@ def handler_for(session, port):
                     self.send(400, {"error": "Use one valid mint address"})
                     return
                 try:
-                    args = ["query", session / "index.sqlite"] + ([mint] if mint else [])
+                    args = ["query-recent" if runtime_status else "query", session / "index.sqlite"] + ([mint] if mint else [])
                     self.send(200, command(session, *args))
                 except (RuntimeError, subprocess.TimeoutExpired, ValueError):
                     self.send(503, {"error": "Query failed; inspect session events.jsonl"})

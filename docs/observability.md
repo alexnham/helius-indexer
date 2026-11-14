@@ -247,3 +247,22 @@ creating a database or exposing a path/error payload. It never substitutes for
 verified coverage/freshness gauges. Persistent initialization publishes its receipt
 only after replay checks pass; startup/restart and native CLI event logs remain
 separate. See [Docker operation](docker.md) for scope and validation.
+
+## Provider-backed local console
+
+The opt-in runtime exposes `/api/status` with separate supervisor state, combined
+worker report, per-mint unique storage summary, live raw/replay diagnostics and
+scoped historical coverage. The newest-first transfer query uses the same storage
+repair visibility rules as ordinary queries. Polling is every five seconds only
+while the page is visible. Supervisor failure/timeout cannot fabricate a successful
+source report. Availability remains separate from source connection and verified
+coverage. See [runtime testing](runtime-testing.md) for limits and manual correctness checks.
+
+Continuous runtime cycles record `cycle`, the last report and the prune result in
+`worker.json` (`state` is `running`, `retrying` or `stopped`). Each prune emits a
+`retention_pruned` event, and its report gives removed transfer/input row counts
+and the oldest retained slot. `live-status` exposes `last_received_slot`, the
+resume position for the next cycle. Pruning invalidates historical/source/overlap completion proofs for a partially
+retained boundary slot in the same transaction as deletion. Shutdown tracks both
+intake and prune subprocesses; timeout kills and reaps the current child. Pruning
+keeps coverage `unknown`.

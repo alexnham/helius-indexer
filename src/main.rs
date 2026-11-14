@@ -15,7 +15,7 @@ use std::{
     time::Instant,
 };
 
-const USAGE: &str = "usage: helius-indexer ingest DB CAPTURE [--metrics FILE] | query DB [MINT] | backfill DB MINT START END [--metrics FILE] | coverage DB MINT START END | live DB FROM_SLOT SECONDS | live-status DB | live-retry DB | summary DB MINT | overlap DB START END SECONDS | repair DB START END | repair-status DB START END | repair-history-archive DB MINT START END | repair-history DB MINT START END | [feature archive] archive/archive-replay/archive-overlap DB CACHE MINT START END | bridge-plan DB CACHE MINT START | bridge DB CACHE MINT START | bridge-status DB MINT START | bridge-live DB CACHE START SECONDS | archive-overlap-replay DB MINT START END | archive-tip CACHE | archive-live DB CACHE START END SECONDS";
+const USAGE: &str = "usage: helius-indexer monitor DB MINT LIVE_FROM START END SECONDS | query-recent DB [MINT] | ingest DB CAPTURE [--metrics FILE] | query DB [MINT] | backfill DB MINT START END [--metrics FILE] | coverage DB MINT START END | live DB FROM_SLOT SECONDS [MINT] | prune DB KEEP | live-status DB | live-retry DB | summary DB MINT | overlap DB START END SECONDS | repair DB START END | repair-status DB START END | repair-history-archive DB MINT START END | repair-history DB MINT START END | [feature archive] archive/archive-replay/archive-overlap DB CACHE MINT START END | bridge-plan DB CACHE MINT START | bridge DB CACHE MINT START | bridge-status DB MINT START | bridge-live DB CACHE START SECONDS | archive-overlap-replay DB MINT START END | archive-tip CACHE | archive-live DB CACHE START END SECONDS";
 
 fn ingest(db: &str, input: &str, telemetry: &mut Telemetry) -> Result<serde_json::Value> {
     let started = Instant::now();
@@ -198,6 +198,23 @@ fn run(args: &[String], telemetry: &mut Telemetry) -> Result<serde_json::Value> 
                 })
             }
         }
+        [command, db, mint, from, start, end, seconds] if command == "monitor" => {
+            helius_indexer::coordinator::monitor(
+                Path::new(db),
+                helius_indexer::coordinator::MonitorConfig {
+                    mint,
+                    live_from: from.parse().map_err(|_| Error("invalid_live_bounds"))?,
+                    start: start
+                        .parse()
+                        .map_err(|_| Error("invalid_historical_range"))?,
+                    end: end.parse().map_err(|_| Error("invalid_historical_range"))?,
+                    seconds: seconds.parse().map_err(|_| Error("invalid_live_bounds"))?,
+                },
+                telemetry,
+            )
+        }
+        [command, db] if command == "query-recent" => query_recent(db, None),
+        [command, db, mint] if command == "query-recent" => query_recent(db, Some(mint)),
         [command, db, mint] if command == "summary" => Store::summary(Path::new(db), mint),
         [command, db, start, end, seconds] if command == "overlap" => {
             helius_indexer::coordinator::run(
@@ -264,6 +281,22 @@ fn run(args: &[String], telemetry: &mut Telemetry) -> Result<serde_json::Value> 
             seconds.parse().map_err(|_| Error("invalid_live_bounds"))?,
             telemetry,
         ),
+        [command, db, from, seconds, mint] if command == "live" => helius_indexer::live::run_mint(
+            Path::new(db),
+            from.parse().map_err(|_| Error("invalid_live_bounds"))?,
+            seconds.parse().map_err(|_| Error("invalid_live_bounds"))?,
+            mint,
+            telemetry,
+        ),
+        [command, db, keep] if command == "prune" => {
+            telemetry.set_context("storage", "local", "retention");
+            let report = Store::prune(
+                Path::new(db),
+                keep.parse().map_err(|_| Error("invalid_retention_limit"))?,
+            )?;
+            telemetry.emit("retention_pruned", "prune", "success", None);
+            Ok(report)
+        }
         [command, db] if command == "live-status" => {
             helius_indexer::live::Intake::report(Path::new(db))
         }
@@ -284,6 +317,14 @@ fn query(db: &str, mint: Option<&str>) -> Result<serde_json::Value> {
     let transfers = Store::query(Path::new(db), mint, 1000)?;
     Ok(
         json!({"coverage":"unknown","limit":1000,"transfers":transfers,"live":helius_indexer::live::Intake::report(Path::new(db))?}),
+    )
+}
+
+fn query_recent(db: &str, mint: Option<&str>) -> Result<serde_json::Value> {
+    Ok(
+        json!({"coverage":"unknown","limit":1000,"order":"newest_first",
+        "transfers":Store::query_recent(Path::new(db), mint, 1000)?,
+        "live":helius_indexer::live::Intake::report(Path::new(db))?}),
     )
 }
 

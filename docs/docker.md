@@ -119,3 +119,9 @@ receipt/binary/queries after recreation, and network-disabled initialization.
 The default Docker console is healthy on the separate test port 8766. AMD64
 verification is configured in CI and remains pending until that job passes.
 No Rust source changed; the native Rust suite was not rebuilt/rerun locally.
+
+The separate [provider-backed runtime](runtime-testing.md) is now available under
+`--profile live`: real live intake and configurable bounded recent RPC history,
+a separate data volume, runtime-only secret and inspectable coverage. The default
+captured console remains unchanged. Archive-enabled image packaging from #27 is
+still separate work.

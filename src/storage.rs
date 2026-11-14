@@ -267,17 +267,104 @@ impl Store {
         )
     }
 
+    /// Runtime-test retention: keeps the newest `keep` transfers and drops inputs and
+    /// progress for older slots, so pruned slots report unknown rather than complete.
+    pub fn prune(path: &Path, keep: usize) -> Result<serde_json::Value> {
+        if !(1..=1_000_000).contains(&keep) {
+            return Err(Error("invalid_retention_limit"));
+        }
+        let mut store = Self::open(path)?;
+        let transaction = store
+            .0
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|_| Error("storage_write_failed"))?;
+        let write = |sql: &str, value: i64| {
+            transaction
+                .execute(sql, [value])
+                .map_err(|_| Error("storage_write_failed"))
+        };
+        let transfers = write(
+            "DELETE FROM transfers WHERE transfer_id NOT IN (SELECT transfer_id FROM transfers
+             ORDER BY slot DESC, signature DESC, outer_index DESC, inner_index DESC LIMIT ?1)",
+            keep as i64,
+        )?;
+        let cutoff: Option<i64> = transaction
+            .query_row("SELECT MIN(slot) FROM transfers", [], |r| r.get(0))
+            .map_err(|_| Error("storage_read_failed"))?;
+        let mut inputs = 0;
+        if let Some(cutoff) = cutoff {
+            for table in ["captures", "capture_inputs"] {
+                inputs += write(
+                    &format!(
+                        "DELETE FROM {table} WHERE json_extract(result_json,'$.slot') < ?1
+                     AND signature NOT IN (SELECT signature FROM transfers)"
+                    ),
+                    cutoff,
+                )?;
+            }
+            let existing: Vec<String> = transaction
+                .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+                .and_then(|mut s| s.query_map([], |r| r.get(0))?.collect())
+                .map_err(|_| Error("storage_read_failed"))?;
+            // Owned by live/backfill/repair code; absent until those paths first run.
+            for table in [
+                "decoder_repairs",
+                "live_raw",
+                "historical_slots",
+                "historical_inputs",
+                "historical_source_slots",
+                "historical_block_identity",
+                "bridge_overlap_proofs",
+            ] {
+                if existing.iter().any(|name| name == table) {
+                    // A count cap can split its oldest retained slot. Its completion
+                    // proofs must disappear atomically with the removed transfers.
+                    let proof = matches!(
+                        table,
+                        "historical_slots" | "historical_source_slots" | "bridge_overlap_proofs"
+                    );
+                    let comparison = if proof && transfers > 0 { "<=" } else { "<" };
+                    inputs += write(
+                        &format!("DELETE FROM {table} WHERE slot {comparison} ?1"),
+                        cutoff,
+                    )?;
+                }
+            }
+        }
+        transaction
+            .commit()
+            .map_err(|_| Error("storage_write_failed"))?;
+        Ok(
+            serde_json::json!({"kept_limit":keep,"removed_transfers":transfers,"removed_input_rows":inputs,
+            "oldest_retained_slot":cutoff,"coverage":"unknown"}),
+        )
+    }
+
     pub fn query(path: &Path, mint: Option<&str>, limit: usize) -> Result<Vec<Transfer>> {
+        Self::query_ordered(path, mint, limit, false)
+    }
+
+    pub fn query_recent(path: &Path, mint: Option<&str>, limit: usize) -> Result<Vec<Transfer>> {
+        Self::query_ordered(path, mint, limit, true)
+    }
+
+    fn query_ordered(
+        path: &Path,
+        mint: Option<&str>,
+        limit: usize,
+        recent: bool,
+    ) -> Result<Vec<Transfer>> {
         if !(1..=1000).contains(&limit) {
             return Err(Error("invalid_query_limit"));
         }
+        let order = if recent { "DESC" } else { "ASC" };
         let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
             .map_err(|_| Error("storage_open_failed"))?;
         let mut stmt = db
             .prepare(&format!(
                 "SELECT record_json FROM transfers
             WHERE (?1 IS NULL OR mint=?1) {}
-            ORDER BY slot, signature, outer_index, inner_index LIMIT ?2",
+            ORDER BY slot {order}, signature {order}, outer_index {order}, inner_index {order} LIMIT ?2",
                 repair_filter(&db, "?3")?
             ))
             .map_err(|_| Error("storage_read_failed"))?;

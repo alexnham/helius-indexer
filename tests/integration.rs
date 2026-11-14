@@ -861,3 +861,139 @@ fn withheld_withdrawals_are_not_ordinary_edges_or_evidence_of_transfer_fees() {
         "unsupported_transfer_fee_instruction"
     );
 }
+
+#[test]
+fn recent_query_limits_after_ordering_and_preserves_exact_values() {
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("recent.sqlite");
+    let cases: Vec<Value> =
+        serde_json::from_slice(include_bytes!("fixtures/mainnet-coverage.json")).unwrap();
+    let mut store = Store::open(&path).unwrap();
+    for case in cases.iter().take(8) {
+        let raw = serde_json::to_vec(&case["capture"]).unwrap();
+        let capture = decoder::parse_capture(&raw).unwrap();
+        let decoded = decoder::decode(&capture);
+        store.persist(&capture, &raw, &decoded).unwrap();
+    }
+    let mut ascending = Store::query(&path, None, 1000).unwrap();
+    assert!(ascending.len() > 3);
+    ascending.reverse();
+    let recent = Store::query_recent(&path, None, 3).unwrap();
+    assert_eq!(
+        serde_json::to_value(&recent).unwrap(),
+        serde_json::to_value(&ascending[..3]).unwrap()
+    );
+    let mint = recent[0].mint.clone();
+    assert!(
+        Store::query_recent(&path, Some(&mint), 3)
+            .unwrap()
+            .iter()
+            .all(|row| row.mint == mint)
+    );
+    assert!(Store::query_recent(&path, None, 1001).is_err());
+}
+
+#[test]
+fn monitor_rejects_invalid_scope_before_network_access() {
+    let dir = TempDir::new().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_helius-indexer"))
+        .args([
+            "monitor",
+            dir.path().join("invalid.sqlite").to_str().unwrap(),
+            "invalid-mint",
+            "10",
+            "1",
+            "4",
+            "60",
+        ])
+        .env("INDEXER_LIVE_OPT_IN", "0")
+        .env_remove("HELIUS_API_KEY")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("invalid_mint")
+    );
+    assert!(!dir.path().join("invalid.sqlite").exists());
+}
+
+#[test]
+fn prune_keeps_newest_transfers_and_marks_older_slots_unknown() {
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("prune.sqlite");
+    let cases: Vec<Value> =
+        serde_json::from_slice(include_bytes!("fixtures/mainnet-coverage.json")).unwrap();
+    let mut store = Store::open(&path).unwrap();
+    for case in cases.iter().take(8) {
+        let raw = serde_json::to_vec(&case["capture"]).unwrap();
+        let capture = decoder::parse_capture(&raw).unwrap();
+        let decoded = decoder::decode(&capture);
+        store.persist(&capture, &raw, &decoded).unwrap();
+    }
+    drop(store);
+    let newest = Store::query_recent(&path, None, 3).unwrap();
+    let before = Store::query(&path, None, 1000).unwrap().len();
+    assert!(before > 3);
+    let boundary = newest.iter().map(|row| row.slot).min().unwrap();
+    let history = helius_indexer::backfill::History::open(&path).unwrap();
+    let db = rusqlite::Connection::open(&path).unwrap();
+    db.execute("INSERT INTO historical_slots(mint,decoder,slot,status,first_pending) VALUES(?1,?2,?3,'complete',1)",
+        rusqlite::params![newest[0].mint,decoder::DECODER_VERSION,boundary as i64]).unwrap();
+    db.execute(
+        "INSERT INTO historical_source_slots VALUES(?1,?2,?3,'finalized-mainnet-rpc','complete')",
+        rusqlite::params![newest[0].mint, decoder::DECODER_VERSION, boundary as i64],
+    )
+    .unwrap();
+    assert!(
+        history
+            .coverage(&newest[0].mint, boundary, boundary)
+            .unwrap()
+            .complete
+    );
+    db.execute_batch("CREATE TRIGGER fail_prune BEFORE DELETE ON historical_slots BEGIN SELECT RAISE(ABORT,'injected'); END;").unwrap();
+    assert!(Store::prune(&path, 3).is_err());
+    assert_eq!(Store::query(&path, None, 1000).unwrap().len(), before);
+    assert!(
+        history
+            .coverage(&newest[0].mint, boundary, boundary)
+            .unwrap()
+            .complete
+    );
+    db.execute_batch("DROP TRIGGER fail_prune").unwrap();
+    let report = Store::prune(&path, 3).unwrap();
+    assert!(
+        !history
+            .coverage(&newest[0].mint, boundary, boundary)
+            .unwrap()
+            .complete,
+        "a partially retained slot must lose its completion evidence"
+    );
+    let proofs: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM historical_source_slots WHERE slot=?1",
+            [boundary as i64],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(proofs, 0);
+    assert_eq!(report["removed_transfers"], before - 3);
+    assert_eq!(
+        serde_json::to_value(Store::query_recent(&path, None, 1000).unwrap()).unwrap(),
+        serde_json::to_value(&newest).unwrap()
+    );
+    let cutoff = report["oldest_retained_slot"].as_i64().unwrap();
+    let db = rusqlite::Connection::open(&path).unwrap();
+    let older: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM captures WHERE json_extract(result_json,'$.slot') < ?1",
+            [cutoff],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(older, 0);
+    // Idempotent once within the limit.
+    assert_eq!(Store::prune(&path, 3).unwrap()["removed_transfers"], 0);
+    assert!(Store::prune(&path, 0).is_err());
+}
