@@ -19,11 +19,18 @@ use std::collections::{BTreeMap, HashSet};
 /// Transfers are range-partitioned by slot; one partition spans one epoch of slots.
 const PARTITION_SLOTS: i64 = 432_000;
 
-/// Storage write outcomes for one Store, for stage metrics. A write is one `persist`
-/// transaction; failures are storage errors only, never decode or reconcile outcomes.
+/// Storage write outcomes for one Store, for stage metrics. Latency is observed per batch
+/// (one PostgreSQL transaction); failures are storage errors only, never decode outcomes.
 #[derive(Clone, Copy, Debug, Default, serde::Serialize)]
 pub struct WriteStats {
+    /// Batches committed or attempted; latency buckets observe one batch each.
+    pub batches: u64,
+    /// Batches retried item by item after the whole batch failed.
+    pub fallbacks: u64,
+    /// Items written (transactions), across all batches.
     pub writes: u64,
+    /// Raw input bytes across all batches.
+    pub batch_bytes: u64,
     pub failed_writes: u64,
     pub transfers_written: u64,
     pub seconds: f64,
@@ -47,15 +54,20 @@ impl WriteStats {
         out.push_str(&format!(
             "indexer_stage_duration_seconds_bucket{{operation=\"transfer_write\",mode=\"{mode}\",le=\"+Inf\"}} {writes}\nindexer_stage_duration_seconds_sum{{operation=\"transfer_write\",mode=\"{mode}\"}} {}\nindexer_stage_duration_seconds_count{{operation=\"transfer_write\",mode=\"{mode}\"}} {writes}\n",
             self.seconds,
-            writes = self.writes,
+            writes = self.batches,
         ));
         out
     }
 
     pub fn counter_lines(&self, mode: &str) -> String {
         format!(
-            "indexer_storage_write_failures_total{{mode=\"{mode}\"}} {}\nindexer_storage_transfers_written_total{{mode=\"{mode}\"}} {}\n",
-            self.failed_writes, self.transfers_written
+            "indexer_storage_write_failures_total{{mode=\"{mode}\"}} {}\nindexer_storage_transfers_written_total{{mode=\"{mode}\"}} {}\nindexer_storage_batches_total{{mode=\"{mode}\"}} {}\nindexer_storage_batch_items_total{{mode=\"{mode}\"}} {}\nindexer_storage_batch_bytes_total{{mode=\"{mode}\"}} {}\nindexer_storage_batch_fallbacks_total{{mode=\"{mode}\"}} {}\n",
+            self.failed_writes,
+            self.transfers_written,
+            self.batches,
+            self.writes,
+            self.batch_bytes,
+            self.fallbacks
         )
     }
 }
@@ -121,237 +133,229 @@ impl Store {
     }
 
     /// Stores a complete transaction's output atomically. Replay of identical input is a no-op.
-    ///
-    /// READ COMMITTED: a first observation inserts optimistically without reading; a repeat
-    /// waits on the existing capture's row lock, so concurrent duplicates reconcile in turn.
     pub fn persist(
         &mut self,
         capture: &Capture,
         raw: &[u8],
         decoded: &Result<Vec<Transfer>>,
     ) -> Result<usize> {
+        let item = BatchItem {
+            capture,
+            raw,
+            decoded,
+        };
+        self.persist_batch(std::slice::from_ref(&item)).remove(0)
+    }
+
+    /// Stores many transactions in one PostgreSQL transaction, returning one result per item
+    /// in input order. New transactions use set-based statements, so a batch costs a few
+    /// round trips rather than several per item; repeats reconcile one by one in savepoints.
+    ///
+    /// READ COMMITTED: first observations insert without reading; a repeat waits on the
+    /// stored capture's row lock. Rows are written in signature and transfer-ID order, and
+    /// deadlocks retry the whole batch. A batch that still fails is retried item by item,
+    /// so one bad input cannot block the rest.
+    pub fn persist_batch(&mut self, items: &[BatchItem<'_>]) -> Vec<Result<usize>> {
+        self.persist_batch_acknowledged(items, None)
+    }
+
+    pub(crate) fn persist_batch_acknowledged(
+        &mut self,
+        items: &[BatchItem<'_>],
+        acknowledge: Option<&Acknowledge<'_>>,
+    ) -> Vec<Result<usize>> {
         let started = std::time::Instant::now();
-        let result = self.persist_once(capture, raw, decoded);
+        let mut fallback = false;
+        let results = match self.write_batch(items, acknowledge) {
+            Ok(results) => results,
+            Err(_) if items.len() > 1 => {
+                fallback = true;
+                let results = items
+                    .iter()
+                    .enumerate()
+                    .map(|(index, item)| {
+                        let single = acknowledge.map(|a| Acknowledge {
+                            ids: &a.ids[index..=index],
+                            failed: &[],
+                        });
+                        self.write_batch(std::slice::from_ref(item), single.as_ref())
+                            .and_then(|mut r| r.remove(0))
+                    })
+                    .collect();
+                if let Some(a) = acknowledge.filter(|a| !a.failed.is_empty()) {
+                    // Inputs that failed before storage have no output; record them on their own.
+                    let empty = Acknowledge {
+                        ids: &[],
+                        failed: a.failed,
+                    };
+                    let _ = self.write_batch(&[], Some(&empty));
+                }
+                results
+            }
+            Err(error) => vec![Err(error); items.len()],
+        };
         let seconds = started.elapsed().as_secs_f64();
         let stats = &mut self.stats;
-        stats.writes += 1;
+        stats.batches += 1;
+        stats.fallbacks += u64::from(fallback);
+        stats.writes += items.len() as u64;
+        stats.batch_bytes += items.iter().map(|i| i.raw.len() as u64).sum::<u64>();
         stats.seconds += seconds;
         for (count, bound) in stats.buckets.iter_mut().zip(WRITE_BUCKETS) {
             *count += u64::from(seconds <= bound);
         }
-        match &result {
-            Ok(inserted) => stats.transfers_written += *inserted as u64,
-            Err(error) if error.0.starts_with("storage_") => stats.failed_writes += 1,
-            Err(_) => {}
+        for result in &results {
+            match result {
+                Ok(inserted) => stats.transfers_written += *inserted as u64,
+                Err(error) if error.0.starts_with("storage_") => stats.failed_writes += 1,
+                Err(_) => {}
+            }
         }
-        result
+        results
     }
 
     pub fn stats(&self) -> WriteStats {
         self.stats
     }
 
-    fn persist_once(
+    fn write_batch(
         &mut self,
-        capture: &Capture,
-        raw: &[u8],
-        decoded: &Result<Vec<Transfer>>,
-    ) -> Result<usize> {
-        let signature = capture
-            .result
-            .transaction
-            .signatures
-            .first()
-            .ok_or(Error("missing_signature"))?;
-        let value: serde_json::Value =
-            serde_json::from_slice(raw).map_err(|_| Error("invalid_json"))?;
-        let result_json =
-            serde_json::to_string(&value["result"]).map_err(|_| Error("invalid_json"))?;
-        let digest = Sha256::digest(result_json.as_bytes()).to_vec();
-        let slot = i64::try_from(capture.result.slot).map_err(|_| Error("unsupported_slot"))?;
+        items: &[BatchItem<'_>],
+        acknowledge: Option<&Acknowledge<'_>>,
+    ) -> Result<Vec<Result<usize>>> {
+        let mut early: Vec<Option<Result<usize>>> = vec![None; items.len()];
+        let mut prepared = Vec::with_capacity(items.len());
+        for (index, item) in items.iter().enumerate() {
+            match prepare(index, item) {
+                Ok(p) => prepared.push(p),
+                Err(error) => early[index] = Some(Err(error)),
+            }
+        }
         // Every transfer of a capture carries the capture's slot, including repaired ones.
-        self.ensure_partitions([capture.result.slot])?;
-        let status = match decoded {
-            Ok(_) if !capture.result.meta.err.is_null() => "failed_transaction",
-            Ok(_) => "decoded",
-            Err(e) => e.0,
-        };
-        let mut transaction = self.db.transaction().map_err(write_failed)?;
-        let first = transaction
-            .execute(
-                "INSERT INTO captures(signature,slot,result_json,capture_json,status,decoder_version) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(signature) DO NOTHING",
-                &[signature, &slot, &result_json, &raw, &status, &DECODER_VERSION],
-            )
-            .map_err(write_failed)?
-            == 1;
-        let observe = "INSERT INTO capture_inputs(signature,source,result_digest,slot,result_json,capture_json,status) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(signature,source,result_digest) DO NOTHING";
-        let receipt = "UPDATE capture_inputs SET status=$1 WHERE signature=$2 AND source=$3 AND result_digest=$4";
-        if first {
-            transaction
-                .execute(
-                    observe,
-                    &[
-                        signature,
-                        &capture.source,
-                        &digest,
-                        &slot,
-                        &result_json,
-                        &raw,
-                        &status,
-                    ],
-                )
-                .map_err(write_failed)?;
-            transaction
-                .execute(receipt, &[&status, signature, &capture.source, &digest])
-                .map_err(write_failed)?;
-            let inserted = insert_transfers(&mut transaction, signature, decoded.as_ref().ok())?;
-            transaction
-                .commit()
-                .map_err(|_| Error("storage_commit_failed"))?;
-            return Ok(inserted);
+        self.ensure_partitions(prepared.iter().map(|p| p.slot as u64))?;
+        prepared.sort_by(|a, b| a.signature.cmp(b.signature).then(a.index.cmp(&b.index)));
+        let mut attempt = 0;
+        loop {
+            match self.write_prepared(items, &prepared, acknowledge, &early) {
+                Ok(results) => return Ok(results),
+                Err(error) if attempt < 2 && retryable(&error) => attempt += 1,
+                Err(_) => return Err(Error("storage_write_failed")),
+            }
         }
-        transaction
-            .execute(
-                observe,
-                &[
-                    signature,
-                    &capture.source,
-                    &digest,
-                    &slot,
-                    &result_json,
-                    &raw,
-                    &"received",
-                ],
-            )
-            .map_err(write_failed)?;
-        let row = transaction
-            .query_one(
-                "SELECT result_json,decoder_version,status FROM captures WHERE signature=$1 FOR UPDATE",
-                &[signature],
-            )
-            .map_err(read_failed)?;
-        let (prior, version, prior_status): (String, String, String) =
-            (row.get(0), row.get(1), row.get(2));
-        let prior_value: serde_json::Value =
-            serde_json::from_str(&prior).map_err(|_| Error("stored_record_invalid"))?;
-        let mut repaired = None;
-        let mut outcome = if version != DECODER_VERSION {
-            Err(Error("decoder_revision_conflict"))
+    }
+
+    fn write_prepared(
+        &mut self,
+        items: &[BatchItem<'_>],
+        prepared: &[Prepared<'_>],
+        acknowledge: Option<&Acknowledge<'_>>,
+        early: &[Option<Result<usize>>],
+    ) -> std::result::Result<Vec<Result<usize>>, postgres::Error> {
+        let mut results = early.to_vec();
+        let mut tx = self.db.transaction()?;
+        let mut seen = HashSet::new();
+        let firsts: Vec<&Prepared<'_>> = prepared
+            .iter()
+            .filter(|p| seen.insert(p.signature))
+            .collect();
+        let column =
+            |f: &dyn Fn(&Prepared<'_>) -> String| firsts.iter().map(|p| f(p)).collect::<Vec<_>>();
+        let signatures = column(&|p| p.signature.to_string());
+        let slots: Vec<i64> = firsts.iter().map(|p| p.slot).collect();
+        let references = column(&|p| p.result_json.clone());
+        let raws: Vec<&[u8]> = firsts.iter().map(|p| p.item.raw).collect();
+        let statuses = column(&|p| p.status.to_string());
+        let inserted: HashSet<String> = if firsts.is_empty() {
+            HashSet::new()
         } else {
-            reconcile::compatible_results(&prior_value, &value["result"])
+            tx.query(
+                "INSERT INTO captures(signature,slot,result_json,capture_json,status,decoder_version)
+                 SELECT s,sl,r,c,st,$6 FROM unnest($1::text[],$2::bigint[],$3::text[],$4::bytea[],$5::text[]) AS u(s,sl,r,c,st)
+                 ON CONFLICT(signature) DO NOTHING RETURNING signature",
+                &[&signatures, &slots, &references, &raws, &statuses, &DECODER_VERSION],
+            )?
+            .iter()
+            .map(|r| r.get(0))
+            .collect()
         };
-        let mut reference = None;
-        if outcome.is_ok() {
-            outcome = (|| {
-                let mut combined = reconcile::reference(&prior_value, &value["result"])?;
-                if decoded.is_err() && !prior_value["meta"]["logMessages"].is_null() {
-                    combined["meta"]["logMessages"] = prior_value["meta"]["logMessages"].clone();
-                }
-                let mut envelope = value.clone();
-                envelope["result"] = combined.clone();
-                let raw =
-                    serde_json::to_vec(&envelope).map_err(|_| Error("serialization_failed"))?;
-                let combined_capture = crate::decoder::parse_capture(&raw)?;
-                if decoded.is_ok() {
-                    repaired = Some(crate::decoder::decode(&combined_capture)?);
-                }
-                reference = Some(
-                    serde_json::to_string(&combined).map_err(|_| Error("serialization_failed"))?,
-                );
-                Ok(())
-            })();
-        }
-        let mut updates = Vec::new();
-        if outcome.is_ok()
-            && prior_status == "decoded"
-            && let Some(incoming) = repaired.as_ref()
-        {
-            let old = transaction
-                .query(
-                    "SELECT transfer_id,record_json FROM transfers WHERE signature=$1",
-                    &[signature],
-                )
-                .map_err(read_failed)?
+        // In-batch duplicates of a new signature take the repeat path after its first copy.
+        let new: Vec<&Prepared<'_>> = firsts
+            .iter()
+            .copied()
+            .filter(|p| inserted.contains(p.signature))
+            .collect();
+        let repeats = prepared
+            .iter()
+            .filter(|p| !new.iter().any(|n| n.index == p.index));
+        if !new.is_empty() {
+            let column =
+                |f: &dyn Fn(&Prepared<'_>) -> String| new.iter().map(|p| f(p)).collect::<Vec<_>>();
+            let sources = column(&|p| p.item.capture.source.clone());
+            let digests: Vec<&[u8]> = new.iter().map(|p| p.digest.as_slice()).collect();
+            tx.execute(
+                "INSERT INTO capture_inputs(signature,source,result_digest,slot,result_json,capture_json,status)
+                 SELECT * FROM unnest($1::text[],$2::text[],$3::bytea[],$4::bigint[],$5::text[],$6::bytea[],$7::text[])
+                 ON CONFLICT(signature,source,result_digest) DO UPDATE SET status=excluded.status",
+                &[
+                    &column(&|p| p.signature.to_string()),
+                    &sources,
+                    &digests,
+                    &new.iter().map(|p| p.slot).collect::<Vec<_>>(),
+                    &column(&|p| p.result_json.clone()),
+                    &new.iter().map(|p| p.item.raw).collect::<Vec<_>>(),
+                    &column(&|p| p.status.to_string()),
+                ],
+            )?;
+            let mut rows: Vec<(&str, &Transfer)> = new
                 .iter()
-                .map(|r| (r.get::<_, String>(0), r.get::<_, String>(1)))
-                .collect::<BTreeMap<_, _>>();
-            if old.len() != incoming.len() {
-                outcome = Err(Error("capture_conflict"));
+                .filter_map(|p| p.item.decoded.as_ref().ok().map(|t| (p.signature, t)))
+                .flat_map(|(signature, transfers)| transfers.iter().map(move |t| (signature, t)))
+                .collect();
+            rows.sort_by(|a, b| (a.1.slot, &a.1.transfer_id).cmp(&(b.1.slot, &b.1.transfer_id)));
+            let counts = insert_transfer_rows(&mut tx, &rows)?;
+            for p in &new {
+                results[p.index] = Some(Ok(counts.get(p.signature).copied().unwrap_or(0)));
             }
-            for new in incoming {
-                let Some(old) = old.get(&new.transfer_id) else {
-                    outcome = Err(Error("capture_conflict"));
-                    break;
-                };
-                let old: Transfer =
-                    serde_json::from_str(old).map_err(|_| Error("stored_record_invalid"))?;
-                match reconcile::transfer(&old, new) {
-                    Ok(merged) => updates.push(merged),
-                    Err(e) => {
-                        outcome = Err(e);
-                        break;
-                    }
+        }
+        for p in repeats {
+            let mut item = tx.savepoint("item")?;
+            match reconcile_repeat(&mut item, p) {
+                Ok(kept) => {
+                    item.commit()?;
+                    results[p.index] = Some(kept);
+                }
+                Err(error) => {
+                    item.rollback()?;
+                    results[p.index] = Some(Err(error));
                 }
             }
         }
-        let receipt_status = outcome.as_ref().map_or_else(|e| e.0, |_| status);
-        transaction
-            .execute(
-                receipt,
-                &[&receipt_status, signature, &capture.source, &digest],
-            )
-            .map_err(write_failed)?;
-        if let Err(error) = outcome {
-            // Quarantine is durable, but existing logical query results remain unchanged.
-            transaction
-                .commit()
-                .map_err(|_| Error("storage_commit_failed"))?;
-            return Err(error);
-        }
-        transaction
-            .execute(
-                "UPDATE captures SET result_json=$1 WHERE signature=$2",
-                &[&reference, signature],
-            )
-            .map_err(write_failed)?;
-        if prior_status == "decoded" || prior_status == "failed_transaction" {
-            for merged in updates {
-                let text =
-                    serde_json::to_string(&merged).map_err(|_| Error("serialization_failed"))?;
-                transaction
-                    .execute(
-                        "UPDATE transfers SET record_json=$1 WHERE signature=$2 AND transfer_id=$3",
-                        &[&text, signature, &merged.transfer_id],
-                    )
-                    .map_err(write_failed)?;
+        let results: Vec<Result<usize>> = results
+            .into_iter()
+            .map(|r| r.unwrap_or(Err(Error("storage_write_failed"))))
+            .collect();
+        if let Some(acknowledge) = acknowledge {
+            // Progress commits with the output it describes, never before or without it.
+            let mut ids: Vec<i64> = acknowledge.ids.to_vec();
+            let mut statuses: Vec<&str> = results
+                .iter()
+                .zip(items)
+                .map(|(result, item)| match (result, item.decoded) {
+                    (Ok(_), Ok(_)) => "decoded",
+                    (Ok(_), Err(error)) | (Err(error), _) => error.0,
+                })
+                .collect();
+            for (id, status) in acknowledge.failed {
+                ids.push(*id);
+                statuses.push(status);
             }
-            transaction
-                .commit()
-                .map_err(|_| Error("storage_commit_failed"))?;
-            return Ok(0);
+            tx.execute(
+                "UPDATE live_raw SET status=u.status FROM unnest($1::bigint[],$2::text[]) AS u(id,status) WHERE live_raw.id=u.id",
+                &[&ids, &statuses],
+            )?;
         }
-        // A same-revision unresolved observation may become decodable after metadata arrives.
-        if decoded.is_err() {
-            transaction
-                .commit()
-                .map_err(|_| Error("storage_commit_failed"))?;
-            return Ok(0);
-        }
-        transaction
-            .execute(
-                "UPDATE captures SET capture_json=$1,status=$2 WHERE signature=$3",
-                &[&raw, &status, signature],
-            )
-            .map_err(write_failed)?;
-        let inserted = insert_transfers(
-            &mut transaction,
-            signature,
-            repaired.as_ref().or_else(|| decoded.as_ref().ok()),
-        )?;
-        transaction
-            .commit()
-            .map_err(|_| Error("storage_commit_failed"))?;
-        Ok(inserted)
+        tx.commit()?;
+        Ok(results)
     }
 
     pub fn summary(db: &Database, mint: &str) -> Result<serde_json::Value> {
@@ -552,6 +556,257 @@ impl Store {
         observe_block_identity_scan(&mut tx, slot, block, transactions)?;
         tx.commit().map_err(|_| Error("storage_commit_failed"))
     }
+}
+
+/// One input to `persist_batch`.
+pub struct BatchItem<'a> {
+    pub capture: &'a Capture,
+    pub raw: &'a [u8],
+    pub decoded: &'a Result<Vec<Transfer>>,
+}
+
+/// Live raw-input progress written in the same transaction as the batch output: `ids`
+/// align with the batch items, and `failed` holds inputs that never reached storage.
+pub(crate) struct Acknowledge<'a> {
+    pub ids: &'a [i64],
+    pub failed: &'a [(i64, &'static str)],
+}
+
+struct Prepared<'a> {
+    index: usize,
+    item: &'a BatchItem<'a>,
+    signature: &'a str,
+    value: serde_json::Value,
+    result_json: String,
+    digest: Vec<u8>,
+    slot: i64,
+    status: &'static str,
+}
+
+fn prepare<'a>(index: usize, item: &'a BatchItem<'a>) -> Result<Prepared<'a>> {
+    let signature = item
+        .capture
+        .result
+        .transaction
+        .signatures
+        .first()
+        .ok_or(Error("missing_signature"))?;
+    let value: serde_json::Value =
+        serde_json::from_slice(item.raw).map_err(|_| Error("invalid_json"))?;
+    let result_json = serde_json::to_string(&value["result"]).map_err(|_| Error("invalid_json"))?;
+    let digest = Sha256::digest(result_json.as_bytes()).to_vec();
+    let slot = i64::try_from(item.capture.result.slot).map_err(|_| Error("unsupported_slot"))?;
+    let status = match item.decoded {
+        Ok(_) if !item.capture.result.meta.err.is_null() => "failed_transaction",
+        Ok(_) => "decoded",
+        Err(e) => e.0,
+    };
+    Ok(Prepared {
+        index,
+        item,
+        signature,
+        value,
+        result_json,
+        digest,
+        slot,
+        status,
+    })
+}
+
+fn retryable(error: &postgres::Error) -> bool {
+    use postgres::error::SqlState;
+    error.code().is_some_and(|c| {
+        *c == SqlState::T_R_DEADLOCK_DETECTED || *c == SqlState::T_R_SERIALIZATION_FAILURE
+    })
+}
+
+/// Inserts many transactions' transfers in one statement and counts new rows per signature.
+fn insert_transfer_rows(
+    tx: &mut Transaction<'_>,
+    rows: &[(&str, &Transfer)],
+) -> std::result::Result<std::collections::HashMap<String, usize>, postgres::Error> {
+    let mut counts = std::collections::HashMap::new();
+    if rows.is_empty() {
+        return Ok(counts);
+    }
+    let mut columns = (
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    );
+    for (signature, transfer) in rows {
+        columns.0.push(transfer.transfer_id.as_str());
+        columns.1.push(*signature);
+        columns.2.push(transfer.slot as i64);
+        columns.3.push(transfer.instruction_index as i32);
+        columns
+            .4
+            .push(transfer.inner_instruction_index.map_or(-1, |n| n as i32));
+        columns.5.push(transfer.mint.as_str());
+        columns
+            .6
+            .push(serde_json::to_string(transfer).unwrap_or_default());
+    }
+    for row in tx.query(
+        "INSERT INTO transfers(transfer_id,signature,slot,outer_index,inner_index,mint,record_json)
+         SELECT * FROM unnest($1::text[],$2::text[],$3::bigint[],$4::int[],$5::int[],$6::text[],$7::text[])
+         ON CONFLICT(slot,transfer_id) DO NOTHING RETURNING signature",
+        &[&columns.0, &columns.1, &columns.2, &columns.3, &columns.4, &columns.5, &columns.6],
+    )? {
+        *counts.entry(row.get::<_, String>(0)).or_insert(0) += 1;
+    }
+    Ok(counts)
+}
+
+/// Reconciles an observation of an already stored transaction inside the caller's
+/// savepoint. `Err` rolls the item back; `Ok(result)` keeps its writes, including a
+/// durable quarantine receipt when `result` is an error.
+fn reconcile_repeat(tx: &mut Transaction<'_>, prepared: &Prepared<'_>) -> Result<Result<usize>> {
+    let Prepared {
+        item: BatchItem {
+            capture,
+            raw,
+            decoded,
+        },
+        signature,
+        value,
+        result_json,
+        digest,
+        slot,
+        status,
+        ..
+    } = prepared;
+    let (capture, raw, decoded, signature, slot, status) =
+        (*capture, *raw, *decoded, *signature, *slot, *status);
+    let observe = "INSERT INTO capture_inputs(signature,source,result_digest,slot,result_json,capture_json,status) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(signature,source,result_digest) DO NOTHING";
+    let receipt =
+        "UPDATE capture_inputs SET status=$1 WHERE signature=$2 AND source=$3 AND result_digest=$4";
+    tx.execute(
+        observe,
+        &[
+            &signature,
+            &capture.source,
+            &digest,
+            &slot,
+            &result_json,
+            &raw,
+            &"received",
+        ],
+    )
+    .map_err(write_failed)?;
+    let row = tx
+        .query_one(
+            "SELECT result_json,decoder_version,status FROM captures WHERE signature=$1 FOR UPDATE",
+            &[&signature],
+        )
+        .map_err(read_failed)?;
+    let (prior, version, prior_status): (String, String, String) =
+        (row.get(0), row.get(1), row.get(2));
+    let prior_value: serde_json::Value =
+        serde_json::from_str(&prior).map_err(|_| Error("stored_record_invalid"))?;
+    let mut repaired = None;
+    let mut outcome = if version != DECODER_VERSION {
+        Err(Error("decoder_revision_conflict"))
+    } else {
+        reconcile::compatible_results(&prior_value, &value["result"])
+    };
+    let mut reference = None;
+    if outcome.is_ok() {
+        outcome = (|| {
+            let mut combined = reconcile::reference(&prior_value, &value["result"])?;
+            if decoded.is_err() && !prior_value["meta"]["logMessages"].is_null() {
+                combined["meta"]["logMessages"] = prior_value["meta"]["logMessages"].clone();
+            }
+            let mut envelope = value.clone();
+            envelope["result"] = combined.clone();
+            let raw = serde_json::to_vec(&envelope).map_err(|_| Error("serialization_failed"))?;
+            let combined_capture = crate::decoder::parse_capture(&raw)?;
+            if decoded.is_ok() {
+                repaired = Some(crate::decoder::decode(&combined_capture)?);
+            }
+            reference =
+                Some(serde_json::to_string(&combined).map_err(|_| Error("serialization_failed"))?);
+            Ok(())
+        })();
+    }
+    let mut updates = Vec::new();
+    if outcome.is_ok()
+        && prior_status == "decoded"
+        && let Some(incoming) = repaired.as_ref()
+    {
+        let old = tx
+            .query(
+                "SELECT transfer_id,record_json FROM transfers WHERE signature=$1",
+                &[&signature],
+            )
+            .map_err(read_failed)?
+            .iter()
+            .map(|r| (r.get::<_, String>(0), r.get::<_, String>(1)))
+            .collect::<BTreeMap<_, _>>();
+        if old.len() != incoming.len() {
+            outcome = Err(Error("capture_conflict"));
+        }
+        for new in incoming {
+            let Some(old) = old.get(&new.transfer_id) else {
+                outcome = Err(Error("capture_conflict"));
+                break;
+            };
+            let old: Transfer =
+                serde_json::from_str(old).map_err(|_| Error("stored_record_invalid"))?;
+            match reconcile::transfer(&old, new) {
+                Ok(merged) => updates.push(merged),
+                Err(e) => {
+                    outcome = Err(e);
+                    break;
+                }
+            }
+        }
+    }
+    let receipt_status = outcome.as_ref().map_or_else(|e| e.0, |_| status);
+    tx.execute(
+        receipt,
+        &[&receipt_status, &signature, &capture.source, &digest],
+    )
+    .map_err(write_failed)?;
+    if let Err(error) = outcome {
+        // Quarantine is durable, but existing logical query results remain unchanged.
+        return Ok(Err(error));
+    }
+    tx.execute(
+        "UPDATE captures SET result_json=$1 WHERE signature=$2",
+        &[&reference, &signature],
+    )
+    .map_err(write_failed)?;
+    if prior_status == "decoded" || prior_status == "failed_transaction" {
+        for merged in updates {
+            let text = serde_json::to_string(&merged).map_err(|_| Error("serialization_failed"))?;
+            tx.execute(
+                "UPDATE transfers SET record_json=$1 WHERE signature=$2 AND transfer_id=$3",
+                &[&text, &signature, &merged.transfer_id],
+            )
+            .map_err(write_failed)?;
+        }
+        return Ok(Ok(0));
+    }
+    // A same-revision unresolved observation may become decodable after metadata arrives.
+    if decoded.is_err() {
+        return Ok(Ok(0));
+    }
+    tx.execute(
+        "UPDATE captures SET capture_json=$1,status=$2 WHERE signature=$3",
+        &[&raw, &status, &signature],
+    )
+    .map_err(write_failed)?;
+    let inserted = insert_transfers(
+        tx,
+        signature,
+        repaired.as_ref().or_else(|| decoded.as_ref().ok()),
+    )?;
+    Ok(Ok(inserted))
 }
 
 /// One multi-row statement per transaction; existing identities are left unchanged.
