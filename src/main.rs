@@ -15,7 +15,7 @@ use std::{
     time::Instant,
 };
 
-const USAGE: &str = "usage: DATABASE_URL=postgres://... helius-indexer COMMAND, where SESSION is a schema name (^[a-z][a-z0-9_]*$), not a file path: migrate SESSION | comparison-input SESSION MINT [--sample] | monitor SESSION MINT LIVE_FROM START END SECONDS | query-recent SESSION [MINT] | ingest SESSION CAPTURE [--metrics FILE] | query SESSION [MINT] | backfill SESSION MINT START END [--metrics FILE] | coverage SESSION MINT START END | live SESSION FROM_SLOT SECONDS [MINT] | prune SESSION KEEP | live-status SESSION | live-retry SESSION | summary SESSION MINT | overlap SESSION START END SECONDS | repair SESSION START END | repair-status SESSION START END | repair-history-archive SESSION MINT START END | repair-history SESSION MINT START END | [feature archive] archive/archive-replay/archive-overlap SESSION CACHE MINT START END | bridge-plan SESSION CACHE MINT START | bridge SESSION CACHE MINT START | bridge-status SESSION MINT START | bridge-live SESSION CACHE START SECONDS | archive-overlap-replay SESSION MINT START END | archive-tip CACHE | archive-live SESSION CACHE START END SECONDS";
+const USAGE: &str = "usage: DATABASE_URL=postgres://... helius-indexer COMMAND, where SESSION is a schema name (^[a-z][a-z0-9_]*$), not a file path: health SESSION | migrate SESSION | comparison-input SESSION MINT [--sample] | monitor SESSION MINT LIVE_FROM START END SECONDS | query-recent SESSION [MINT] | ingest SESSION CAPTURE [--metrics FILE] | query SESSION [MINT] | backfill SESSION MINT START END [--metrics FILE] | coverage SESSION MINT START END | live SESSION FROM_SLOT SECONDS [MINT] | prune SESSION KEEP | live-status SESSION | live-retry SESSION | summary SESSION MINT | overlap SESSION START END SECONDS | repair SESSION START END | repair-status SESSION START END | repair-history-archive SESSION MINT START END | repair-history SESSION MINT START END | [feature archive] archive/archive-replay/archive-overlap SESSION CACHE MINT START END | bridge-plan SESSION CACHE MINT START | bridge SESSION CACHE MINT START | bridge-status SESSION MINT START | bridge-live SESSION CACHE START SECONDS | archive-overlap-replay SESSION MINT START END | archive-tip CACHE | archive-live SESSION CACHE START END SECONDS";
 
 fn ingest(db: &str, input: &str, telemetry: &mut Telemetry) -> Result<serde_json::Value> {
     let started = Instant::now();
@@ -70,6 +70,7 @@ fn ingest(db: &str, input: &str, telemetry: &mut Telemetry) -> Result<serde_json
 
 fn run(args: &[String], telemetry: &mut Telemetry) -> Result<serde_json::Value> {
     match args {
+        [command, session] if command == "health" => Database::from_env(session)?.health(),
         #[cfg(feature = "archive")]
         [command, db, mint, start, end] if command == "archive-overlap-replay" => {
             helius_indexer::archive::replay_overlap(

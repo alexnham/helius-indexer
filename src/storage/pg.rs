@@ -110,6 +110,32 @@ impl Database {
         Self::new(url, session)
     }
 
+    /// Readiness must not create a schema, run migrations or repair missing tables.
+    pub fn health(&self) -> Result<serde_json::Value> {
+        let mut client = self.connect_unmigrated()?;
+        let mut tx = client
+            .build_transaction()
+            .read_only(true)
+            .start()
+            .map_err(|_| Error("storage_not_ready"))?;
+        let version: i32 = tx
+            .query_one(
+                "SELECT COALESCE(MAX(version),0) FROM schema_migrations",
+                &[],
+            )
+            .map_err(|_| Error("storage_not_ready"))?
+            .get(0);
+        if version != MIGRATIONS.last().map_or(0, |m| m.0) {
+            return Err(Error("storage_not_ready"));
+        }
+        tx.query("SELECT transfer_id FROM transfers LIMIT 1", &[])
+            .map_err(|_| Error("storage_not_ready"))?;
+        tx.commit().map_err(|_| Error("storage_not_ready"))?;
+        Ok(
+            serde_json::json!({"status":"ready","backend":"postgresql","session":self.schema,"schema_version":version}),
+        )
+    }
+
     pub fn session(&self) -> &str {
         &self.schema
     }
@@ -222,6 +248,35 @@ mod tests {
         .iter()
         .map(|r| r.get(0))
         .collect()
+    }
+
+    #[test]
+    fn health_is_read_only_and_never_creates_or_repairs_a_session() {
+        let test = TestDatabase::new();
+        assert!(test.0.health().is_err());
+        let mut control = connect(&TestDatabase::url()).unwrap();
+        assert!(
+            !control
+                .query_one(
+                    "SELECT EXISTS(SELECT 1 FROM pg_namespace WHERE nspname=$1)",
+                    &[&test.0.schema]
+                )
+                .unwrap()
+                .get::<_, bool>(0)
+        );
+        test.0.connect().unwrap();
+        assert_eq!(test.0.health().unwrap()["backend"], "postgresql");
+        test.0
+            .test_client()
+            .batch_execute("DROP TABLE transfers CASCADE")
+            .unwrap();
+        assert!(test.0.health().is_err());
+        assert!(
+            test.sql()
+                .query_one("SELECT to_regclass('transfers') IS NULL", &[])
+                .unwrap()
+                .get::<_, bool>(0)
+        );
     }
 
     #[test]

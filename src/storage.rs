@@ -11,7 +11,7 @@ use crate::{
     reconcile,
 };
 pub use pg::Database;
-use postgres::{Client, GenericClient, Transaction};
+use postgres::{Client, GenericClient, Transaction, fallible_iterator::FallibleIterator};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
 
@@ -284,15 +284,15 @@ impl Store {
 
     pub fn summary(db: &Database, mint: &str) -> Result<serde_json::Value> {
         let mut client = db.connect()?;
-        let rows = client
-            .query(
+        let mut rows = client
+            .query_raw(
                 "SELECT record_json FROM transfers t WHERE mint=$1 AND NOT EXISTS(SELECT 1 FROM decoder_repairs r WHERE r.signature=t.signature AND r.status='unresolved')",
-                &[&mint],
+                [&mint],
             )
             .map_err(read_failed)?;
         let (mut count, mut volume, mut fees, mut unknown_fees) = (0u64, 0u128, 0u128, 0u64);
         let mut other_decoder_transfers = 0u64;
-        for row in rows {
+        while let Some(row) = rows.next().map_err(read_failed)? {
             let transfer: Transfer = serde_json::from_str(row.get::<_, &str>(0))
                 .map_err(|_| Error("stored_record_invalid"))?;
             if transfer.decoder_version != DECODER_VERSION {
@@ -597,6 +597,13 @@ fn observe_block_identity_inner(
     block: &serde_json::Value,
     transactions: &[serde_json::Value],
 ) -> Result<()> {
+    // Lock absent as well as existing parent/child anchors. Row locks alone cannot
+    // serialize two first observations of different, adjacent slots.
+    tx.execute(
+        "SELECT pg_advisory_xact_lock(hashtextextended(current_schema() || ':block_identity', 0))",
+        &[],
+    )
+    .map_err(write_failed)?;
     let mut ids = Vec::with_capacity(transactions.len());
     let mut seen = std::collections::HashSet::new();
     for transaction in transactions {
@@ -688,3 +695,6 @@ fn observe_block_identity_inner(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;
