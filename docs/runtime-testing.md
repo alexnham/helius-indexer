@@ -31,7 +31,7 @@ Existing copied CLI binaries are preserved on restart; use a fresh directory
 for this schema upgrade and back up PostgreSQL before migrating. Changing an
 existing job's mint/range/ID is rejected. To choose a different scope, use a new
 `INDEXER_SESSION` directory and a new `INDEXER_REPLAY_JOB` (or database session).
-After upgrade, older binaries refuse schema 3; rollback restores a pre-upgrade
+After upgrade, older binaries refuse schema 5; rollback restores a pre-upgrade
 backup into a separate schema with its matching binary. See [replay jobs](replay-jobs.md).
 
 ## Restart, budgets and retention

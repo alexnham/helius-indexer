@@ -112,3 +112,9 @@ Expected IDs, raw amounts, fees and positions come from compiled transfer operan
 not balance deltas or generated Rust output. Synthetic block headers used by
 adapter tests are not claimed as captured block anchors. Full-block retained-input
 recovery evidence and limitations are in `docs/rpc-evidence-recovery.md`.
+
+
+`replay-prototype-v2.sql` and `replay-prototype-v3.sql` are exact schema snapshots
+from commit `9febd85` before integrating main's Kafka migration numbers. They contain
+no chain payloads or secrets and exist only to test automatic, data-preserving
+upgrades of the earlier local replay prototypes to canonical schema version 5.

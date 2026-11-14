@@ -9,7 +9,7 @@ getBlock scans. Old Faithful routing remains issue #31.
 
 ## Durable boundaries
 
-Migration 0002 adds frozen jobs, attempts and compact input receipts. Job identity
+Migration 0004 adds frozen jobs, attempts and compact input receipts. Job identity
 fixes the mint, inclusive start/end and decoder revision. Recreating an existing
 job is idempotent only for that original scope/revision. Scope rejection does not
 move the range or consume budget.
@@ -41,12 +41,15 @@ an observation only: verified coverage and boundary remain unknown.
 
 ## Compatibility and recovery
 
-Migrations 0002 and 0003 are additive and preserve existing input/output tables.
-Version 3 upgrades existing prototype jobs without resetting scope, receipts or
-charged budgets. Raw rows referenced by replay receipts are classified as replay;
+Migrations 0004 and 0005 are additive and preserve existing input/output tables.
+Main uses versions 2/3 for Kafka; the unpublished replay prototypes used those
+numbers for different tables. Migration 4 supplies any missing Kafka tables and
+retains existing replay tables. Migration 5 adds missing input provenance without
+resetting scope, receipts or charged budgets. This supports both main and the
+version 2/3 replay prototypes; the current schema version is 5. Raw rows referenced by replay receipts are classified as replay;
 missing historical attempt/hash/acknowledgment provenance stays null. Back up the
 session using PostgreSQL tooling before upgrading. Earlier binaries reject newer
-schema versions (the current version is 3); rolling back requires restoring the
+schema versions (the current version is 5); rolling back requires restoring the
 pre-upgrade backup into a separate session and using its matching binary. Do not manually decrement the migration
 version or delete receipts to make an older binary open an upgraded session.
 The new tables currently have no deletion/TTL policy; job receipt retention will

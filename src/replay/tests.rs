@@ -328,7 +328,7 @@ fn process_death_at_raw_output_and_receipt_boundaries_recovers_without_duplicate
 fn prototype_upgrade_preserves_scope_budgets_and_retryable_input() {
     let db = TestDatabase::new();
     let mut sql = db.sql();
-    crate::storage::pg::migrate(&mut sql, &crate::storage::pg::MIGRATIONS[..2]).unwrap();
+    crate::storage::pg::migrate(&mut sql, &prototype_migrations()[..2]).unwrap();
     let tx = update(123, 7);
     let wire = tx.encode_to_vec();
     let hash = Sha256::digest(&wire).to_vec();
@@ -361,9 +361,112 @@ fn prototype_upgrade_preserves_scope_budgets_and_retryable_input() {
     assert_eq!(rows[0].amount_raw, 42);
     assert_eq!(rows[0].fee_raw, Some(0));
     assert_eq!(
-        crate::storage::pg::migrate(&mut sql, &crate::storage::pg::MIGRATIONS[..2])
+        crate::storage::pg::migrate(&mut sql, &prototype_migrations()[..2])
             .unwrap_err()
             .0,
         "storage_schema_newer_than_binary"
+    );
+}
+
+fn prototype_migrations() -> [(i32, &'static str); 3] {
+    [
+        crate::storage::pg::MIGRATIONS[0],
+        (
+            2,
+            include_str!("../../tests/fixtures/replay-prototype-v2.sql"),
+        ),
+        (
+            3,
+            include_str!("../../tests/fixtures/replay-prototype-v3.sql"),
+        ),
+    ]
+}
+
+#[test]
+fn merged_kafka_schema_upgrades_without_moving_producer_or_consumer_positions() {
+    let db = TestDatabase::new();
+    let mut sql = db.sql();
+    crate::storage::pg::migrate(&mut sql, &crate::storage::pg::MIGRATIONS[..3]).unwrap();
+    sql.execute("INSERT INTO kafka_producer_cursor VALUES($1,123)", &[&USDC])
+        .unwrap();
+    sql.execute(
+        "INSERT INTO kafka_offsets VALUES('group','topic',0,42)",
+        &[],
+    )
+    .unwrap();
+    sql.execute(
+        "INSERT INTO live_raw(slot,protobuf,status,received_at) VALUES(123,$1,'pending',1)",
+        &[&b"retained".as_slice()],
+    )
+    .unwrap();
+    create(&db.0, "fifty", USDC, 100, 149).unwrap();
+    assert_eq!(
+        sql.query_one("SELECT slot FROM kafka_producer_cursor", &[])
+            .unwrap()
+            .get::<_, i64>(0),
+        123
+    );
+    assert_eq!(
+        sql.query_one("SELECT next_offset FROM kafka_offsets", &[])
+            .unwrap()
+            .get::<_, i64>(0),
+        42
+    );
+    assert_eq!(
+        sql.query_one("SELECT ingestion_mode FROM live_raw", &[])
+            .unwrap()
+            .get::<_, String>(0),
+        "live"
+    );
+    assert_eq!(
+        status(&db.0, "fifty").unwrap()["budget"]["seconds_charged"],
+        0
+    );
+}
+
+#[test]
+fn version_three_prototype_upgrades_without_losing_replay_or_kafka_state() {
+    let db = TestDatabase::new();
+    let mut sql = db.sql();
+    crate::storage::pg::migrate(&mut sql, &prototype_migrations()).unwrap();
+    // The prototype has schema versions 2/3 but neither merged Kafka table.
+    assert!(
+        sql.query_one("SELECT to_regclass('kafka_offsets')::text", &[])
+            .unwrap()
+            .get::<_, Option<String>>(0)
+            .is_none()
+    );
+    sql.execute("INSERT INTO replay_jobs(id,mint,start_slot,end_slot,decoder,created_at,seconds_charged) VALUES('fifty',$1,100,149,$2,1,30)", &[&USDC,&crate::decoder::DECODER_VERSION]).unwrap();
+    let report = status(&db.0, "fifty").unwrap();
+    assert_eq!(report["budget"]["seconds_charged"], 30);
+    assert_eq!(report["start"], 100);
+    assert_eq!(report["end"], 149);
+    assert_eq!(report["coverage"], "unknown");
+    sql.execute(
+        "INSERT INTO kafka_producer_cursor(stream,slot) VALUES($1,123)",
+        &[&USDC],
+    )
+    .unwrap();
+    sql.execute(
+        "INSERT INTO kafka_offsets VALUES('group','topic',0,42)",
+        &[],
+    )
+    .unwrap();
+    crate::storage::pg::migrate(&mut sql, crate::storage::pg::MIGRATIONS).unwrap();
+    assert_eq!(
+        sql.query_one("SELECT slot FROM kafka_producer_cursor", &[])
+            .unwrap()
+            .get::<_, i64>(0),
+        123
+    );
+    assert_eq!(
+        sql.query_one("SELECT next_offset FROM kafka_offsets", &[])
+            .unwrap()
+            .get::<_, i64>(0),
+        42
+    );
+    assert_eq!(
+        status(&db.0, "fifty").unwrap()["budget"]["seconds_charged"],
+        30
     );
 }

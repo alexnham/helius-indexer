@@ -319,3 +319,16 @@ The console shows remaining budgets, processing versus raw retention and unknown
 coverage, alongside live reports and actual query output. Current JSON snapshots
 are inspection telemetry, not a production continuous exporter or alert system.
 See [replay jobs](replay-jobs.md) for bounds and operating commands.
+
+
+### Replay integration with batched writes and Kafka
+
+The shared network driver runs synchronous PostgreSQL and Kafka operations after
+leaving Tokio's network future. Live input retains the 100-input/16-MiB/200-ms
+flush bounds, atomic batch output/status acknowledgment and storage write metrics.
+With Kafka configured, only live input publishes there; delivery-confirmed cursors
+retain the existing reorder margin. Historical replay keeps separate durable raw
+receipts and charged allowances, and cannot advance the live producer cursor.
+The runtime resumes Kafka from the stored `resume_from`, never its maximum raw
+slot. Deterministic tests exercise direct batch acknowledgment and Kafka publication
+alongside a replay receipt using real local PostgreSQL/Kafka, without provider calls.

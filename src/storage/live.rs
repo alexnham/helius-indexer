@@ -30,6 +30,8 @@ pub(crate) struct Snapshot {
     pub last_received_slot: Option<i64>,
     /// Raw inputs received at or after `since`: (received, decoded).
     pub recent: (i64, i64),
+    /// Kafka replay positions by stream (mint): resume live intake from these slots.
+    pub producer_cursors: Vec<(String, i64)>,
 }
 
 impl LiveLog {
@@ -37,22 +39,55 @@ impl LiveLog {
         Ok(Self(RefCell::new(db.connect()?)))
     }
 
-    pub(crate) fn retain(&self, slot: i64, protobuf: &[u8]) -> Result<i64> {
-        Ok(self
+    /// Retains many wire payloads with one statement; ids return in input order.
+    pub(crate) fn retain_batch(&self, rows: &[(i64, Vec<u8>)]) -> Result<Vec<i64>> {
+        let slots: Vec<i64> = rows.iter().map(|r| r.0).collect();
+        let payloads: Vec<&[u8]> = rows.iter().map(|r| r.1.as_slice()).collect();
+        let mut ids: Vec<i64> = self
             .0
             .borrow_mut()
-            .query_one(
-                "INSERT INTO live_raw(slot,protobuf,status,received_at) VALUES($1,$2,'pending',$3) RETURNING id",
-                &[&slot, &protobuf, &now()],
+            .query(
+                "INSERT INTO live_raw(slot,protobuf,status,received_at)
+                 SELECT s,p,'pending',$3 FROM unnest($1::bigint[],$2::bytea[]) WITH ORDINALITY AS u(s,p,n) ORDER BY n
+                 RETURNING id",
+                &[&slots, &payloads, &now()],
             )
             .map_err(write_failed)?
-            .get(0))
+            .iter()
+            .map(|r| r.get(0))
+            .collect();
+        // Identity values follow insertion order, which follows the ordinality.
+        ids.sort_unstable();
+        Ok(ids)
     }
 
-    pub(crate) fn set_status(&self, id: i64, status: &str) -> Result<()> {
+    /// Stored consumer positions for one group and topic: (partition, next offset).
+    pub(crate) fn kafka_offsets(
+        db: &Database,
+        group: &str,
+        topic: &str,
+    ) -> Result<Vec<(i32, i64)>> {
+        Ok(db
+            .connect()?
+            .query(
+                "SELECT partition,next_offset FROM kafka_offsets WHERE consumer_group=$1 AND topic=$2",
+                &[&group, &topic],
+            )
+            .map_err(read_failed)?
+            .iter()
+            .map(|r| (r.get(0), r.get(1)))
+            .collect())
+    }
+
+    /// Monotonic: a stale producer can never move the replay position backwards. A late
+    /// transaction for an older slot is covered by `kafka::REORDER_MARGIN_SLOTS` at resume.
+    pub(crate) fn advance_producer_cursor(&self, stream: &str, slot: i64) -> Result<()> {
         self.0
             .borrow_mut()
-            .execute("UPDATE live_raw SET status=$1 WHERE id=$2", &[&status, &id])
+            .execute(
+                "INSERT INTO kafka_producer_cursor VALUES($1,$2) ON CONFLICT(stream) DO UPDATE SET slot=GREATEST(kafka_producer_cursor.slot,excluded.slot)",
+                &[&stream, &slot],
+            )
             .map_err(write_failed)?;
         Ok(())
     }
@@ -181,6 +216,15 @@ impl LiveLog {
             )
             .map_err(read_failed)?;
         let recent = (row.get(0), row.get(1));
+        let producer_cursors = tx
+            .query(
+                "SELECT stream,slot FROM kafka_producer_cursor ORDER BY stream",
+                &[],
+            )
+            .map_err(read_failed)?
+            .iter()
+            .map(|r| (r.get(0), r.get(1)))
+            .collect();
         tx.commit().map_err(read_failed)?;
         Ok(Snapshot {
             runs,
@@ -189,6 +233,7 @@ impl LiveLog {
             oldest_pending_at,
             last_received_slot,
             recent,
+            producer_cursors,
         })
     }
 }
