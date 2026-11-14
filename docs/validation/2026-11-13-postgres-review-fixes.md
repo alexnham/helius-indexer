@@ -33,9 +33,15 @@ passed the Docker smoke test, including restart persistence and network-disabled
 seeding/replay through the shared PostgreSQL Unix socket. Those Docker results
 precede final reconciliation and do not prove the final image.
 
-Final-head default/archive and Python checks are running again after reconciliation
-with parent PR #44 at `301023c`. CI supplies the separate Linux/AMD64 checks.
-PR #45 remains draft until these results are recorded. No full-window backfill,
+After reconciliation with parent PR #44 at `301023c`, formatting, default and
+archive Clippy passed. The full default Rust suite passed 97 tests, the archive
+suite passed 122, with three ignored subprocess helpers in each. The reconciled
+Python console/runtime suite passed all 12 tests. Commands: `cargo fmt --check`,
+`cargo clippy --offline --locked --all-targets -- -D warnings`,
+`cargo test --offline --locked`, the same Clippy/test commands with
+`--features archive`, and `python3 -m unittest discover -s tests -p '*console_test.py'`.
+CI supplies separate Linux/AMD64 and final-image checks, still pending when this
+evidence was recorded; PR #45 remains draft. No full-window backfill,
 production deployment, hosted PostgreSQL TLS validation or performance benchmark
 was performed. No schema migration or destructive data operation is introduced
 by this follow-up.
