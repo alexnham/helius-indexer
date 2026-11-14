@@ -246,7 +246,7 @@ impl Intake {
         let pending = snapshot.pending;
         let (received, decoded) = snapshot.recent;
         Ok(
-            json!({"recent":{"window_seconds":RECENT_SECONDS,"received":received,"decoded":decoded,"pending":received-decoded},"last_received_slot":snapshot.last_received_slot,"retry_cursor":snapshot.retry_cursor,"retry_batch_limit":100,"oldest_unresolved_age_seconds":if pending==0{Some(0)}else{snapshot.oldest_pending_at.and_then(age)},"state":if runs.is_empty(){"uninitialized"}else{"partial"},"mint":runs.first().and_then(|r|r.get("mint")),"decoder_version":decoder::DECODER_VERSION,"verified_boundary":null,"coverage":"unknown","unresolved_items":pending,"runs":runs,"limit":100,"reason":"filtered_finalized_stream_has_no_validated_completion_evidence"}),
+            json!({"producer_cursors":snapshot.producer_cursors.iter().map(|(stream,slot)| json!({"stream":stream,"slot":slot,"resume_from":crate::kafka::resume_slot(*slot as u64)})).collect::<Vec<_>>(),"recent":{"window_seconds":RECENT_SECONDS,"received":received,"decoded":decoded,"pending":received-decoded},"last_received_slot":snapshot.last_received_slot,"retry_cursor":snapshot.retry_cursor,"retry_batch_limit":100,"oldest_unresolved_age_seconds":if pending==0{Some(0)}else{snapshot.oldest_pending_at.and_then(age)},"state":if runs.is_empty(){"uninitialized"}else{"partial"},"mint":runs.first().and_then(|r|r.get("mint")),"decoder_version":decoder::DECODER_VERSION,"verified_boundary":null,"coverage":"unknown","unresolved_items":pending,"runs":runs,"limit":100,"reason":"filtered_finalized_stream_has_no_validated_completion_evidence"}),
         )
     }
 }
@@ -348,11 +348,45 @@ pub fn run_mint_admitted(
     let mut accepted = 0usize;
     // Stores the buffered inputs: raw rows in one statement, then output plus status in one
     // transaction. A storage error stops intake; retained rows stay pending for retry.
+    // With INDEXER_KAFKA_BROKERS set, live input goes to Kafka instead of PostgreSQL;
+    // consumers write the output. The replay cursor is stored as deliveries confirm.
+    let mut producer = match std::env::var("INDEXER_KAFKA_BROKERS") {
+        Ok(brokers) => {
+            crate::kafka::require_loopback(&brokers)?;
+            crate::kafka::ensure_topic(&brokers, crate::kafka::TOPIC, crate::kafka::PARTITIONS)?;
+            Some(crate::kafka::IntakeProducer::new(
+                &brokers,
+                crate::kafka::TOPIC,
+            )?)
+        }
+        Err(_) => None,
+    };
     let mut flush = |intake: &mut Intake,
                      buffer: &mut Vec<SubscribeUpdateTransaction>,
                      telemetry: &crate::telemetry::Telemetry|
      -> Result<()> {
         if buffer.is_empty() {
+            return Ok(());
+        }
+        if let Some(producer) = producer.as_mut() {
+            let operation = Instant::now();
+            for tx in buffer.iter() {
+                let late = producer.late_beyond_margin;
+                producer.send(tx.slot, &tx.encode_to_vec(), PROTO_SCHEMA)?;
+                if producer.late_beyond_margin > late {
+                    event(
+                        telemetry,
+                        "late_slot_beyond_reorder_margin",
+                        "late_slot_beyond_reorder_margin",
+                    );
+                }
+            }
+            count += buffer.len();
+            if let Some(slot) = producer.poll(Duration::ZERO)? {
+                intake.log.advance_producer_cursor(mint, slot as i64)?;
+            }
+            raw_seconds += operation.elapsed().as_secs_f64();
+            buffer.clear();
             return Ok(());
         }
         let _permit = gate.live()?;
@@ -524,6 +558,16 @@ pub fn run_mint_admitted(
         .unwrap_or(Ok("time_limit"))
     });
     drop(flush);
+    // Everything produced must be confirmed before the run records its final cursor.
+    let result = match producer.as_mut() {
+        Some(producer) => result.and_then(|status| {
+            if let Some(slot) = producer.flush(Duration::from_secs(30))? {
+                intake.log.advance_producer_cursor(mint, slot as i64)?;
+            }
+            Ok(status)
+        }),
+        None => result,
+    };
     let status = result.as_ref().map_or_else(|e| e.0, |s| *s);
     {
         let _permit = gate.live()?;
@@ -531,7 +575,7 @@ pub fn run_mint_admitted(
     }
     event(telemetry, "shutdown", status);
     let elapsed = started.elapsed().as_secs_f64();
-    let report = json!({"status":status,"received":count,"unresolved_attempts":failures,"input_protobuf_bytes":bytes,"elapsed_seconds":elapsed,"reconnect_attempts":reconnects,"inserted_transfers":inserted,"input_transactions_per_second":count as f64/elapsed,"decoded_write_successes":output_successes,"coverage_valid":false,"verified_boundary":null,"freshness_seconds":null,"storage":intake.store.stats(),"coverage":Intake::report(database)?});
+    let report = json!({"status":status,"received":count,"unresolved_attempts":failures,"input_protobuf_bytes":bytes,"elapsed_seconds":elapsed,"reconnect_attempts":reconnects,"inserted_transfers":inserted,"input_transactions_per_second":count as f64/elapsed,"decoded_write_successes":output_successes,"coverage_valid":false,"verified_boundary":null,"freshness_seconds":null,"storage":intake.store.stats(),"kafka":producer.as_ref().map(|p| json!({"topic":crate::kafka::TOPIC,"producer_cursor":p.cursor(),"late_beyond_reorder_margin":p.late_beyond_margin,"reorder_margin_slots":crate::kafka::REORDER_MARGIN_SLOTS})),"coverage":Intake::report(database)?});
     diagnostic(
         telemetry,
         &json!({"event":"live_metrics","mode":"live","source_kind":"laserstream","indexer_transactions_total":count,"indexer_decode_failures_total":failures,"indexer_input_bytes_total":bytes,"indexer_reconnects_total":reconnects,"indexer_coverage_valid":0,"indexer_live_freshness_seconds":null,"indexer_live_slot_gap":null,
@@ -972,6 +1016,54 @@ mod tests {
         assert_eq!(Intake::report(path).unwrap()["unresolved_items"], 1);
         assert_eq!(Store::query(path, None, 100).unwrap().len(), 2);
     }
+    #[test]
+    fn produced_input_advances_a_monotonic_replay_cursor() {
+        use crate::kafka::{
+            IntakeProducer, require_loopback,
+            tests::{TestTopic, test_brokers},
+        };
+        let test = TestDatabase::new();
+        let topic = TestTopic::new(2);
+        let intake = Intake::open(&test.0).unwrap();
+        let mut producer = IntakeProducer::new(&test_brokers(), &topic.0).unwrap();
+        for slot in [123, 124, 125] {
+            let mut tx = update();
+            tx.slot = slot;
+            producer
+                .send(slot, &tx.encode_to_vec(), PROTO_SCHEMA)
+                .unwrap();
+        }
+        assert_eq!(producer.late_beyond_margin, 0, "123..125 are in order");
+        assert_eq!(producer.flush(Duration::from_secs(20)).unwrap(), Some(125));
+        intake.log.advance_producer_cursor(USDC, 125).unwrap();
+        // A stale producer reporting an older slot cannot rewind the stored position.
+        intake.log.advance_producer_cursor(USDC, 120).unwrap();
+        assert_eq!(
+            Intake::report(&test.0).unwrap()["producer_cursors"],
+            json!([{"stream":USDC,"slot":125,"resume_from":125u64.saturating_sub(crate::kafka::REORDER_MARGIN_SLOTS)}])
+        );
+        // A slot far behind the newest one sent is outside the resume margin: counted.
+        producer.send(1_000, b"newest", PROTO_SCHEMA).unwrap();
+        producer.send(10, b"late", PROTO_SCHEMA).unwrap();
+        assert_eq!(producer.late_beyond_margin, 1);
+        assert_eq!(
+            producer.flush(Duration::from_secs(20)).unwrap(),
+            Some(1_000)
+        );
+        let oversize = vec![0; crate::kafka::MAX_MESSAGE_BYTES + 1];
+        assert_eq!(
+            producer.send(126, &oversize, PROTO_SCHEMA).unwrap_err().0,
+            "live_input_limit"
+        );
+        for brokers in ["db.example.test:9092", "127.0.0.1:59092,10.0.0.5:9092", ""] {
+            assert_eq!(
+                require_loopback(brokers).unwrap_err().0,
+                "kafka_tls_required"
+            );
+        }
+        assert!(require_loopback("localhost:59092,[::1]:9092").is_ok());
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn transport_end_failure_and_inactivity_are_distinct() {
         let mut empty = futures_util::stream::empty::<std::result::Result<SubscribeUpdate, ()>>();
