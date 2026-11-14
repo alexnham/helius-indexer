@@ -332,6 +332,9 @@ pub fn consume(
         .subscribe(&[topic])
         .map_err(|_| Error("kafka_unavailable"))?;
     let mut store = crate::storage::Store::open(database)?;
+    // One run identity for every event this consumer emits.
+    let mut telemetry = crate::telemetry::Telemetry::default();
+    telemetry.set_context("kafka_consumer", "kafka", "live");
     let deadline = std::time::Instant::now() + Duration::from_secs(seconds);
     let mut buffer: Vec<rdkafka::message::OwnedMessage> = Vec::new();
     let mut since: Option<std::time::Instant> = None;
@@ -351,10 +354,9 @@ pub fn consume(
         let due =
             since.is_some_and(|s| s.elapsed() >= BATCH_WINDOW) || buffer.len() >= BATCH_INPUTS;
         if (done || due) && !buffer.is_empty() {
-            if let Err(error) = write_consumed(&mut store, &group, topic, &buffer, &mut totals) {
-                // Only reached when even retaining a failed input fails, e.g. the database is down.
-                let mut telemetry = crate::telemetry::Telemetry::default();
-                telemetry.set_context("kafka_consumer", "kafka", "live");
+            if let Err(error) =
+                write_consumed(&mut store, &group, topic, &buffer, &mut totals, &telemetry)
+            {
                 telemetry.emit(
                     "consumer_stopped_on_storage_failure",
                     "consume",
@@ -408,59 +410,74 @@ struct Totals {
     batches: u64,
     revoked_unwritten: u64,
     storage_retained: u64,
+    consecutive_retained: u64,
 }
 
-/// Writes a batch; if it fails storage, retries its messages one by one. A message that
-/// still fails on its own is deterministic for that input: it is retained in live_raw with
-/// its error class and its position advances, so one bad input cannot block its partition.
-/// It stays retryable offline (`live-retry`). If even that retention fails, the consumer
-/// stops without advancing.
+/// Consecutive inputs retained for storage failure before the consumer treats the fault
+/// as systemic (a broken table, a decoder regression) and stops instead of draining.
+const MAX_CONSECUTIVE_RETAINED: u64 = 3;
+
+/// Writes a batch; if it fails storage, retries its messages one by one, in order. A
+/// message that still fails on its own is retained in live_raw with its error class and its
+/// position advances, so one bad input cannot block its partition; `live-retry` stores it
+/// once the cause is fixed. After `MAX_CONSECUTIVE_RETAINED` such failures in a row, or if
+/// retention itself fails, the consumer stops without advancing.
 fn write_consumed(
     store: &mut crate::storage::Store,
     group: &str,
     topic: &str,
     messages: &[rdkafka::message::OwnedMessage],
     totals: &mut Totals,
+    telemetry: &crate::telemetry::Telemetry,
 ) -> Result<()> {
     use rdkafka::Message;
-    match write_once(store, group, topic, messages, totals) {
-        Ok(()) => Ok(()),
-        Err(_) if messages.len() > 1 => {
-            for message in messages {
-                write_consumed(store, group, topic, std::slice::from_ref(message), totals)?;
+    if write_once(store, group, topic, messages, totals).is_ok() {
+        totals.consecutive_retained = 0;
+        return Ok(());
+    }
+    for message in messages {
+        let error = match write_once(store, group, topic, std::slice::from_ref(message), totals) {
+            Ok(()) => {
+                totals.consecutive_retained = 0;
+                continue;
             }
-            Ok(())
-        }
-        Err(error) => {
-            let message = &messages[0];
-            let slot = message
-                .key()
-                .and_then(|k| <[u8; 8]>::try_from(k).ok())
-                .map_or(0, |k| u64::from_be_bytes(k) as i64);
-            store.acknowledge(&crate::storage::Acknowledge::Kafka {
-                group,
-                topic,
-                offsets: &[(message.partition(), message.offset() + 1)],
-                retained: &[(
-                    slot,
-                    message.payload().unwrap_or_default().to_vec(),
-                    error.0,
-                )],
-            })?;
-            let mut telemetry = crate::telemetry::Telemetry::default();
-            telemetry.set_context("kafka_consumer", "kafka", "live");
+            Err(error) => error,
+        };
+        if totals.consecutive_retained >= MAX_CONSECUTIVE_RETAINED {
             telemetry.emit(
-                "consumer_retained_storage_failure",
+                "consumer_stopped_on_systemic_storage_failure",
                 "consume",
                 "failed",
                 Some(error.0),
             );
-            totals.consumed += 1;
-            totals.retained += 1;
-            totals.storage_retained += 1;
-            Ok(())
+            return Err(error);
         }
+        let slot = message
+            .key()
+            .and_then(|k| <[u8; 8]>::try_from(k).ok())
+            .map_or(0, |k| u64::from_be_bytes(k) as i64);
+        store.acknowledge(&crate::storage::Acknowledge::Kafka {
+            group,
+            topic,
+            offsets: &[(message.partition(), message.offset() + 1)],
+            retained: &[(
+                slot,
+                message.payload().unwrap_or_default().to_vec(),
+                error.0,
+            )],
+        })?;
+        telemetry.emit(
+            "consumer_retained_storage_failure",
+            "consume",
+            "failed",
+            Some(error.0),
+        );
+        totals.consecutive_retained += 1;
+        totals.consumed += 1;
+        totals.retained += 1;
+        totals.storage_retained += 1;
     }
+    Ok(())
 }
 
 fn write_once(
@@ -942,6 +959,46 @@ mod consumer_tests {
         let mut intake = crate::live::Intake::open(&test.0).unwrap();
         assert_eq!(intake.retry().unwrap()["decoded"], 1);
         assert_eq!(Store::query(&test.0, None, 100).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn a_systemic_storage_fault_stops_after_a_bounded_number_of_retained_inputs() {
+        let test = TestDatabase::new();
+        let topic = TestTopic::new(1);
+        let updates: Vec<_> = (1..=6u8).map(|n| signed(n, 100 + u64::from(n))).collect();
+        produce(&topic.0, &updates);
+        Store::open(&test.0).unwrap();
+        test.sql()
+            .batch_execute("CREATE FUNCTION fail() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RAISE EXCEPTION 'injected'; END$$; CREATE TRIGGER fail_transfers BEFORE INSERT ON transfers FOR EACH ROW EXECUTE FUNCTION fail();")
+            .unwrap();
+        assert_eq!(
+            consume(&test.0, &test_brokers(), &topic.0, 6)
+                .unwrap_err()
+                .0,
+            "storage_write_failed"
+        );
+        let retained: i64 = test
+            .sql()
+            .query_one("SELECT COUNT(*) FROM live_raw", &[])
+            .unwrap()
+            .get(0);
+        assert_eq!(
+            retained,
+            super::MAX_CONSECUTIVE_RETAINED as i64,
+            "the topic is not drained"
+        );
+        assert_eq!(
+            stored_positions(&test),
+            3,
+            "only the retained inputs advanced"
+        );
+        test.sql()
+            .batch_execute("DROP TRIGGER fail_transfers ON transfers;")
+            .unwrap();
+        consume(&test.0, &test_brokers(), &topic.0, 6).unwrap();
+        let mut intake = crate::live::Intake::open(&test.0).unwrap();
+        assert_eq!(intake.retry().unwrap()["decoded"], 3);
+        assert_eq!(Store::query(&test.0, None, 100).unwrap().len(), 6);
     }
 
     #[test]
