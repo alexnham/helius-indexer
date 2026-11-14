@@ -901,7 +901,7 @@ pub(crate) mod tests {
         assert_eq!(rows.len(), 2);
         assert!(
             rows.iter()
-                .all(|row| row.amount_raw == 42 && row.fee_raw == Some(0))
+                .all(|row| row.amount_raw == Some(42) && row.fee_raw == Some(0))
         );
     }
 
@@ -1217,7 +1217,7 @@ pub(crate) mod tests {
         let mut tx = update();
         let raw = normalize(&tx).unwrap();
         let capture = decoder::parse_capture(&raw).unwrap();
-        assert_eq!(decoder::decode(&capture).unwrap()[0].amount_raw, 42);
+        assert_eq!(decoder::decode(&capture).unwrap()[0].amount_raw, Some(42));
         let message = tx
             .transaction
             .as_mut()

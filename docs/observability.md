@@ -296,6 +296,20 @@ closed. Summary rows stream through checked u128 accumulation instead of loading
 a mint's history into a client-side vector. Existing bounded error classes and
 credential redaction apply.
 
+
+## Confidential transfer diagnostics
+
+Decoder v6 preserves hidden amounts/fees as null. Storage summaries report
+`unknown_amount_count` and `confidential_transfer_count` independently of known
+volume, unknown fees and indexing coverage. Unknown amounts do not become decode
+failures when the instruction and mint are identifiable. Unsupported variants and
+malformed layouts use bounded `unsupported_confidential_instruction` and
+`invalid_confidential_instruction` classes through the existing decode events,
+metrics and durable historical retry state. No ciphertext, secret or new metric
+label is exported. Synthetic fixture/integration checks cover null serialization,
+duplicate replay, optional historical metadata, non-transfer activity, failed
+execution evidence, sanitized failure events and retries blocking coverage.
+
 ## Replay jobs and source separation
 
 The replay job report includes frozen range/revision, consumed allowance and

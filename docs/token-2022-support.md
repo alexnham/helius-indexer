@@ -16,7 +16,9 @@ JSON strings. No floating point or balance-delta reconstruction is used.
 | WithdrawWithheldTokensFromMint (26, 2), WithdrawWithheldTokensFromAccounts (26, 3), HarvestWithheldTokensToMint (26, 4) | Recognized fee maintenance with validated length/account counts; emit no ordinary transfer edge |
 | UnwrapLamports (45), either token program | Recognized native SOL movement; excluded from token transfer edges |
 | Fee configuration (26, 0 / 5), other extension instructions | Explicitly unsupported pending further coverage; not silently treated as transfers |
-| Confidential transfers, other extension opcodes | Explicitly unsupported pending #7 or further evidence |
+| Confidential Transfer (27, 7), TransferWithFee (27, 13), current proof layout | Supported; explicit mint operand, hidden amount/fee null; see v6 boundary below |
+| Confidential configuration, deposit/withdraw within one account (27, 0–6 / 8–12 / 14) | Recognized current layouts; no transfer edge |
+| Other extension opcodes / confidential layouts | Explicitly unsupported; retained for retry, affected coverage incomplete |
 | SetAuthority base types 0–3, either token program | No transfer edge; AccountOwner (2) clears affected account owner fields across the transaction, including change-and-restore; mint/freeze/close authorities preserve the existing owner evidence |
 | Extension authority types | Explicitly unsupported |
 
@@ -25,7 +27,7 @@ invocations need complete runtime invocation/success evidence. A runtime failure
 anywhere in such a transaction conservatively rejects it, including a caught
 parent failure that could roll back an otherwise successful inner transfer.
 Failed transactions emit no transfers. Unknown instructions and insufficient
-historical evidence retain the full sanitized input and failure status in SQLite;
+historical evidence retain the full sanitized input and failure status in PostgreSQL;
 transaction output is atomic and coverage remains `unknown`.
 
 Successful checked-with-fee execution proves the encoded expected fee matched the
@@ -91,3 +93,51 @@ archive inputs can now be reverified offline with `repair-history-archive`, whic
 selects archived block receipts instead of RPC receipts and never downloads CAR
 files. Back up before in-place repair; this changes decoded output, not storage
 schema or transfer identity.
+
+
+## Revision v6: confidential transfer queries
+
+Verified 2026-11-14 against the [Token-2022 interface at revision
+`e8ca680ca8aeb12f9598524b003c776c6a4168f2`](https://github.com/solana-program/token-2022/blob/e8ca680ca8aeb12f9598524b003c776c6a4168f2/interface/src/extension/confidential_transfer/instruction.rs).
+The current `Transfer` (27, 7) and `TransferWithFee` (27, 13) instructions
+encode source, mint and destination as the first three accounts. Supported data
+lengths are 169 and 171 bytes respectively: two discriminators, a 36-byte
+[decryptable balance](https://github.com/solana-program/token-2022/blob/e8ca680ca8aeb12f9598524b003c776c6a4168f2/clients/js/src/generated/types/decryptableBalance.ts),
+two 64-byte [auditor ciphertexts](https://github.com/solana-program/token-2022/blob/e8ca680ca8aeb12f9598524b003c776c6a4168f2/clients/js/src/generated/types/encryptedBalance.ts),
+and three/five proof offsets. Context accounts or the shared instructions sysvar
+and authority must fit the equality, validity and range offsets. TransferWithFee's
+fee offsets (bytes 168–169) are read only on transfer-fee mints, which the
+instruction does not reveal, so they impose no account minimum. Record accounts
+and multisig signers may add accounts. Older split-proof layouts and unknown variants remain unresolved.
+
+Successful finalized execution is the evidence for program/proof validation; this
+indexer does not verify cryptography, signatures or consensus. Captures must come
+from a trusted finalized source. Synthetic fixtures test parsing rather than
+establishing valid proofs or on-chain availability. Inner execution evidence and
+atomic whole-transaction rejection follow the ordinary transfer rules above.
+
+`confidential=true`, `amount_raw=null` and `fee_raw=null` survive persistence,
+query and replay, including self transfers. Plain `Transfer` (27, 7) records
+`fee_raw=0` instead: Token-2022 rejects it on transfer-fee mints, so success
+proves no fee. `TransferWithFee` keeps a null fee. No encrypted field or balance delta
+is treated as an amount. The explicit mint is sufficient even without token
+balance metadata. `decimals` is then null; consistent execution-time token-balance
+metadata may enrich it. Conflicting mint, decimals or token-program evidence
+rejects the transaction. Owner evidence follows the same conservative rules as
+ordinary transfers. Configuration and deposit/withdraw operations within one
+account emit no edge; mint involvement alone never creates a transfer.
+
+`summary` adds `unknown_amount_count` and `confidential_transfer_count` alongside
+`known_volume_raw` and `unknown_fee_count`. A zero known volume with unknown
+amounts is not a zero total volume. Coverage continues to describe instruction
+indexing separately from unknown values. Unsupported/malformed candidates are
+retained with bounded failure classes and prevent affected historical completion.
+
+Compatibility: PostgreSQL stores transfer JSON as text, so no SQL migration or
+rewrite is needed. V6 reads existing decimal-string amounts and numeric decimals;
+new confidential records add nulls. Older binaries cannot read those null amounts.
+Upgrade readers before ingesting v6 output. Ordinary ingestion rejects mixed
+same-signature decoder revisions; use the explicit [repair procedure](decoder-repair.md)
+and reverify affected retained blocks. Back up the stopped session before repair;
+rollback to an older binary requires restoring the pre-v6 backup, including inputs,
+output and coverage. Stable transfer identities are unchanged.

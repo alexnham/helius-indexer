@@ -47,7 +47,7 @@ fn out_of_order_duplicates_and_later_slot_never_forge_completion() {
     assert_eq!(rows.len(), 2);
     assert!(
         rows.iter()
-            .all(|r| r.amount_raw == 42 && r.fee_raw == Some(0) && !r.confidential)
+            .all(|r| r.amount_raw == Some(42) && r.fee_raw == Some(0) && !r.confidential)
     );
     let report = status(&db.0, "fifty").unwrap();
     assert_eq!(report["resume_from"], 100);
@@ -107,7 +107,7 @@ fn transport_metadata_changes_deduplicate_but_changed_effects_are_reconciled() {
     run.reservation.acknowledge(raw, &result).unwrap();
     let rows = Store::query(&db.0, Some(USDC), 100).unwrap();
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].amount_raw, 42);
+    assert_eq!(rows[0].amount_raw, Some(42));
     assert_eq!(status(&db.0, "fifty").unwrap()["receipts"]["unresolved"], 1);
 }
 
@@ -141,7 +141,7 @@ fn count_pruning_preserves_processing_receipts_without_resurrecting_output() {
     let rows = Store::query(&db.0, Some(USDC), 100).unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].slot, 102);
-    assert_eq!(rows[0].amount_raw, 42);
+    assert_eq!(rows[0].amount_raw, Some(42));
 }
 
 #[test]
@@ -318,7 +318,7 @@ fn process_death_at_raw_output_and_receipt_boundaries_recovers_without_duplicate
         assert_eq!(report["job"]["receipts"]["decoded"], 1);
         let rows = Store::query(&db.0, Some(USDC), 100).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].amount_raw, 42);
+        assert_eq!(rows[0].amount_raw, Some(42));
         assert_eq!(report["job"]["budget"]["seconds_charged"], 5);
         assert_eq!(report["job"]["coverage"], "unknown");
     }
@@ -358,7 +358,7 @@ fn prototype_upgrade_preserves_scope_budgets_and_retryable_input() {
     assert_eq!(recovered["job"]["coverage"], "unknown");
     let rows = Store::query(&db.0, Some(USDC), 100).unwrap();
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].amount_raw, 42);
+    assert_eq!(rows[0].amount_raw, Some(42));
     assert_eq!(rows[0].fee_raw, Some(0));
     assert_eq!(
         crate::storage::pg::migrate(&mut sql, &prototype_migrations()[..2])

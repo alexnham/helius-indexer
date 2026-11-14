@@ -22,7 +22,7 @@ Each transfer record contains:
 | `mint`, `token_program` | Token and owning token program |
 | `source_token_account`, `destination_token_account` | Accounts participating in the transfer |
 | `source_owner`, `destination_owner` | Wallet owners at execution time where historical evidence permits resolution; otherwise null |
-| `amount_raw`, `decimals` | Instructed transfer amount in base units and token precision; amount null if unavailable |
+| `amount_raw`, `decimals` | Instructed transfer amount in base units and token precision; amount null if unavailable; precision null without execution-time metadata |
 | `fee_raw` | Separate Token-2022 withheld transfer fee in base units; null if unavailable |
 | `confidential` | Whether the transfer uses confidential semantics |
 | `decoder_version` | Decoder revision used to derive the record |

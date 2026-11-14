@@ -1,0 +1,126 @@
+[
+  {
+    "variant": 7,
+    "provenance": "Synthetic current interface layout; no on-chain execution or cryptographic validity claimed.",
+    "capture": {
+      "schema_version": 1,
+      "cluster": "mainnet-beta",
+      "commitment": "finalized",
+      "source": "fixture",
+      "result": {
+        "slot": 123,
+        "blockTime": 1794430000,
+        "version": "legacy",
+        "transaction": {
+          "signatures": [
+            "99eUso3aSbE9tqGSTXzo3TLfKb9RkMTURrHKQ1K7Zh3BbeqPevr5E1iCbpTjqHuTFLtfxTTD5ekfVuZFzQyEQf8"
+          ],
+          "message": {
+            "accountKeys": [
+              "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+              "4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi",
+              "8qbHbw2BbbTHBW1sbeqakYXVKRQM8Ne7pLK7m6CVfeR",
+              "CktRuQ2mttgRGkXJtyksdKHjUdc2C4TgDzyB98oEzy8",
+              "GgBaCs3NCBuZN12kCJgAW63ydqohFkHEdfdEXBPzLHq",
+              "Sysvar1nstructions1111111111111111111111111"
+            ],
+            "instructions": [
+              {
+                "programIdIndex": 0,
+                "accounts": [
+                  1,
+                  3,
+                  2,
+                  5,
+                  4
+                ],
+                "data": "3gH9iZz6e2W7P8w53ur441uah5DNhxgept6xvyCYH8BuoUZU1gdRM8cqPWA1e2uv27KCgV23cA5UC7jHrANTr8uqVwoC3Ry9R9dd521MLM7qBHXAZTDzV7gJyKQ91r9nPMuKrAQHjH84uvPeeoXp7pZdpEPxtaCCwidJASwcZ4859koKQ9c5EjXJR75gnaJsq7XJRrnpuqk7CfygbYMnPnMJZyatrBdpkQqvdqi"
+              }
+            ]
+          }
+        },
+        "meta": {
+          "err": null,
+          "innerInstructions": [],
+          "logMessages": [],
+          "preTokenBalances": [],
+          "postTokenBalances": []
+        }
+      }
+    },
+    "expected": {
+      "transfer_id": "solana:mainnet-beta:99eUso3aSbE9tqGSTXzo3TLfKb9RkMTURrHKQ1K7Zh3BbeqPevr5E1iCbpTjqHuTFLtfxTTD5ekfVuZFzQyEQf8:0:outer",
+      "mint": "CktRuQ2mttgRGkXJtyksdKHjUdc2C4TgDzyB98oEzy8",
+      "source_token_account": "4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi",
+      "destination_token_account": "8qbHbw2BbbTHBW1sbeqakYXVKRQM8Ne7pLK7m6CVfeR",
+      "instruction_index": 0,
+      "inner_instruction_index": null,
+      "amount_raw": null,
+      "fee_raw": "0",
+      "decimals": null,
+      "confidential": true
+    }
+  },
+  {
+    "variant": 13,
+    "provenance": "Synthetic current interface layout; no on-chain execution or cryptographic validity claimed.",
+    "capture": {
+      "schema_version": 1,
+      "cluster": "mainnet-beta",
+      "commitment": "finalized",
+      "source": "fixture",
+      "result": {
+        "slot": 123,
+        "blockTime": 1794430000,
+        "version": "legacy",
+        "transaction": {
+          "signatures": [
+            "G8mkV3evpXRRoYdxZhzcnzCf2Nz5XoH2E1P22J9nLHMdFe81eJ9H8bToQEa5yYPqkD5pVRGXinFoe7TmQmWrkwE"
+          ],
+          "message": {
+            "accountKeys": [
+              "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+              "4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi",
+              "8qbHbw2BbbTHBW1sbeqakYXVKRQM8Ne7pLK7m6CVfeR",
+              "CktRuQ2mttgRGkXJtyksdKHjUdc2C4TgDzyB98oEzy8",
+              "GgBaCs3NCBuZN12kCJgAW63ydqohFkHEdfdEXBPzLHq",
+              "Sysvar1nstructions1111111111111111111111111"
+            ],
+            "instructions": [
+              {
+                "programIdIndex": 0,
+                "accounts": [
+                  1,
+                  3,
+                  2,
+                  5,
+                  4
+                ],
+                "data": "uCh6JsmRnU2CrzRZwrRwF4cKNcpMhi1TdZdz1wVJkUnEPBNZn8M45LbywERu5QYNX5UzCHjagXFHWwmPcoXcKLadCN76x5m4sVdQDEeojPn7spESRxQsSNsvaW8LVVKFG5cZphP9YoAqqWZq43EcKGfD9xCG6YsR4PidgtMzeQchbFJY4hLn7bGJpFpUqu7n6Comf4JdtrQmPBBz85BbaXPYk6kDNeH7JytNia2Z6"
+              }
+            ]
+          }
+        },
+        "meta": {
+          "err": null,
+          "innerInstructions": [],
+          "logMessages": [],
+          "preTokenBalances": [],
+          "postTokenBalances": []
+        }
+      }
+    },
+    "expected": {
+      "transfer_id": "solana:mainnet-beta:G8mkV3evpXRRoYdxZhzcnzCf2Nz5XoH2E1P22J9nLHMdFe81eJ9H8bToQEa5yYPqkD5pVRGXinFoe7TmQmWrkwE:0:outer",
+      "mint": "CktRuQ2mttgRGkXJtyksdKHjUdc2C4TgDzyB98oEzy8",
+      "source_token_account": "4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi",
+      "destination_token_account": "8qbHbw2BbbTHBW1sbeqakYXVKRQM8Ne7pLK7m6CVfeR",
+      "instruction_index": 0,
+      "inner_instruction_index": null,
+      "amount_raw": null,
+      "fee_raw": null,
+      "decimals": null,
+      "confidential": true
+    }
+  }
+]

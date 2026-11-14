@@ -78,7 +78,7 @@ fn correction_adds_changes_and_removes_full_transaction_output_without_new_input
     db.execute("UPDATE transfers SET mint='old-wrong-mint',record_json=jsonb_set(jsonb_set(jsonb_set(record_json::jsonb,'{mint}',to_jsonb('old-wrong-mint'::text)),'{amount_raw}',to_jsonb('999'::text)),'{fee_raw}',to_jsonb('7'::text))::text", &[]).unwrap();
     let mut false_row = correct[0].clone();
     false_row.transfer_id.push_str(":false");
-    false_row.amount_raw = 123;
+    false_row.amount_raw = Some(123);
     false_row.decoder_version = "token-transfers-v3".into();
     insert(&mut db, &false_row);
     // An old unresolved flag must not be resurrected by a later target revision.

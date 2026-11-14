@@ -148,11 +148,13 @@ pub fn transfer(prior: &Transfer, incoming: &Transfer) -> Result<Transfer> {
     merged.block_time = enrich(&prior.block_time, &incoming.block_time)?;
     merged.source_owner = enrich(&prior.source_owner, &incoming.source_owner)?;
     merged.destination_owner = enrich(&prior.destination_owner, &incoming.destination_owner)?;
+    merged.decimals = enrich(&prior.decimals, &incoming.decimals)?;
     merged.fee_raw = enrich(&prior.fee_raw, &incoming.fee_raw)?;
     let mut comparable = prior.clone();
     comparable.block_time = merged.block_time;
     comparable.source_owner = merged.source_owner.clone();
     comparable.destination_owner = merged.destination_owner.clone();
+    comparable.decimals = merged.decimals;
     comparable.fee_raw = merged.fee_raw;
     if comparable != merged {
         return Err(Error("capture_conflict"));
