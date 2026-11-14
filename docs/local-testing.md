@@ -10,8 +10,9 @@ Open **http://127.0.0.1:8765**. The script builds the existing default Rust CLI,
 creates a new private session under ignored `data/local-test/`, ingests 50 captured
 inputs, and replays them to check deduplication. No provider credentials, Docker,
 Node installation or API calls are needed. It does not load `.env` or modify
-existing databases. Python 3.10+, the installed Rust toolchain and a C compiler
-for bundled SQLite are required. Build dependencies must already be cached;
+existing databases. Python 3.10+, the installed Rust toolchain and PostgreSQL
+(`docker compose up -d postgres`, with `DATABASE_URL` set as in `.env.example`) are
+required. Build dependencies must already be cached;
 if needed, run `cargo fetch --locked` once, then repeat the startup command.
 
 The initial dataset contains **303 unique transfers across 38 mints**, including
@@ -73,7 +74,7 @@ cargo build --offline --locked
 python3 -m unittest discover -s tests -p local_console_test.py
 ```
 
-The acceptance checks use the real CLI/SQLite and a loopback HTTP server. They
+The acceptance checks use the real CLI, local PostgreSQL and a loopback HTTP server. They
 cover captured values, mint filtering, null fees, duplicate-free replay, read-only
 queries, invalid request bounds, foreign Host rejection and blocked filesystem/
 write routes. They run in the existing default CI job after Rust tests. No Rust

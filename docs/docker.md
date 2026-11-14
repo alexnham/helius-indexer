@@ -33,8 +33,10 @@ are excluded.
 
 ## Persistent session
 
-The dedicated `console-data` named volume holds the database, SQLite WAL files,
-raw captures, copied binary, receipt and events under `/app/data/session`. It is
+The dedicated `console-data` named volume holds raw captures, the copied binary,
+receipt and events under `/app/data/session`; the data itself is the `console` schema
+in the `postgres` service (`postgres-data` volume), reached over a Unix socket shared
+through the `postgres-socket` volume, so no database traffic crosses a network. It is
 separate from the repository's existing native `data/` directory. First startup
 seeds 50 captures, then verifies duplicate-free replay (303 unique transfers).
 Later startups reopen that same session without reseeding or replacing its binary.
@@ -62,14 +64,16 @@ docker compose down --volumes
 ```
 
 That deletes the named volume and everything stored in it. Ordinary `down` preserves
-it. Stop the service before copying/archiving the volume; never copy a live SQLite
-main database file alone while its WAL is active. Ingestion profiles, credential
+it. Stop the services before archiving the volumes, or use `pg_dump` from the
+`postgres` service. Sessions created before PostgreSQL are not migrated: remove the
+old `console-data` volume and let the console reseed. Ingestion profiles, credential
 file support and a full backup/restore runbook belong to the second Docker phase.
 
 ## Health and limits
 
-`/healthz` checks that the session receipt parses and the existing SQLite transfer
-table is readable, using a read-only connection. It does not create missing data.
+`/healthz` checks that the session receipt parses, names its database session, and
+that a summary query on it succeeds. A receipt without a session fails before any
+connection is made.
 A green container health check means the console/database are accessible; it does
 not mean chain coverage, freshness, live replay or 30-day readiness. Coverage stays
 explicitly unknown.
@@ -80,7 +84,7 @@ and provides writable data plus a 64 MiB temporary filesystem. The captured-data
 service has one CPU, 512 MiB memory and 64 PIDs; these are local-demo caps, not
 production sizing results. The single-request server retains bounded socket and
 CLI deadlines. SIGTERM during serving closes the server; interrupted seed writes
-are recovered through the existing SQLite/idempotent replay contract.
+are recovered through the idempotent replay contract.
 
 Use `docker compose ps` for health and `docker compose logs --tail 30 console` for
 startup errors. Detailed stage events remain in the volume's `events.jsonl`. No

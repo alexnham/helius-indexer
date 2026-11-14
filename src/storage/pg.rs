@@ -148,7 +148,7 @@ impl Database {
 }
 
 /// A fresh session schema on the local test server, dropped afterwards, so tests run
-/// in parallel. Start the server with `docker compose --profile db up -d postgres`.
+/// in parallel. Start the server with `docker compose up -d postgres`.
 #[doc(hidden)]
 pub struct TestDatabase(pub Database);
 
@@ -178,7 +178,7 @@ impl TestDatabase {
                 c.batch_execute(&format!("DROP SCHEMA IF EXISTS \"{session}\" CASCADE"))
                     .map_err(|_| Error("storage_open_failed"))
             })
-            .expect("local PostgreSQL unavailable: run `docker compose --profile db up -d postgres` or set INDEXER_TEST_DATABASE_URL");
+            .expect("local PostgreSQL unavailable: run `docker compose up -d postgres` or set INDEXER_TEST_DATABASE_URL");
         Self(db)
     }
 

@@ -6,10 +6,16 @@ services:
       target: console
     environment:
       INDEXER_CONSOLE_PORT: ${INDEXER_CONSOLE_PORT:-8765}
+      # Unix socket on a shared volume: private to these containers, so plaintext is allowed.
+      DATABASE_URL: host=/var/run/postgresql user=indexer dbname=indexer
+    depends_on:
+      postgres:
+        condition: service_healthy
     ports:
       - "127.0.0.1:${INDEXER_CONSOLE_PORT:-8765}:${INDEXER_CONSOLE_PORT:-8765}"
     volumes:
       - console-data:/app/data
+      - postgres-socket:/var/run/postgresql
     read_only: true
     tmpfs:
       - /tmp:size=64m,mode=1777
@@ -38,11 +44,17 @@ services:
       INDEXER_BACKFILL_END: ${INDEXER_BACKFILL_END:-}
       INDEXER_LIVE_FROM: ${INDEXER_LIVE_FROM:-}
       INDEXER_KEEP_TRANSFERS: ${INDEXER_KEEP_TRANSFERS:-1000}
+      # Unix socket on a shared volume: private to these containers, so plaintext is allowed.
+      DATABASE_URL: host=/var/run/postgresql user=indexer dbname=indexer
+    depends_on:
+      postgres:
+        condition: service_healthy
     ports:
       - "127.0.0.1:${INDEXER_RUNTIME_PORT:-8767}:${INDEXER_RUNTIME_PORT:-8767}"
     secrets: [helius]
     volumes:
       - runtime-data:/app/data
+      - postgres-socket:/var/run/postgresql
     read_only: true
     tmpfs:
       - /tmp:size=64m,mode=1777
@@ -54,10 +66,9 @@ services:
     pids_limit: 64
     stop_grace_period: 20s
 
-  # Local PostgreSQL for development and tests (`docker compose --profile db up -d postgres`).
-  # Loopback only; the default password is for this local container, never a hosted database.
+  # Local PostgreSQL for the console, runtime, development and tests (`docker compose up -d postgres`).
+  # Host access is loopback only; the default password is for this local container, never a hosted database.
   postgres:
-    profiles: [db]
     image: postgres:18.6-alpine@sha256:9ba53c7d41ea093baf5c1ba635ba5434c4f979880527d49bb7d9237d3193085b
     environment:
       POSTGRES_USER: indexer
@@ -67,6 +78,7 @@ services:
       - "127.0.0.1:${INDEXER_POSTGRES_PORT:-55432}:5432"
     volumes:
       - postgres-data:/var/lib/postgresql
+      - postgres-socket:/var/run/postgresql
     healthcheck:
       test: [CMD, pg_isready, -U, indexer, -d, indexer]
       interval: 2s
@@ -88,3 +100,4 @@ volumes:
   console-data:
   runtime-data:
   postgres-data:
+  postgres-socket:

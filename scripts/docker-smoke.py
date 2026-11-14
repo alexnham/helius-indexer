@@ -15,7 +15,9 @@ PORT = os.environ.get("INDEXER_CONSOLE_PORT", "8765")
 def compose(*args):
     return subprocess.run(
         ["docker", "compose", "-f", str(ROOT / "compose.yaml"), "-p", PROJECT, *args],
-        cwd=ROOT, env={**os.environ, "INDEXER_CONSOLE_PORT": PORT},
+        cwd=ROOT, env={**os.environ, "INDEXER_CONSOLE_PORT": PORT,
+                       # Avoids a development database already published on the default port.
+                       "INDEXER_POSTGRES_PORT": os.environ.get("INDEXER_SMOKE_POSTGRES_PORT", "55433")},
         text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         timeout=120, check=True,
     ).stdout
@@ -62,7 +64,12 @@ def main():
         assert snapshot() == before, "Restart replaced the session receipt or binary"
         assert get("/api/transfers") == initial, "Restart changed transfer output"
         print("Docker smoke passed: non-root, no runtime Cargo, health, graceful stop, persistent session and identical queries")
-        subprocess.run(["docker", "run", "--rm", "--network", "none", "helius-indexer-console:local", "--seed-only"],
+        # No network at all: the database is reached only through the shared Unix socket.
+        subprocess.run(["docker", "run", "--rm", "--network", "none",
+                        "-v", f"{PROJECT}_postgres-socket:/var/run/postgresql",
+                        "-e", "DATABASE_URL=host=/var/run/postgresql user=indexer dbname=indexer",
+                        "-e", "INDEXER_DB_SESSION=smoke_offline",
+                        "helius-indexer-console:local", "--seed-only"],
                        check=True, timeout=120, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         print("Network-disabled seed/replay passed")
     finally:

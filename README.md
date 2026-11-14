@@ -28,7 +28,7 @@ console; live and 30-day coverage remain unverified.
 
 Offline validation slice for a Solana token transfer index. It decodes compiled
 SPL Token instructions, atomically stores captured inputs and transfers in
-SQLite, and queries persisted results from a separate process. Implementation
+PostgreSQL, and queries persisted results from a separate process. Implementation
 starts with [ticket #1](https://github.com/alexnham/helius-indexer/issues/1).
 
 The [proposal](PROPOSAL.md) defines the full index. Production backfill,
@@ -39,17 +39,22 @@ inspection tool, not a production 30-day API. Captured-query responses report co
 
 ## Run the captured example
 
-Requires Rust/Cargo (declared minimum Rust 1.89) and a C compiler for bundled
-SQLite. No provider account, API key, Docker, or running database is needed.
+Requires Rust/Cargo (declared minimum Rust 1.89) and PostgreSQL. The bundled
+loopback container is enough (`docker compose up -d postgres`). No provider account
+or API key is needed. Every command takes a SESSION, a schema name such as `local`,
+in place of the former SQLite file; the server comes only from `DATABASE_URL`, never
+an argument. Existing SQLite files are not migrated: re-ingest or refetch them.
 The first build fetches dependencies; the captured commands and default tests make no network
 requests. The historical command below explicitly requests bounded RPC data.
 
 ```sh
+docker compose up -d postgres
+export DATABASE_URL=postgres://indexer:indexer@127.0.0.1:55432/indexer
 cargo build --locked
 mkdir -p data
-cargo run --locked -- ingest data/index.sqlite tests/fixtures/mainnet-transfer.json --metrics data/first-run.prom
-cargo run --locked -- query data/index.sqlite
-cargo run --locked -- query data/index.sqlite EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+cargo run --locked -- ingest local tests/fixtures/mainnet-transfer.json --metrics data/first-run.prom
+cargo run --locked -- query local
+cargo run --locked -- query local EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
 ```
 
 The captured example decodes two inner USDC transfers of `23360000` base units
@@ -119,11 +124,13 @@ records do not imply verified coverage.
 
 ## Provisional persistence
 
-SQLite is an embedded local validation store, chosen to demonstrate real durable
-writes and restart behavior without committing to production infrastructure.
-Bundled SQLite keeps local and CI behavior consistent. Raw capture, decode status,
-and all transfers commit in one transaction, with WAL and `synchronous=FULL`.
-Writes wait at most five seconds for contention.
+PostgreSQL is the selected store (see PROPOSAL.md, 2026-11-13); SQLite was removed.
+Each SESSION is its own schema on the `DATABASE_URL` server, created and migrated on
+first connection (`src/storage/migrations`). Raw capture, decode status and all of a
+transaction's transfers commit in one transaction at READ COMMITTED: a first
+observation inserts without reading, and a repeat waits on that capture's row lock.
+Transfers are range-partitioned by slot. Plaintext connections are accepted only
+over loopback or a Unix socket; hosted servers need TLS, which is not yet supported.
 
 Compatible same-revision observations coalesce immediately by deterministic
 transfer identity. Unknown metadata may be enriched; contradictory known values
@@ -161,7 +168,7 @@ uses its own schema). Set `INDEXER_TEST_DATABASE_URL` to use another local serve
 This makes no provider calls; never point tests at a hosted database.
 
 ```sh
-docker compose --profile db up -d postgres
+docker compose up -d postgres
 cargo fetch --locked
 cargo fmt --check
 cargo clippy --offline --locked --all-targets -- -D warnings
@@ -179,9 +186,9 @@ and telemetry/redaction/export failures.
 ```sh
 # Public mainnet RPC is the default; SOLANA_RPC_URL optionally selects an existing HTTPS endpoint.
 # Keep credential-bearing URLs in environment variables, never arguments or committed files.
-cargo run --locked -- backfill data/history.sqlite EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v 468265447 468265447 --metrics data/history.prom
-cargo run --locked -- coverage data/history.sqlite EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v 468265447 468265447
-cargo run --locked -- query data/history.sqlite EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+cargo run --locked -- backfill history EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v 468265447 468265447 --metrics data/history.prom
+cargo run --locked -- coverage history EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v 468265447 468265447
+cargo run --locked -- query history EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
 ```
 
 Compatible stream/RPC observations can share a validation database. Use the
@@ -224,7 +231,7 @@ those raw blocks rather than `captures`; enriched source metadata can repair the
 on retry. Successful effects keep their identity and known semantic values; compatible
 unknown metadata can be enriched. Decoder revision correction/removal semantics
 remain outside this slice.
-SQLite acknowledgment precedes coverage acknowledgment. A crash after raw/output
+Durable output acknowledgment precedes coverage acknowledgment. A crash after raw/output
 writes leaves coverage unknown; restart reuses durable raw input after interruption
 and deduplicates output. Missing/unsupported metadata is refetched on retry.
 Storage schema additions are compatible with existing captures/transfers; older
@@ -287,9 +294,9 @@ tail. Create a plan explicitly before running either worker command.
 
 
 Decoder v5 supports base authority changes and withheld-fee collection without
-losing unrelated transfers. Use `repair-history-archive DB MINT START END` for
+losing unrelated transfers. Use `repair-history-archive SESSION MINT START END` for
 explicit offline re-verification of normalized archive receipts already retained
-in SQLite. It needs no CAR cache or optional SDK feature. See the
+in the session. It needs no CAR cache or optional SDK feature. See the
 [decoder maintenance validation](docs/validation/2026-11-12-decoder-maintenance.md)
 and back up the database before in-place repair.
 
