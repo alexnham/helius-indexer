@@ -247,6 +247,11 @@ impl Store {
         results
     }
 
+    /// Writes progress alone, with no batch output; unlike an empty batch, failures surface.
+    pub(crate) fn acknowledge(&mut self, acknowledge: &Acknowledge<'_>) -> Result<()> {
+        self.write_batch(&[], Some(acknowledge)).map(|_| ())
+    }
+
     pub fn stats(&self) -> WriteStats {
         self.stats
     }

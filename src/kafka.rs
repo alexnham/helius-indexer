@@ -332,6 +332,9 @@ pub fn consume(
         .subscribe(&[topic])
         .map_err(|_| Error("kafka_unavailable"))?;
     let mut store = crate::storage::Store::open(database)?;
+    // One run identity for every event this consumer emits.
+    let mut telemetry = crate::telemetry::Telemetry::default();
+    telemetry.set_context("kafka_consumer", "kafka", "live");
     let deadline = std::time::Instant::now() + Duration::from_secs(seconds);
     let mut buffer: Vec<rdkafka::message::OwnedMessage> = Vec::new();
     let mut since: Option<std::time::Instant> = None;
@@ -351,11 +354,9 @@ pub fn consume(
         let due =
             since.is_some_and(|s| s.elapsed() >= BATCH_WINDOW) || buffer.len() >= BATCH_INPUTS;
         if (done || due) && !buffer.is_empty() {
-            if let Err(error) = write_consumed(&mut store, &group, topic, &buffer, &mut totals) {
-                // shortcut: a deterministic per-item storage failure blocks its partition on
-                // every restart; retaining it in live_raw and advancing is a follow-up (#36).
-                let mut telemetry = crate::telemetry::Telemetry::default();
-                telemetry.set_context("kafka_consumer", "kafka", "live");
+            if let Err(error) =
+                write_consumed(&mut store, &group, topic, &buffer, &mut totals, &telemetry)
+            {
                 telemetry.emit(
                     "consumer_stopped_on_storage_failure",
                     "consume",
@@ -396,7 +397,7 @@ pub fn consume(
     Ok(
         serde_json::json!({"consumer_group":group,"topic":topic,"consumed":totals.consumed,
         "inserted_transfers":totals.inserted,"retained_failures":totals.retained,
-        "batches":totals.batches,"revoked_unwritten":totals.revoked_unwritten,
+        "batches":totals.batches,"revoked_unwritten":totals.revoked_unwritten,"storage_failures_retained":totals.storage_retained,
         "storage":store.stats(),"coverage":"unknown"}),
     )
 }
@@ -408,9 +409,78 @@ struct Totals {
     retained: u64,
     batches: u64,
     revoked_unwritten: u64,
+    storage_retained: u64,
+    consecutive_retained: u64,
 }
 
+/// Consecutive inputs retained for storage failure before the consumer treats the fault
+/// as systemic (a broken table, a decoder regression) and stops instead of draining.
+const MAX_CONSECUTIVE_RETAINED: u64 = 3;
+
+/// Writes a batch; if it fails storage, retries its messages one by one, in order. A
+/// message that still fails on its own is retained in live_raw with its error class and its
+/// position advances, so one bad input cannot block its partition; `live-retry` stores it
+/// once the cause is fixed. After `MAX_CONSECUTIVE_RETAINED` such failures in a row, or if
+/// retention itself fails, the consumer stops without advancing.
 fn write_consumed(
+    store: &mut crate::storage::Store,
+    group: &str,
+    topic: &str,
+    messages: &[rdkafka::message::OwnedMessage],
+    totals: &mut Totals,
+    telemetry: &crate::telemetry::Telemetry,
+) -> Result<()> {
+    use rdkafka::Message;
+    if write_once(store, group, topic, messages, totals).is_ok() {
+        totals.consecutive_retained = 0;
+        return Ok(());
+    }
+    for message in messages {
+        let error = match write_once(store, group, topic, std::slice::from_ref(message), totals) {
+            Ok(()) => {
+                totals.consecutive_retained = 0;
+                continue;
+            }
+            Err(error) => error,
+        };
+        if totals.consecutive_retained >= MAX_CONSECUTIVE_RETAINED {
+            telemetry.emit(
+                "consumer_stopped_on_systemic_storage_failure",
+                "consume",
+                "failed",
+                Some(error.0),
+            );
+            return Err(error);
+        }
+        let slot = message
+            .key()
+            .and_then(|k| <[u8; 8]>::try_from(k).ok())
+            .map_or(0, |k| u64::from_be_bytes(k) as i64);
+        store.acknowledge(&crate::storage::Acknowledge::Kafka {
+            group,
+            topic,
+            offsets: &[(message.partition(), message.offset() + 1)],
+            retained: &[(
+                slot,
+                message.payload().unwrap_or_default().to_vec(),
+                error.0,
+            )],
+        })?;
+        telemetry.emit(
+            "consumer_retained_storage_failure",
+            "consume",
+            "failed",
+            Some(error.0),
+        );
+        totals.consecutive_retained += 1;
+        totals.consumed += 1;
+        totals.retained += 1;
+        totals.storage_retained += 1;
+    }
+    Ok(())
+}
+
+fn write_once(
     store: &mut crate::storage::Store,
     group: &str,
     topic: &str,
@@ -861,10 +931,42 @@ mod consumer_tests {
     }
 
     #[test]
-    fn a_storage_failure_never_advances_positions() {
+    fn a_poison_input_is_retained_and_its_partition_moves_on() {
         let test = TestDatabase::new();
         let topic = TestTopic::new(1);
-        produce(&topic.0, &[signed(9, 123), signed(8, 124)]);
+        let poison = bs58::encode([8u8; 64]).into_string();
+        produce(&topic.0, &[signed(9, 123), signed(8, 124), signed(6, 126)]);
+        Store::open(&test.0).unwrap();
+        test.sql()
+            .batch_execute(&format!("CREATE FUNCTION poison() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN IF NEW.signature='{poison}' THEN RAISE EXCEPTION 'poison'; END IF; RETURN NEW; END$$; CREATE TRIGGER poison BEFORE INSERT ON captures FOR EACH ROW EXECUTE FUNCTION poison();"))
+            .unwrap();
+        let report = consume(&test.0, &test_brokers(), &topic.0, 6).unwrap();
+        // The good inputs may be stored by the batch fallback before the per-message retry,
+        // so the stored rows, not the newly-inserted count, are the measure.
+        assert_eq!(Store::query(&test.0, None, 100).unwrap().len(), 2);
+        assert_eq!(report["storage_failures_retained"], 1);
+        assert_eq!(stored_positions(&test), 3, "the partition is not blocked");
+        let status: String = test
+            .sql()
+            .query_one("SELECT status FROM live_raw", &[])
+            .unwrap()
+            .get(0);
+        assert_eq!(status, "storage_write_failed");
+        // Nothing is lost: once the cause is fixed, offline retry stores the retained input.
+        test.sql()
+            .batch_execute("DROP TRIGGER poison ON captures;")
+            .unwrap();
+        let mut intake = crate::live::Intake::open(&test.0).unwrap();
+        assert_eq!(intake.retry().unwrap()["decoded"], 1);
+        assert_eq!(Store::query(&test.0, None, 100).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn a_systemic_storage_fault_stops_after_a_bounded_number_of_retained_inputs() {
+        let test = TestDatabase::new();
+        let topic = TestTopic::new(1);
+        let updates: Vec<_> = (1..=6u8).map(|n| signed(n, 100 + u64::from(n))).collect();
+        produce(&topic.0, &updates);
         Store::open(&test.0).unwrap();
         test.sql()
             .batch_execute("CREATE FUNCTION fail() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RAISE EXCEPTION 'injected'; END$$; CREATE TRIGGER fail_transfers BEFORE INSERT ON transfers FOR EACH ROW EXECUTE FUNCTION fail();")
@@ -875,13 +977,53 @@ mod consumer_tests {
                 .0,
             "storage_write_failed"
         );
-        assert_eq!(stored_positions(&test), 0);
+        let retained: i64 = test
+            .sql()
+            .query_one("SELECT COUNT(*) FROM live_raw", &[])
+            .unwrap()
+            .get(0);
+        assert_eq!(
+            retained,
+            super::MAX_CONSECUTIVE_RETAINED as i64,
+            "the topic is not drained"
+        );
+        assert_eq!(
+            stored_positions(&test),
+            3,
+            "only the retained inputs advanced"
+        );
         test.sql()
             .batch_execute("DROP TRIGGER fail_transfers ON transfers;")
             .unwrap();
+        consume(&test.0, &test_brokers(), &topic.0, 6).unwrap();
+        let mut intake = crate::live::Intake::open(&test.0).unwrap();
+        assert_eq!(intake.retry().unwrap()["decoded"], 3);
+        assert_eq!(Store::query(&test.0, None, 100).unwrap().len(), 6);
+    }
+
+    #[test]
+    fn positions_never_advance_when_a_failed_input_cannot_be_retained() {
+        let test = TestDatabase::new();
+        let topic = TestTopic::new(1);
+        produce(&topic.0, &[signed(9, 123), signed(8, 124)]);
+        Store::open(&test.0).unwrap();
+        test.sql()
+            .batch_execute("CREATE FUNCTION fail() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RAISE EXCEPTION 'injected'; END$$; CREATE TRIGGER fail_transfers BEFORE INSERT ON transfers FOR EACH ROW EXECUTE FUNCTION fail(); CREATE TRIGGER fail_raw BEFORE INSERT ON live_raw FOR EACH ROW EXECUTE FUNCTION fail();")
+            .unwrap();
+        assert_eq!(
+            consume(&test.0, &test_brokers(), &topic.0, 6)
+                .unwrap_err()
+                .0,
+            "storage_write_failed"
+        );
+        assert_eq!(stored_positions(&test), 0);
+        test.sql()
+            .batch_execute(
+                "DROP TRIGGER fail_transfers ON transfers; DROP TRIGGER fail_raw ON live_raw;",
+            )
+            .unwrap();
         let retry = consume(&test.0, &test_brokers(), &topic.0, 6).unwrap();
         assert_eq!(retry["inserted_transfers"], 2);
-        assert_eq!(Store::query(&test.0, None, 100).unwrap().len(), 2);
     }
 
     #[test]
