@@ -130,7 +130,16 @@ first connection (`src/storage/migrations`). Raw capture, decode status and all 
 transaction's transfers commit in one transaction at READ COMMITTED: a first
 observation inserts without reading, and a repeat waits on that capture's row lock.
 Transfers are range-partitioned by slot. Plaintext connections are accepted only
-over loopback or a Unix socket; hosted servers need TLS, which is not yet supported.
+over loopback or a Unix socket. Any other host requires TLS (`sslmode=disable` is
+refused and `prefer` is upgraded to required) with an authenticated server: a trusted
+chain and matching hostname (system roots, or `INDEXER_DB_TLS_ROOT`), or, for
+self-signed servers, an operator-pinned leaf fingerprint in `INDEXER_DB_TLS_SHA256`.
+There is no unauthenticated mode: unlike libpq, URL `sslmode=require` here still means
+authenticated TLS, and verification is configured only through `INDEXER_DB_TLS_ROOT`
+and `INDEXER_DB_TLS_SHA256`. A pin is never learned automatically; certificate
+rotation fails closed until the pin is updated. See `.env.example`. The opt-in
+`cargo test --test hosted -- --ignored` check (needs `INDEXER_HOSTED_DATABASE_URL`)
+measures latency and throughput against a hosted server in a throwaway session.
 
 Compatible same-revision observations coalesce immediately by deterministic
 transfer identity. Unknown metadata may be enriched; contradictory known values

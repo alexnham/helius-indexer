@@ -6,15 +6,49 @@ use postgres::{Client, NoTls};
 pub(crate) const MIGRATIONS: &[(i32, &str)] = &[(1, include_str!("migrations/0001_initial.sql"))];
 
 /// Connection errors are reduced to a class: driver messages can echo the URL or credentials.
+/// Loopback and Unix sockets may be plaintext; every other host requires authenticated TLS.
 pub(crate) fn connect(url: &str) -> Result<Client> {
-    let config: postgres::Config = url.parse().map_err(|_| Error("storage_open_failed"))?;
-    // shortcut: no TLS client yet, so only loopback and Unix-socket servers are accepted; add TLS before hosted use (#35).
-    if !loopback(&config) {
+    use postgres::config::SslMode;
+    let mut config: postgres::Config = url.parse().map_err(|_| Error("storage_open_failed"))?;
+    if loopback(&config) && config.get_ssl_mode() != SslMode::Require {
+        return config
+            .connect(NoTls)
+            .map_err(|_| Error("storage_open_failed"));
+    }
+    if config.get_ssl_mode() == SslMode::Disable {
         return Err(Error("storage_tls_required"));
     }
-    config
-        .connect(NoTls)
-        .map_err(|_| Error("storage_open_failed"))
+    // `prefer` would fall back to plaintext if the server declined TLS.
+    config.ssl_mode(SslMode::Require);
+    // A pin authenticates only the certificate; binding SCRAM to this TLS channel also
+    // proves the server holds the password verifier, defeating a relaying intermediary.
+    if std::env::var_os("INDEXER_DB_TLS_SHA256").is_some() {
+        config.channel_binding(postgres::config::ChannelBinding::Require);
+    }
+    let tls = tokio_postgres_rustls::MakeRustlsConnect::new(super::tls::from_env()?);
+    config.connect(tls).map_err(|error| {
+        Error(if tls_failure(&error) {
+            "storage_tls_failed"
+        } else {
+            "storage_open_failed"
+        })
+    })
+}
+
+fn tls_failure(error: &postgres::Error) -> bool {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(current) = source {
+        let rustls = current.downcast_ref::<rustls::Error>().is_some()
+            || current
+                .downcast_ref::<std::io::Error>()
+                .and_then(|io| io.get_ref())
+                .is_some_and(|inner| inner.downcast_ref::<rustls::Error>().is_some());
+        if rustls {
+            return true;
+        }
+        source = current.source();
+    }
+    false
 }
 
 fn loopback(config: &postgres::Config) -> bool {
@@ -323,16 +357,31 @@ mod tests {
     #[test]
     fn plaintext_connections_are_refused_off_loopback() {
         for url in [
-            "postgres://u:p@roundhouse.proxy.rlwy.net:54778/railway",
-            "postgres://u:p@10.0.0.5/x",
-            "host=127.0.0.1,db.example.com user=u",
-            "host=localhost hostaddr=192.0.2.1 user=u",
+            "postgres://u:p@db.example.test/railway?sslmode=disable",
+            "postgres://u:p@10.0.0.5/x?sslmode=disable",
+            "host=127.0.0.1,db.example.test user=u sslmode=disable",
+            "host=localhost hostaddr=192.0.2.1 user=u sslmode=disable",
         ] {
             let Err(error) = connect(url) else {
                 panic!("connected without TLS");
             };
             assert_eq!(error.0, "storage_tls_required", "{url}");
         }
+    }
+
+    #[test]
+    fn untrusted_or_unpinned_servers_fail_tls_without_a_plaintext_fallback() {
+        // A local plain server on a non-loopback address would accept plaintext; TLS is
+        // demanded instead, and the server's refusal surfaces as a TLS or open failure.
+        let url = TestDatabase::url().replace("127.0.0.1", "localhost") + "?sslmode=require";
+        let Err(error) = connect(&url) else {
+            panic!("connected without verified TLS");
+        };
+        assert!(
+            matches!(error.0, "storage_tls_failed" | "storage_open_failed"),
+            "{}",
+            error.0
+        );
     }
 
     #[test]
