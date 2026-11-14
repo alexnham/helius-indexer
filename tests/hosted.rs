@@ -18,6 +18,17 @@ fn hosted_database_tls_latency_and_write_throughput() {
         .unwrap()
         .subsec_nanos();
     let db = Database::new(url, &format!("hosted_check_{nanos}")).unwrap();
+    // Drops the throwaway schema even when an assertion fails part way.
+    struct Cleanup(Database);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = self.0.test_client().batch_execute(&format!(
+                "DROP SCHEMA IF EXISTS \"{}\" CASCADE",
+                self.0.session()
+            ));
+        }
+    }
+    let _cleanup = Cleanup(db.clone());
     let started = Instant::now();
     let mut sql = db.test_client();
     let connect_ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -43,8 +54,6 @@ fn hosted_database_tls_latency_and_write_throughput() {
     }
     let seconds = started.elapsed().as_secs_f64();
     let stored = Store::query(&db, None, 1000).unwrap().len();
-    sql.batch_execute(&format!("DROP SCHEMA \"{}\" CASCADE", db.session()))
-        .unwrap();
     assert_eq!(stored, inserted);
     println!(
         "{}",
