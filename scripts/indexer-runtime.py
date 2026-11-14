@@ -79,6 +79,14 @@ def atomic_json(path, value):
     temporary.replace(path)
 
 
+def resume_slot(live, mint):
+    """Kafka mode resumes from the producer's resume_from (cursor minus the reorder margin),
+    never the raw cursor; the PostgreSQL path resumes from the newest retained slot."""
+    if os.environ.get("INDEXER_KAFKA_BROKERS"):
+        return next((c["resume_from"] for c in live.get("producer_cursors", []) if c["stream"] == mint), None)
+    return live.get("last_received_slot")
+
+
 def initialize(session, binary, database):
     import shutil
     session.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -154,7 +162,7 @@ def main():
                     prune_code, pruned = cycle(["prune", db, config["keep"]], timeout=300, report_name="prune.json")
                     if prune_code != 0:
                         raise RuntimeError("Prune failed")
-                    resume = CONSOLE.command(session, "live-status", db).get("last_received_slot") or resume
+                    resume = resume_slot(CONSOLE.command(session, "live-status", db), config["mint"]) or resume
                 except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
                     code, result, failed, pruned = None, None, True, None
                 last = {"exit_code": code, "report": result, "pruned": pruned, "resume_from": resume}

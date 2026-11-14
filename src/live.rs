@@ -20,10 +20,10 @@ use tonic::{
 pub const USDC: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 const MAX_MESSAGES: usize = 10_000;
 /// A live batch flushes at this many inputs, bytes or age, whichever comes first.
-const BATCH_INPUTS: usize = 100;
+pub(crate) const BATCH_INPUTS: usize = 100;
 const BATCH_BYTES: usize = 16 * 1024 * 1024;
-const BATCH_WINDOW: Duration = Duration::from_millis(200);
-const PROTO_SCHEMA: &str = "laserstream-core-proto/14.0.0";
+pub(crate) const BATCH_WINDOW: Duration = Duration::from_millis(200);
+pub(crate) const PROTO_SCHEMA: &str = "laserstream-core-proto/14.0.0";
 const RECENT_SECONDS: i64 = 60;
 
 pub fn request(from: u64) -> SubscribeRequest {
@@ -166,7 +166,7 @@ impl Intake {
         let ids: Vec<i64> = ready.iter().map(|r| r.1).collect();
         let stored = self.store.persist_batch_acknowledged(
             &items,
-            Some(&Acknowledge {
+            Some(&Acknowledge::Live {
                 ids: &ids,
                 failed: &failed,
             }),
@@ -632,11 +632,11 @@ fn check_replay(from: u64, first: u64) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::storage::pg::TestDatabase;
     use laserstream_core_proto::solana::storage::confirmed_block as wire;
-    fn update() -> SubscribeUpdateTransaction {
+    pub(crate) fn update() -> SubscribeUpdateTransaction {
         let mut data = vec![12];
         data.extend(42u64.to_le_bytes());
         data.push(6);

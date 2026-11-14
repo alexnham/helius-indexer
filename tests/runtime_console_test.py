@@ -21,6 +21,9 @@ os.environ.setdefault("DATABASE_URL", os.environ.get(
     "INDEXER_TEST_DATABASE_URL", "postgres://indexer:indexer@127.0.0.1:55432/indexer"))
 
 
+CONSOLE_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+
+
 def database():
     return "pytest_" + secrets.token_hex(6)
 
@@ -94,6 +97,19 @@ class RuntimeConsole(unittest.TestCase):
                 self.assertEqual(result["blocks"], 16)
                 self.assertGreater(result["expected"], 0)
                 self.assertEqual((result["missing"], result["extra"], result["wrong"]), (0, 0, 0))
+
+    def test_kafka_mode_resumes_from_resume_from_never_the_raw_cursor(self):
+        live = {"last_received_slot": 900, "producer_cursors": [
+            {"stream": "other", "slot": 50, "resume_from": 0},
+            {"stream": CONSOLE_MINT, "slot": 1000, "resume_from": 850}]}
+        os.environ.pop("INDEXER_KAFKA_BROKERS", None)
+        self.assertEqual(RUNTIME.resume_slot(live, CONSOLE_MINT), 900)
+        os.environ["INDEXER_KAFKA_BROKERS"] = "127.0.0.1:59092"
+        try:
+            self.assertEqual(RUNTIME.resume_slot(live, CONSOLE_MINT), 850)
+            self.assertIsNone(RUNTIME.resume_slot({"producer_cursors": []}, CONSOLE_MINT))
+        finally:
+            os.environ.pop("INDEXER_KAFKA_BROKERS", None)
 
     def test_supervised_child_is_killed_and_reaped_on_timeout_or_stop(self):
         with tempfile.TemporaryDirectory() as directory:

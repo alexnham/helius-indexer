@@ -239,6 +239,253 @@ fn retention_ok(
     )
 }
 
+/// Assigns partitions at the positions stored in PostgreSQL, never Kafka's committed
+/// offsets, and records revocations so a half-filled batch is not written by a consumer
+/// that no longer owns its partitions.
+struct Positions {
+    db: crate::storage::Database,
+    group: String,
+    topic: String,
+    revoked: std::sync::atomic::AtomicBool,
+    failed: std::sync::Mutex<Option<Error>>,
+}
+
+impl ClientContext for Positions {}
+
+impl rdkafka::consumer::ConsumerContext for Positions {
+    fn rebalance(
+        &self,
+        consumer: &rdkafka::consumer::BaseConsumer<Self>,
+        err: rdkafka::types::RDKafkaRespErr,
+        tpl: &mut rdkafka::TopicPartitionList,
+    ) {
+        use rdkafka::{Offset, consumer::Consumer, types::RDKafkaRespErr};
+        match err {
+            RDKafkaRespErr::RD_KAFKA_RESP_ERR__ASSIGN_PARTITIONS => {
+                match crate::storage::live::LiveLog::kafka_offsets(
+                    &self.db,
+                    &self.group,
+                    &self.topic,
+                ) {
+                    Ok(stored) => {
+                        let partitions: Vec<(String, i32)> = tpl
+                            .elements()
+                            .iter()
+                            .map(|e| (e.topic().to_string(), e.partition()))
+                            .collect();
+                        for (topic, partition) in partitions {
+                            let offset = stored
+                                .iter()
+                                .find(|s| s.0 == partition)
+                                .map_or(Offset::Beginning, |s| Offset::Offset(s.1));
+                            let _ = tpl.set_partition_offset(&topic, partition, offset);
+                        }
+                        let _ = consumer.assign(tpl);
+                    }
+                    // Without stored positions nothing is assigned; the loop reports the error.
+                    Err(error) => {
+                        if let Ok(mut failed) = self.failed.lock() {
+                            *failed = Some(error);
+                        }
+                    }
+                }
+            }
+            RDKafkaRespErr::RD_KAFKA_RESP_ERR__REVOKE_PARTITIONS => {
+                self.revoked
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                let _ = consumer.unassign();
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Consumes live input from `topic` as one member of the session's consumer group and
+/// writes it in batches; each batch commits its output and the group's positions together.
+/// Input that fails before storage is retained in live_raw for offline retry. A storage
+/// failure stops the consumer without advancing positions, so a restart replays the batch.
+pub fn consume(
+    database: &crate::storage::Database,
+    brokers: &str,
+    topic: &str,
+    seconds: u64,
+) -> Result<serde_json::Value> {
+    use crate::live::{BATCH_INPUTS, BATCH_WINDOW};
+    use rdkafka::consumer::{BaseConsumer, Consumer};
+    require_loopback(brokers)?;
+    ensure_topic(brokers, topic, PARTITIONS)?;
+    let group = format!("indexer-{}", database.session());
+    let consumer: BaseConsumer<Positions> = config(brokers)
+        .set("group.id", &group)
+        .set("enable.auto.commit", "false")
+        .set("enable.auto.offset.store", "false")
+        .set("auto.offset.reset", "earliest")
+        .create_with_context(Positions {
+            db: database.clone(),
+            group: group.clone(),
+            topic: topic.into(),
+            revoked: Default::default(),
+            failed: Default::default(),
+        })
+        .map_err(|_| Error("kafka_unavailable"))?;
+    consumer
+        .subscribe(&[topic])
+        .map_err(|_| Error("kafka_unavailable"))?;
+    let mut store = crate::storage::Store::open(database)?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(seconds);
+    let mut buffer: Vec<rdkafka::message::OwnedMessage> = Vec::new();
+    let mut since: Option<std::time::Instant> = None;
+    let mut totals = Totals::default();
+    loop {
+        if let Some(error) = consumer
+            .context()
+            .failed
+            .lock()
+            .ok()
+            .and_then(|mut f| f.take())
+        {
+            return Err(error);
+        }
+        let now = std::time::Instant::now();
+        let done = now >= deadline;
+        let due =
+            since.is_some_and(|s| s.elapsed() >= BATCH_WINDOW) || buffer.len() >= BATCH_INPUTS;
+        if (done || due) && !buffer.is_empty() {
+            write_consumed(&mut store, &group, topic, &buffer, &mut totals)?;
+            buffer.clear();
+            since = None;
+        }
+        if done {
+            break;
+        }
+        let wait = since
+            .map_or(BATCH_WINDOW, |s| BATCH_WINDOW.saturating_sub(s.elapsed()))
+            .min(deadline.saturating_duration_since(now))
+            .max(Duration::from_millis(1));
+        match consumer.poll(wait) {
+            Some(Ok(message)) => {
+                buffer.push(message.detach());
+                since.get_or_insert_with(std::time::Instant::now);
+            }
+            Some(Err(_)) => return Err(Error("kafka_consume_failed")),
+            None => {}
+        }
+        if consumer
+            .context()
+            .revoked
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            // Positions for these messages were never stored; the next owner replays them.
+            totals.revoked_unwritten += buffer.len() as u64;
+            buffer.clear();
+            since = None;
+        }
+    }
+    Ok(
+        serde_json::json!({"consumer_group":group,"topic":topic,"consumed":totals.consumed,
+        "inserted_transfers":totals.inserted,"retained_failures":totals.retained,
+        "batches":totals.batches,"revoked_unwritten":totals.revoked_unwritten,
+        "storage":store.stats(),"coverage":"unknown"}),
+    )
+}
+
+#[derive(Default)]
+struct Totals {
+    consumed: u64,
+    inserted: u64,
+    retained: u64,
+    batches: u64,
+    revoked_unwritten: u64,
+}
+
+fn write_consumed(
+    store: &mut crate::storage::Store,
+    group: &str,
+    topic: &str,
+    messages: &[rdkafka::message::OwnedMessage],
+    totals: &mut Totals,
+) -> Result<()> {
+    use crate::{
+        decoder,
+        storage::{Acknowledge, BatchItem},
+    };
+    use laserstream_core_proto::geyser::SubscribeUpdateTransaction;
+    use prost::Message as _;
+    use rdkafka::message::{Headers, Message};
+    let mut offsets = std::collections::BTreeMap::new();
+    let mut decoded = Vec::new();
+    let mut retained = Vec::new();
+    for message in messages {
+        let next = offsets.entry(message.partition()).or_insert(0);
+        *next = (*next).max(message.offset() + 1);
+        let payload = message.payload().unwrap_or_default();
+        let slot = message
+            .key()
+            .and_then(|k| <[u8; 8]>::try_from(k).ok())
+            .map_or(0, u64::from_be_bytes) as i64;
+        let schema = message.headers().and_then(|headers| {
+            headers
+                .iter()
+                .find(|h| h.key == "proto_schema")
+                .and_then(|h| h.value)
+        });
+        let prepared = (|| {
+            if schema != Some(crate::live::PROTO_SCHEMA.as_bytes()) {
+                return Err(Error("unsupported_stored_proto_schema"));
+            }
+            let update = SubscribeUpdateTransaction::decode(payload)
+                .map_err(|_| Error("stored_record_invalid"))?;
+            let raw = crate::live::normalize(&update)?;
+            Ok((decoder::parse_capture(&raw)?, raw))
+        })();
+        match prepared {
+            Ok((capture, raw)) => {
+                let transfers = decoder::decode(&capture);
+                // Undecodable but stored captures are also retained, as live intake does.
+                if let Err(error) = &transfers {
+                    retained.push((slot, payload.to_vec(), error.0));
+                }
+                decoded.push((capture, raw, transfers));
+            }
+            Err(error) => retained.push((slot, payload.to_vec(), error.0)),
+        }
+    }
+    let items: Vec<BatchItem<'_>> = decoded
+        .iter()
+        .map(|(capture, raw, transfers)| BatchItem {
+            capture,
+            raw,
+            decoded: transfers,
+        })
+        .collect();
+    let offsets: Vec<(i32, i64)> = offsets.into_iter().collect();
+    let fallbacks = store.stats().fallbacks;
+    let results = store.persist_batch_acknowledged(
+        &items,
+        Some(&Acknowledge::Kafka {
+            group,
+            topic,
+            offsets: &offsets,
+            retained: &retained,
+        }),
+    );
+    if store.stats().fallbacks > fallbacks
+        || results
+            .iter()
+            .any(|r| matches!(r, Err(e) if e.0.starts_with("storage_")))
+    {
+        return Err(Error("storage_write_failed"));
+    }
+    totals.consumed += messages.len() as u64;
+    totals.inserted += results
+        .iter()
+        .filter_map(|r| r.as_ref().ok())
+        .sum::<usize>() as u64;
+    totals.retained += retained.len() as u64;
+    totals.batches += 1;
+    Ok(())
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -495,5 +742,153 @@ mod cursor_tests {
     fn resume_replays_a_bounded_reorder_margin() {
         assert_eq!(resume_slot(1_000), 1_000 - super::REORDER_MARGIN_SLOTS);
         assert_eq!(resume_slot(10), 0);
+    }
+}
+
+#[cfg(test)]
+mod consumer_tests {
+    use super::{
+        IntakeProducer, consume,
+        tests::{TestTopic, test_brokers},
+    };
+    use crate::{
+        live::{PROTO_SCHEMA, tests::update},
+        storage::{Store, pg::TestDatabase},
+    };
+    use prost::Message;
+    use std::time::Duration;
+
+    /// A valid one-transfer update with its own signature.
+    fn signed(n: u8, slot: u64) -> laserstream_core_proto::geyser::SubscribeUpdateTransaction {
+        let mut tx = update();
+        tx.slot = slot;
+        let info = tx.transaction.as_mut().unwrap();
+        info.signature = vec![n; 64];
+        info.transaction.as_mut().unwrap().signatures = vec![vec![n; 64]];
+        tx
+    }
+
+    fn produce(
+        topic: &str,
+        updates: &[laserstream_core_proto::geyser::SubscribeUpdateTransaction],
+    ) {
+        let mut producer = IntakeProducer::new(&test_brokers(), topic).unwrap();
+        for tx in updates {
+            producer
+                .send(tx.slot, &tx.encode_to_vec(), PROTO_SCHEMA)
+                .unwrap();
+        }
+        producer.flush(Duration::from_secs(20)).unwrap();
+    }
+
+    fn stored_positions(test: &TestDatabase) -> i64 {
+        test.sql()
+            .query_one(
+                "SELECT COALESCE(SUM(next_offset),0)::bigint FROM kafka_offsets",
+                &[],
+            )
+            .unwrap()
+            .get(0)
+    }
+
+    #[test]
+    fn input_is_stored_once_failures_are_retained_and_restarts_resume() {
+        let test = TestDatabase::new();
+        let topic = TestTopic::new(2);
+        let mut broken = signed(7, 125);
+        broken.transaction.as_mut().unwrap().meta = None;
+        produce(&topic.0, &[signed(9, 123), signed(8, 124), broken]);
+        let first = consume(&test.0, &test_brokers(), &topic.0, 6).unwrap();
+        assert_eq!(first["consumed"], 3);
+        assert_eq!(first["inserted_transfers"], 2);
+        assert_eq!(first["retained_failures"], 1);
+        assert_eq!(stored_positions(&test), 3);
+        let status: String = test
+            .sql()
+            .query_one("SELECT status FROM live_raw", &[])
+            .unwrap()
+            .get(0);
+        assert_eq!(status, "missing_execution_metadata");
+        let again = consume(&test.0, &test_brokers(), &topic.0, 4).unwrap();
+        assert_eq!(
+            again["consumed"], 0,
+            "a restart resumes from stored positions"
+        );
+        assert_eq!(Store::query(&test.0, None, 100).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_storage_failure_never_advances_positions() {
+        let test = TestDatabase::new();
+        let topic = TestTopic::new(1);
+        produce(&topic.0, &[signed(9, 123), signed(8, 124)]);
+        Store::open(&test.0).unwrap();
+        test.sql()
+            .batch_execute("CREATE FUNCTION fail() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RAISE EXCEPTION 'injected'; END$$; CREATE TRIGGER fail_transfers BEFORE INSERT ON transfers FOR EACH ROW EXECUTE FUNCTION fail();")
+            .unwrap();
+        assert_eq!(
+            consume(&test.0, &test_brokers(), &topic.0, 6)
+                .unwrap_err()
+                .0,
+            "storage_write_failed"
+        );
+        assert_eq!(stored_positions(&test), 0);
+        test.sql()
+            .batch_execute("DROP TRIGGER fail_transfers ON transfers;")
+            .unwrap();
+        let retry = consume(&test.0, &test_brokers(), &topic.0, 6).unwrap();
+        assert_eq!(retry["inserted_transfers"], 2);
+        assert_eq!(Store::query(&test.0, None, 100).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn two_consumers_split_partitions_and_store_every_input_once() {
+        let test = TestDatabase::new();
+        let topic = TestTopic::new(6);
+        let updates: Vec<_> = (1..=40u8)
+            .map(|n| signed(n, 1_000 + u64::from(n)))
+            .collect();
+        produce(&topic.0, &updates);
+        let workers: Vec<_> = (0..2)
+            .map(|_| {
+                let (db, name) = (test.0.clone(), topic.0.clone());
+                std::thread::spawn(move || consume(&db, &test_brokers(), &name, 12).unwrap())
+            })
+            .collect();
+        let reports: Vec<_> = workers.into_iter().map(|w| w.join().unwrap()).collect();
+        assert_eq!(Store::query(&test.0, None, 100).unwrap().len(), 40);
+        assert_eq!(stored_positions(&test), 40);
+        let consumed: u64 = reports
+            .iter()
+            .map(|r| r["consumed"].as_u64().unwrap())
+            .sum();
+        assert!(
+            consumed >= 40,
+            "every input consumed; redelivery is allowed"
+        );
+    }
+
+    #[test]
+    fn a_stale_consumer_cannot_rewind_stored_positions() {
+        use crate::storage::Acknowledge;
+        let test = TestDatabase::new();
+        let mut store = Store::open(&test.0).unwrap();
+        for offset in [10, 5] {
+            store.persist_batch_acknowledged(
+                &[],
+                Some(&Acknowledge::Kafka {
+                    group: "g",
+                    topic: "t",
+                    offsets: &[(0, offset)],
+                    retained: &[],
+                }),
+            );
+        }
+        let stored: i64 = test
+            .sql()
+            .query_one("SELECT next_offset FROM kafka_offsets", &[])
+            .unwrap()
+            .get(0);
+        assert_eq!(stored, 10);
     }
 }
