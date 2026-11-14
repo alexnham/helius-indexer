@@ -26,6 +26,9 @@ tokio = { version = "1", features = ["rt", "time", "macros"] }
 tokio-stream = "0.1"
 tonic = { version = "0.14", features = ["tls-native-roots", "tls-ring"] }
 postgres = "0.19"
+tokio-postgres-rustls = { version = "0.14", default-features = false }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.8"
 
 [dev-dependencies]
 tempfile = "3"

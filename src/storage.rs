@@ -4,6 +4,7 @@ pub(crate) mod history;
 pub(crate) mod live;
 pub mod pg;
 pub(crate) mod repair;
+pub(crate) mod tls;
 use crate::{
     Error, Result,
     decoder::DECODER_VERSION,
