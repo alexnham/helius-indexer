@@ -120,3 +120,12 @@ provider errors, credentials, payloads, signatures, or URLs enter diagnostics.
 No exporter/backend is required and no telemetry queue grows with transaction
 count. Full stage histograms, continuously refreshed reference/replay gauges,
 backlog age, dashboards/alerts and independent completeness checks remain pending.
+
+## Replay-job contract prerequisite
+
+The [2026-11-13 source-contract review](research/2026-11-13-laserstream-replay-contract.md)
+defines the implementation boundary for issue #30. Normal recent backfill uses
+LaserStream historical replay. Filtered replay observations do not by themselves
+establish verified slot coverage; independent full-finalized-block evidence is
+needed for any range presented as complete. This research does not add job state
+or change the currently bounded live command.
