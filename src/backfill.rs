@@ -1,4 +1,5 @@
 //! Bounded finalized block ingestion. Coverage is a separate durable acknowledgment.
+use crate::storage::Database;
 use crate::{
     Error, Result, decoder,
     storage::{Store, history::HistoryLog},
@@ -7,7 +8,6 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
     io::Read,
-    path::{Path, PathBuf},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -254,7 +254,7 @@ impl Metrics {
 
 pub struct History {
     db: HistoryLog,
-    path: PathBuf,
+    database: Database,
     telemetry: crate::telemetry::Telemetry,
     revision_repair: bool,
     active_source: &'static str,
@@ -280,17 +280,17 @@ pub(crate) fn scope(mint: &str, start: u64, end: u64) -> Result<()> {
     Ok(())
 }
 impl History {
-    pub fn open(path: &Path) -> Result<Self> {
+    pub fn open(database: &Database) -> Result<Self> {
         // Initialize the shared transaction store before adding compatible, independent tables.
-        Store::open(path)?;
-        let db = HistoryLog::open(path)?;
+        Store::open(database)?;
+        let db = HistoryLog::open(database)?;
         let mut telemetry = crate::telemetry::Telemetry::default();
         telemetry.set_context("backfill", "rpc", "historical");
         Ok(Self {
             db,
             revision_repair: false,
             active_source: "finalized-mainnet-rpc",
-            path: path.to_path_buf(),
+            database: database.clone(),
             telemetry,
             gate: std::sync::Arc::new(crate::coordinator::WriteGate::default()),
         })
@@ -436,7 +436,7 @@ impl History {
         }
         let mut store = {
             let _permit = self.gate.historical()?;
-            Store::open(&self.path)?
+            Store::open(&self.database)?
         };
         for slot in start..=end {
             if cancelled() {

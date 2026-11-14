@@ -1,10 +1,10 @@
 //! Bounded offline revision repair. A repaired capture is not proof of full slot coverage.
+use crate::storage::Database;
 use crate::{
     Error, Result, backfill::MAX_SLOTS, decoder::DECODER_VERSION, storage::Store,
     telemetry::Telemetry,
 };
 use serde_json::{Value, json};
-use std::path::Path;
 
 fn scope(start: u64, end: u64) -> Result<()> {
     if start > end || end > i64::MAX as u64 || end - start >= MAX_SLOTS {
@@ -14,9 +14,9 @@ fn scope(start: u64, end: u64) -> Result<()> {
 }
 
 /// The completion flag concerns retained captures only; historical blocks must be reverified.
-pub fn status(path: &Path, start: u64, end: u64) -> Result<Value> {
+pub fn status(database: &Database, start: u64, end: u64) -> Result<Value> {
     scope(start, end)?;
-    let counts = Store::repair_counts(path, start, end)?;
+    let counts = Store::repair_counts(database, start, end)?;
     let (total, remaining, corrected, unresolved, oldest) = (
         counts.total,
         counts.remaining_other_revision,
@@ -49,7 +49,7 @@ pub fn status(path: &Path, start: u64, end: u64) -> Result<Value> {
 
 /// Each call schedules at most 100 captures, preferring those with fewer prior attempts.
 pub fn run(
-    path: &Path,
+    database: &Database,
     start: u64,
     end: u64,
     telemetry: &mut Telemetry,
@@ -57,8 +57,8 @@ pub fn run(
 ) -> Result<Value> {
     scope(start, end)?;
     telemetry.set_context("decoder_repair", "retained_capture", "repair");
-    let mut store = Store::open(path)?;
-    let selected = Store::repair_candidates(path, start, end, 100)?;
+    let mut store = Store::open(database)?;
+    let selected = Store::repair_candidates(database, start, end, 100)?;
     let (mut attempted, mut corrected, mut unresolved, mut replaced_rows, mut written_rows) =
         (0, 0, 0, 0, 0);
     let mut stopped = false;
@@ -90,7 +90,7 @@ pub fn run(
         );
     }
     telemetry.slot = None;
-    let progress = status(path, start, end)?;
+    let progress = status(database, start, end)?;
     telemetry.emit(
         "decoder_repair_batch_finished",
         "repair",
@@ -108,29 +108,29 @@ pub fn run(
 
 /// Reverify whole retained RPC blocks offline, including previously rejected candidates.
 pub fn history(
-    path: &Path,
+    database: &Database,
     telemetry: &mut Telemetry,
     mint: &str,
     start: u64,
     end: u64,
     cancelled: impl Fn() -> bool,
 ) -> Result<Value> {
-    history_from(path, telemetry, mint, start, end, cancelled, false)
+    history_from(database, telemetry, mint, start, end, cancelled, false)
 }
 
 /// Reverify normalized archive blocks without fetching CAR files or the network.
 pub fn archive_history(
-    path: &Path,
+    database: &Database,
     telemetry: &mut Telemetry,
     mint: &str,
     start: u64,
     end: u64,
     cancelled: impl Fn() -> bool,
 ) -> Result<Value> {
-    history_from(path, telemetry, mint, start, end, cancelled, true)
+    history_from(database, telemetry, mint, start, end, cancelled, true)
 }
 fn history_from(
-    path: &Path,
+    database: &Database,
     telemetry: &mut Telemetry,
     mint: &str,
     start: u64,
@@ -160,7 +160,7 @@ fn history_from(
             Err(Error("retained_block_unavailable"))
         }
     }
-    let mut history = crate::backfill::History::open(path)?;
+    let mut history = crate::backfill::History::open(database)?;
     history.enable_revision_repair(telemetry.run_id.clone());
     let run_id = history.run_id().to_owned();
     let (coverage, metrics) = history.run(mint, start, end, &mut NoNetwork(archive), cancelled)?;

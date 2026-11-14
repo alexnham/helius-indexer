@@ -2,12 +2,10 @@ use helius_indexer::{
     Error, Result,
     backfill::{BlockSource, History, MAX_SLOTS},
     decoder,
-    storage::Store,
+    storage::{Database, Store, pg::TestDatabase},
 };
-use rusqlite::Connection;
 use serde_json::{Value, json};
-use std::{cell::Cell, collections::BTreeMap, path::Path};
-use tempfile::TempDir;
+use std::{cell::Cell, collections::BTreeMap};
 
 struct Source {
     blocks: BTreeMap<u64, Vec<u8>>,
@@ -42,16 +40,13 @@ fn source(blocks: Vec<(u64, Vec<u8>)>) -> Source {
         calls: Vec::new(),
     }
 }
-fn db() -> (TempDir, std::path::PathBuf) {
-    let dir = TempDir::new().unwrap();
-    let path = dir.path().join("history.sqlite");
-    (dir, path)
+fn db() -> (TestDatabase, Database) {
+    let test = TestDatabase::new();
+    let database = test.0.clone();
+    (test, database)
 }
-fn sql(path: &Path, query: &str) {
-    Connection::open(path)
-        .unwrap()
-        .execute_batch(query)
-        .unwrap();
+fn sql(path: &Database, query: &str) {
+    path.test_client().batch_execute(query).unwrap();
 }
 
 #[test]
@@ -81,11 +76,11 @@ fn captured_input_and_historical_block_have_identical_queries_and_restart_is_a_n
     assert!(coverage.complete);
     assert_eq!(metrics.source_attempts, 0);
     assert_eq!(source.calls.len(), 1);
-    let db = Connection::open(&path).unwrap();
+    let mut db = path.test_client();
     assert_eq!(
-        db.query_row("SELECT COUNT(*) FROM historical_inputs", [], |r| r
-            .get::<_, i64>(0))
-            .unwrap(),
+        db.query_one("SELECT COUNT(*) FROM historical_inputs", &[])
+            .unwrap()
+            .get::<_, i64>(0),
         1
     );
 }
@@ -159,11 +154,10 @@ fn missing_metadata_null_blocks_and_rpc_skipped_errors_stay_retryable() {
     );
     assert!(Store::query(&path, None, 1000).unwrap().is_empty());
     assert_eq!(
-        Connection::open(&path)
+        path.test_client()
+            .query_one("SELECT COUNT(*) FROM historical_inputs", &[])
             .unwrap()
-            .query_row("SELECT COUNT(*) FROM historical_inputs", [], |r| r
-                .get::<_, i64>(0))
-            .unwrap(),
+            .get::<_, i64>(0),
         3
     );
 }
@@ -204,7 +198,7 @@ fn crash_at_coverage_ack_leaves_output_durable_and_restart_deduplicates() {
     History::open(&path).unwrap();
     sql(
         &path,
-        "CREATE TRIGGER fail_ack BEFORE UPDATE OF status ON historical_slots WHEN NEW.status='complete' BEGIN SELECT RAISE(ABORT,'injected'); END;",
+        "CREATE OR REPLACE FUNCTION fail() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RAISE EXCEPTION 'injected'; END$$; CREATE TRIGGER fail_ack BEFORE UPDATE OF status ON historical_slots FOR EACH ROW WHEN (NEW.status='complete') EXECUTE FUNCTION fail();",
     );
     let mut source = source(vec![(
         slot,
@@ -224,7 +218,7 @@ fn crash_at_coverage_ack_leaves_output_durable_and_restart_deduplicates() {
             .unwrap()
             .complete
     );
-    sql(&path, "DROP TRIGGER fail_ack;");
+    sql(&path, "DROP TRIGGER fail_ack ON historical_slots;");
     source.blocks.clear();
     let (coverage, metrics) = History::open(&path)
         .unwrap()
@@ -242,7 +236,7 @@ fn write_failure_cannot_advance_coverage_and_raw_is_retained() {
     History::open(&path).unwrap();
     sql(
         &path,
-        "CREATE TRIGGER fail_capture BEFORE INSERT ON captures BEGIN SELECT RAISE(ABORT,'injected'); END;",
+        "CREATE OR REPLACE FUNCTION fail() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RAISE EXCEPTION 'injected'; END$$; CREATE TRIGGER fail_capture BEFORE INSERT ON captures FOR EACH ROW EXECUTE FUNCTION fail();",
     );
     let mut source = source(vec![(
         slot,
@@ -256,14 +250,13 @@ fn write_failure_cannot_advance_coverage_and_raw_is_retained() {
     assert_eq!(metrics.write_errors, 1);
     assert!(Store::query(&path, None, 1000).unwrap().is_empty());
     assert_eq!(
-        Connection::open(&path)
+        path.test_client()
+            .query_one("SELECT COUNT(*) FROM historical_inputs", &[])
             .unwrap()
-            .query_row("SELECT COUNT(*) FROM historical_inputs", [], |r| r
-                .get::<_, i64>(0))
-            .unwrap(),
+            .get::<_, i64>(0),
         1
     );
-    sql(&path, "DROP TRIGGER fail_capture;");
+    sql(&path, "DROP TRIGGER fail_capture ON captures;");
     assert!(
         History::open(&path)
             .unwrap()
@@ -320,11 +313,10 @@ fn enriched_historical_metadata_repairs_an_unresolved_candidate() {
     );
     assert_eq!(Store::query(&path, None, 1000).unwrap().len(), 2);
     assert_eq!(
-        Connection::open(&path)
+        path.test_client()
+            .query_one("SELECT COUNT(*) FROM historical_inputs", &[])
             .unwrap()
-            .query_row("SELECT COUNT(*) FROM historical_inputs", [], |r| r
-                .get::<_, i64>(0))
-            .unwrap(),
+            .get::<_, i64>(0),
         2
     );
 }
@@ -336,7 +328,7 @@ fn raw_write_failure_never_decodes_or_acknowledges_output() {
     History::open(&path).unwrap();
     sql(
         &path,
-        "CREATE TRIGGER fail_raw BEFORE INSERT ON historical_inputs BEGIN SELECT RAISE(ABORT,'injected'); END;",
+        "CREATE OR REPLACE FUNCTION fail() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RAISE EXCEPTION 'injected'; END$$; CREATE TRIGGER fail_raw BEFORE INSERT ON historical_inputs FOR EACH ROW EXECUTE FUNCTION fail();",
     );
     let mut source = source(vec![(
         slot,
@@ -356,7 +348,7 @@ fn raw_write_failure_never_decodes_or_acknowledges_output() {
             .unwrap()
             .complete
     );
-    sql(&path, "DROP TRIGGER fail_raw;");
+    sql(&path, "DROP TRIGGER fail_raw ON historical_inputs;");
     assert!(
         History::open(&path)
             .unwrap()
@@ -417,18 +409,21 @@ fn recovery_transactions() -> Vec<Value> {
 #[test]
 #[ignore = "subprocess helper for process-exit recovery tests"]
 fn historical_process_exit_child() {
-    let path = std::env::var_os("INDEXER_TEST_RECOVERY_DB").unwrap();
-    let path = Path::new(&path);
+    let session = std::env::var("INDEXER_TEST_RECOVERY_DB").unwrap();
+    let path = &Database::new(TestDatabase::url(), &session).unwrap();
     let phase = std::env::var("INDEXER_TEST_RECOVERY_PHASE").unwrap();
     let slot = fixture()["result"]["slot"].as_u64().unwrap();
     let mut history = History::open(path).unwrap();
-    let db = Connection::open(path).unwrap();
+    let db = Cell::new(Some(path.test_client()));
     let mut source = source(vec![(slot, block(slot, slot - 1, recovery_transactions()))]);
     history
         .run(&mint(), slot, slot, &mut source, || {
-            let raw: i64 = db
-                .query_row("SELECT COUNT(*) FROM historical_inputs", [], |r| r.get(0))
-                .unwrap();
+            let mut client = db.take().unwrap();
+            let raw: i64 = client
+                .query_one("SELECT COUNT(*) FROM historical_inputs", &[])
+                .unwrap()
+                .get(0);
+            db.set(Some(client));
             let output = Store::query(path, None, 100).unwrap().len();
             if (phase == "after_raw" && raw > 0) || (phase == "after_output" && output > 0) {
                 std::process::exit(77);
@@ -447,7 +442,7 @@ fn historical_process_exit_restarts_from_retained_raw_without_advancing_a_gap() 
         let slot = fixture()["result"]["slot"].as_u64().unwrap();
         let status = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "historical_process_exit_child", "--ignored"])
-            .env("INDEXER_TEST_RECOVERY_DB", &path)
+            .env("INDEXER_TEST_RECOVERY_DB", path.session())
             .env("INDEXER_TEST_RECOVERY_PHASE", phase)
             .output()
             .unwrap()
@@ -469,12 +464,11 @@ fn historical_process_exit_restarts_from_retained_raw_without_advancing_a_gap() 
             Store::query(&path, None, 100).unwrap().len(),
             expected_before
         );
-        let conn = Connection::open(&path).unwrap();
+        let mut conn = path.test_client();
         let first: i64 = conn
-            .query_row("SELECT first_pending FROM historical_slots", [], |r| {
-                r.get(0)
-            })
-            .unwrap();
+            .query_one("SELECT first_pending FROM historical_slots", &[])
+            .unwrap()
+            .get(0);
         let mut unavailable = source(vec![]);
         let (coverage, metrics) = history
             .run(&mint(), slot, slot, &mut unavailable, || false)
@@ -499,9 +493,9 @@ fn historical_process_exit_restarts_from_retained_raw_without_advancing_a_gap() 
         actual.sort_by(|a, b| a.transfer_id.cmp(&b.transfer_id));
         assert_eq!(actual, expected);
         assert_eq!(
-            conn.query_row("SELECT first_pending FROM historical_slots", [], |r| r
-                .get::<_, i64>(0))
-                .unwrap(),
+            conn.query_one("SELECT first_pending FROM historical_slots", &[])
+                .unwrap()
+                .get::<_, i64>(0),
             first
         );
         let summary = Store::summary(&path, &mint()).unwrap();

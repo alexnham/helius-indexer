@@ -280,7 +280,8 @@ fn cached_car_source_replays_through_real_storage_and_both_source_orders() {
     let slot = value["result"]["slot"].as_u64().unwrap();
     for reverse in [false, true] {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("index.sqlite");
+        let path = crate::storage::pg::TestDatabase::new();
+        let path = &path.0;
         let cache = dir.path().join("archive");
         fs::create_dir(&cache).unwrap();
         put_cache(&cache, slot, &slot_range(&value, slot, slot - 1, 7, true));
@@ -296,7 +297,7 @@ fn cached_car_source_replays_through_real_storage_and_both_source_orders() {
         let rpc_raw=serde_json::to_vec(&json!({"jsonrpc":"2.0","id":1,"result":{"blockhash":bs58::encode([7;32]).into_string(),"previousBlockhash":bs58::encode([6;32]).into_string(),"parentSlot":slot-1,"blockTime":value["result"]["blockTime"],"transactions":[value["result"]]}})).unwrap();
         compare_blocks(&archive_raw, &rpc_raw, slot).unwrap();
         let mint = &crate::live::USDC;
-        let mut history = History::open(&path).unwrap();
+        let mut history = History::open(path).unwrap();
         let mut a = Observation {
             slot,
             raw: archive_raw,
@@ -338,16 +339,13 @@ fn cached_car_source_replays_through_real_storage_and_both_source_orders() {
         let expected =
             decoder::decode(&decoder::parse_capture(&serde_json::to_vec(&value).unwrap()).unwrap())
                 .unwrap();
-        assert_eq!(Store::query(&path, None, 1000).unwrap(), expected);
-        assert_eq!(Store::summary(&path, mint).unwrap()["transfer_count"], 2);
-        let db = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(Store::query(path, None, 1000).unwrap(), expected);
+        assert_eq!(Store::summary(path, mint).unwrap()["transfer_count"], 2);
+        let mut db = path.test_client();
         assert_eq!(
-            db.query_row(
-                "SELECT COUNT(DISTINCT source) FROM capture_inputs",
-                [],
-                |r| r.get::<_, i64>(0)
-            )
-            .unwrap(),
+            db.query_one("SELECT COUNT(DISTINCT source) FROM capture_inputs", &[])
+                .unwrap()
+                .get::<_, i64>(0),
             2
         );
     }
@@ -383,21 +381,18 @@ fn corrupt_truncated_or_incomplete_archives_cannot_prove_empty_coverage() {
 
 #[test]
 fn immutable_block_identity_rejects_conflicts_and_warms_existing_raw_inputs() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("index.sqlite");
-    let _history = History::open(&path).unwrap();
+    let path = crate::storage::pg::TestDatabase::new();
+    let path = &path.0;
+    let _history = History::open(path).unwrap();
     let slot = 12345u64;
     let block = json!({"blockhash":bs58::encode([7;32]).into_string(),"previousBlockhash":bs58::encode([6;32]).into_string(),"parentSlot":slot-1,"blockTime":100,"transactions":[{"transaction":{"signatures":[bs58::encode([8;64]).into_string()]}}]});
-    let db = rusqlite::Connection::open(&path).unwrap();
+    let mut db = path.test_client();
     db.execute(
-        "INSERT INTO historical_inputs VALUES('mint','old',?1,1,'finalized-mainnet-rpc',1,?2)",
-        rusqlite::params![
-            slot as i64,
-            serde_json::to_vec(&json!({"jsonrpc":"2.0","id":1,"result":block})).unwrap()
-        ],
+        "INSERT INTO historical_inputs(mint,decoder,slot,attempt,source_kind,received_at,produced_block,response) VALUES('mint','old',$1,1,'finalized-mainnet-rpc',1,true,$2)",
+        &[&(slot as i64), &(serde_json::to_vec(&json!({"jsonrpc":"2.0","id":1,"result":block})).unwrap())],
     )
     .unwrap();
-    let mut store = Store::open(&path).unwrap();
+    let mut store = Store::open(path).unwrap();
     let mut conflict = block.clone();
     conflict["blockhash"] = json!(bs58::encode([9; 32]).into_string());
     assert_eq!(
@@ -429,44 +424,41 @@ fn immutable_block_identity_rejects_conflicts_and_warms_existing_raw_inputs() {
         "block_identity_conflict"
     );
     assert_eq!(
-        db.query_row("SELECT COUNT(*) FROM transfers", [], |r| r.get::<_, i64>(0))
-            .unwrap(),
+        db.query_one("SELECT COUNT(*) FROM transfers", &[])
+            .unwrap()
+            .get::<_, i64>(0),
         0
     );
 }
 
 #[test]
 fn failed_legacy_identity_migration_cannot_be_bypassed_on_retry() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("index.sqlite");
-    let _history = History::open(&path).unwrap();
-    let db = rusqlite::Connection::open(&path).unwrap();
+    let path = crate::storage::pg::TestDatabase::new();
+    let path = &path.0;
+    let _history = History::open(path).unwrap();
+    let mut db = path.test_client();
     let block = json!({"blockhash":bs58::encode([7;32]).into_string(),"previousBlockhash":bs58::encode([6;32]).into_string(),"parentSlot":10,"blockTime":100,"transactions":[]});
-    for attempt in 1..=2 {
+    for attempt in 1..=2i64 {
         let mut prior = block.clone();
         if attempt == 2 {
             prior["blockhash"] = json!(bs58::encode([9; 32]).into_string());
         }
         db.execute(
-            "INSERT INTO historical_inputs VALUES('mint','old',11,?1,'finalized-mainnet-rpc',1,?2)",
-            rusqlite::params![
-                attempt,
-                serde_json::to_vec(&json!({"jsonrpc":"2.0","id":1,"result":prior})).unwrap()
-            ],
+            "INSERT INTO historical_inputs(mint,decoder,slot,attempt,source_kind,received_at,produced_block,response) VALUES('mint','old',11,$1,'finalized-mainnet-rpc',1,true,$2)",
+            &[&attempt, &(serde_json::to_vec(&json!({"jsonrpc":"2.0","id":1,"result":prior})).unwrap())],
         )
         .unwrap();
     }
-    let mut store = Store::open(&path).unwrap();
+    let mut store = Store::open(path).unwrap();
     for _ in 0..2 {
         assert_eq!(
             store.observe_block_identity(11, &block, &[]).unwrap_err().0,
             "block_identity_conflict"
         );
         assert_eq!(
-            db.query_row("SELECT COUNT(*) FROM historical_block_identity", [], |r| {
-                r.get::<_, i64>(0)
-            })
-            .unwrap(),
+            db.query_one("SELECT COUNT(*) FROM historical_block_identity", &[])
+                .unwrap()
+                .get::<_, i64>(0),
             0
         );
     }

@@ -1,4 +1,5 @@
 //! Bounded LaserStream intake. Filtered transaction delivery never proves slot coverage.
+use crate::storage::Database;
 use crate::{
     Error, Result, decoder,
     storage::{
@@ -10,10 +11,7 @@ use futures_util::StreamExt;
 use laserstream_core_proto::geyser::*;
 use prost::Message;
 use serde_json::{Value, json};
-use std::{
-    path::Path,
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 use tonic::{
     Request,
     transport::{ClientTlsConfig, Endpoint},
@@ -106,10 +104,10 @@ pub struct Intake {
     store: Store,
 }
 impl Intake {
-    pub fn open(path: &Path) -> Result<Self> {
-        let store = Store::open(path)?;
+    pub fn open(database: &Database) -> Result<Self> {
+        let store = Store::open(database)?;
         Ok(Self {
-            log: LiveLog::open(path)?,
+            log: LiveLog::open(database)?,
             store,
         })
     }
@@ -169,11 +167,9 @@ impl Intake {
             json!({"attempted":pending.len(),"decoded":success,"failed":pending.len()-success,"retry_cursor":pending.last().copied().unwrap_or(cursor),"run_id":telemetry.run_id,"coverage":"unknown"}),
         )
     }
-    pub fn report(path: &Path) -> Result<Value> {
+    pub fn report(database: &Database) -> Result<Value> {
         // Raw inputs by arrival time show flow during a cycle; attempts, not unique transfers.
-        let Some(snapshot) = LiveLog::snapshot(path, now() - RECENT_SECONDS)? else {
-            return Ok(json!({"state":"uninitialized","verified_boundary":null}));
-        };
+        let snapshot = LiveLog::snapshot(database, now() - RECENT_SECONDS)?;
         let runs: Vec<Value> = snapshot.runs.iter().map(|run| {
             let (from, reference, reference_at, first, replay_at) = (run.from_slot, run.reference_slot, run.reference_at, run.replay_first, run.replay_at);
             json!({"run":run.id,"from_slot":from,"state":run.state,
@@ -212,23 +208,23 @@ pub fn validate_options(from: u64, seconds: u64) -> Result<()> {
     Ok(())
 }
 pub fn run(
-    path: &Path,
+    database: &Database,
     from: u64,
     seconds: u64,
     telemetry: &mut crate::telemetry::Telemetry,
 ) -> Result<Value> {
-    run_mint(path, from, seconds, USDC, telemetry)
+    run_mint(database, from, seconds, USDC, telemetry)
 }
 
 pub fn run_mint(
-    path: &Path,
+    database: &Database,
     from: u64,
     seconds: u64,
     mint: &str,
     telemetry: &mut crate::telemetry::Telemetry,
 ) -> Result<Value> {
     run_mint_admitted(
-        path,
+        database,
         from,
         seconds,
         mint,
@@ -237,17 +233,17 @@ pub fn run_mint(
     )
 }
 pub fn run_admitted(
-    path: &Path,
+    database: &Database,
     from: u64,
     seconds: u64,
     telemetry: &mut crate::telemetry::Telemetry,
     gate: &crate::coordinator::WriteGate,
 ) -> Result<Value> {
-    run_mint_admitted(path, from, seconds, USDC, telemetry, gate)
+    run_mint_admitted(database, from, seconds, USDC, telemetry, gate)
 }
 
 pub fn run_mint_admitted(
-    path: &Path,
+    database: &Database,
     from: u64,
     seconds: u64,
     mint: &str,
@@ -264,7 +260,7 @@ pub fn run_mint_admitted(
         .map_err(|_| Error("invalid_live_credentials"))?;
     let mut intake = {
         let _permit = gate.live()?;
-        Intake::open(path)?
+        Intake::open(database)?
     };
     let run = {
         let _permit = gate.live()?;
@@ -423,7 +419,7 @@ pub fn run_mint_admitted(
     }
     event(telemetry, "shutdown", status);
     let elapsed = started.elapsed().as_secs_f64();
-    let report = json!({"status":status,"received":count,"unresolved_attempts":failures,"input_protobuf_bytes":bytes,"elapsed_seconds":elapsed,"reconnect_attempts":reconnects,"inserted_transfers":inserted,"input_transactions_per_second":count as f64/elapsed,"decoded_write_successes":output_successes,"coverage_valid":false,"verified_boundary":null,"freshness_seconds":null,"coverage":Intake::report(path)?});
+    let report = json!({"status":status,"received":count,"unresolved_attempts":failures,"input_protobuf_bytes":bytes,"elapsed_seconds":elapsed,"reconnect_attempts":reconnects,"inserted_transfers":inserted,"input_transactions_per_second":count as f64/elapsed,"decoded_write_successes":output_successes,"coverage_valid":false,"verified_boundary":null,"freshness_seconds":null,"coverage":Intake::report(database)?});
     diagnostic(
         telemetry,
         &json!({"event":"live_metrics","mode":"live","source_kind":"laserstream","indexer_transactions_total":count,"indexer_decode_failures_total":failures,"indexer_input_bytes_total":bytes,"indexer_reconnects_total":reconnects,"indexer_coverage_valid":0,"indexer_live_freshness_seconds":null,"indexer_live_slot_gap":null,
@@ -481,8 +477,8 @@ fn check_replay(from: u64, first: u64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::pg::TestDatabase;
     use laserstream_core_proto::solana::storage::confirmed_block as wire;
-    use rusqlite::Connection;
     fn update() -> SubscribeUpdateTransaction {
         let mut data = vec![12];
         data.extend(42u64.to_le_bytes());
@@ -519,8 +515,8 @@ mod tests {
     #[test]
     #[ignore = "subprocess helper for process-exit recovery tests"]
     fn process_exit_boundary_child() {
-        let path = std::env::var_os("INDEXER_TEST_RECOVERY_DB").unwrap();
-        let path = Path::new(&path);
+        let session = std::env::var("INDEXER_TEST_RECOVERY_DB").unwrap();
+        let path = &Database::new(TestDatabase::url(), &session).unwrap();
         let phase = std::env::var("INDEXER_TEST_RECOVERY_PHASE").unwrap();
         let mut intake = Intake::open(path).unwrap();
         let tx = update();
@@ -529,10 +525,9 @@ mod tests {
         }
         let id = intake.retain(&tx).unwrap();
         if phase == "after_retry_cursor" {
-            intake
-                .log
-                .sql()
-                .execute("INSERT INTO live_retry_cursor VALUES(1,?1)", [id])
+            path.connect()
+                .unwrap()
+                .execute("INSERT INTO live_retry_cursor VALUES(1,$1)", &[&id])
                 .unwrap();
             std::process::exit(77);
         }
@@ -567,31 +562,32 @@ mod tests {
             "after_ack",
             "after_retry_cursor",
         ] {
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("live.sqlite");
+            let test = TestDatabase::new();
+            let path = &test.0;
             let status = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
                     "live::tests::process_exit_boundary_child",
                     "--ignored",
                 ])
-                .env("INDEXER_TEST_RECOVERY_DB", &path)
+                .env("INDEXER_TEST_RECOVERY_DB", path.session())
                 .env("INDEXER_TEST_RECOVERY_PHASE", phase)
                 .output()
                 .unwrap()
                 .status;
             assert_eq!(status.code(), Some(77), "{phase}");
-            let before = Store::query(&path, Some(USDC), 100).unwrap();
+            let before = Store::query(path, Some(USDC), 100).unwrap();
             assert_eq!(
                 before.len(),
                 usize::from(matches!(phase, "after_output" | "after_ack"))
             );
-            let db = Connection::open(&path).unwrap();
+            let mut db = test.sql();
             let received: Option<i64> = db
-                .query_row("SELECT MIN(received_at) FROM live_raw", [], |r| r.get(0))
-                .unwrap();
+                .query_one("SELECT MIN(received_at) FROM live_raw", &[])
+                .unwrap()
+                .get(0);
             assert_eq!(received.is_some(), phase != "before_raw");
-            let report = Intake::report(&path).unwrap();
+            let report = Intake::report(path).unwrap();
             assert_eq!(
                 report["unresolved_items"],
                 usize::from(matches!(
@@ -600,86 +596,78 @@ mod tests {
                 ))
             );
             assert!(report["verified_boundary"].is_null());
-            let mut intake = Intake::open(&path).unwrap();
+            let mut intake = Intake::open(path).unwrap();
             intake.retry().unwrap();
             // Unacknowledged input before raw persistence must arrive again from a source.
             let tx = update();
             let id = intake.retain(&tx).unwrap();
             intake.process(id, &tx).unwrap();
-            assert_eq!(Store::summary(&path, USDC).unwrap()["transfer_count"], 1);
+            assert_eq!(Store::summary(path, USDC).unwrap()["transfer_count"], 1);
             assert_eq!(
-                Store::summary(&path, USDC).unwrap()["known_volume_raw"],
+                Store::summary(path, USDC).unwrap()["known_volume_raw"],
                 "42"
             );
-            assert_eq!(Intake::report(&path).unwrap()["unresolved_items"], 0);
+            assert_eq!(Intake::report(path).unwrap()["unresolved_items"], 0);
             if let Some(received) = received {
                 assert_eq!(
-                    db.query_row(
-                        "SELECT received_at FROM live_raw ORDER BY id LIMIT 1",
-                        [],
-                        |r| r.get::<_, i64>(0)
-                    )
-                    .unwrap(),
+                    db.query_one("SELECT received_at FROM live_raw ORDER BY id LIMIT 1", &[])
+                        .unwrap()
+                        .get::<_, i64>(0),
                     received
                 );
             }
-            assert!(Intake::report(&path).unwrap()["verified_boundary"].is_null());
+            assert!(Intake::report(path).unwrap()["verified_boundary"].is_null());
         }
     }
 
     #[test]
     fn unresolved_prefix_cannot_starve_later_retryable_input_after_restart() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("live.sqlite");
-        let mut intake = Intake::open(&path).unwrap();
+        let test = TestDatabase::new();
+        let path = &test.0;
+        let mut intake = Intake::open(path).unwrap();
         let mut unsupported = update();
         unsupported.transaction.as_mut().unwrap().meta = None;
         for _ in 0..100 {
             intake.retain(&unsupported).unwrap();
         }
         intake.retain(&update()).unwrap();
-        intake
-            .log
-            .sql()
-            .execute("UPDATE live_raw SET received_at=1", [])
+        test.sql()
+            .execute("UPDATE live_raw SET received_at=1", &[])
             .unwrap();
         assert_eq!(intake.retry().unwrap()["decoded"], 0);
         drop(intake);
-        let mut intake = Intake::open(&path).unwrap();
+        let mut intake = Intake::open(path).unwrap();
         assert_eq!(intake.retry().unwrap()["decoded"], 1);
-        assert_eq!(Store::summary(&path, USDC).unwrap()["transfer_count"], 1);
-        assert_eq!(Intake::report(&path).unwrap()["unresolved_items"], 100);
+        assert_eq!(Store::summary(path, USDC).unwrap()["transfer_count"], 1);
+        assert_eq!(Intake::report(path).unwrap()["unresolved_items"], 100);
         assert_eq!(
-            intake
-                .log
-                .sql()
-                .query_row("SELECT MIN(received_at) FROM live_raw", [], |r| r
-                    .get::<_, i64>(0))
-                .unwrap(),
+            test.sql()
+                .query_one("SELECT MIN(received_at) FROM live_raw", &[])
+                .unwrap()
+                .get::<_, i64>(0),
             1
         );
         drop(intake);
-        Connection::open(&path)
-            .unwrap()
-            .execute("DROP TABLE live_retry_cursor", [])
+        test.sql()
+            .execute("DELETE FROM live_retry_cursor", &[])
             .unwrap();
-        assert!(Intake::report(&path).unwrap()["retry_cursor"].is_null());
-        Intake::open(&path).unwrap();
-        assert_eq!(Store::summary(&path, USDC).unwrap()["transfer_count"], 1);
+        assert!(Intake::report(path).unwrap()["retry_cursor"].is_null());
+        Intake::open(path).unwrap();
+        assert_eq!(Store::summary(path, USDC).unwrap()["transfer_count"], 1);
     }
 
     #[test]
     fn broken_diagnostics_pipe_does_not_block_durable_retry() {
         use std::{io::Write, process::Stdio};
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("live.sqlite");
+        let test = TestDatabase::new();
+        let path = &test.0;
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
                 "live::tests::process_exit_boundary_child",
                 "--ignored",
             ])
-            .env("INDEXER_TEST_RECOVERY_DB", &path)
+            .env("INDEXER_TEST_RECOVERY_DB", path.session())
             .env("INDEXER_TEST_RECOVERY_PHASE", "broken_diagnostics")
             .stdin(Stdio::piped())
             .stderr(Stdio::piped())
@@ -689,8 +677,8 @@ mod tests {
         drop(child.stderr.take());
         child.stdin.take().unwrap().write_all(&[1]).unwrap();
         assert_eq!(child.wait().unwrap().code(), Some(77));
-        assert_eq!(Store::summary(&path, USDC).unwrap()["transfer_count"], 1);
-        assert_eq!(Intake::report(&path).unwrap()["unresolved_items"], 0);
+        assert_eq!(Store::summary(path, USDC).unwrap()["transfer_count"], 1);
+        assert_eq!(Intake::report(path).unwrap()["unresolved_items"], 0);
     }
 
     #[test]
@@ -750,86 +738,82 @@ mod tests {
     }
     #[test]
     fn durable_pending_restart_retry_duplicates_and_failed_metadata() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("live.sqlite");
+        let test = TestDatabase::new();
+        let path = &test.0;
         let tx = update();
-        let intake = Intake::open(&path).unwrap();
+        let intake = Intake::open(path).unwrap();
         let id = intake.retain(&tx).unwrap();
         drop(intake);
-        let mut intake = Intake::open(&path).unwrap();
+        let mut intake = Intake::open(path).unwrap();
         assert_eq!(intake.retry().unwrap()["decoded"], 1);
-        assert_eq!(Store::query(&path, Some(USDC), 100).unwrap().len(), 1);
+        assert_eq!(Store::query(path, Some(USDC), 100).unwrap().len(), 1);
         assert_eq!(intake.process(id, &tx).unwrap(), 0);
-        let report = Intake::report(&path).unwrap();
+        let report = Intake::report(path).unwrap();
         assert!(report["verified_boundary"].is_null());
         assert_eq!(report["unresolved_items"], 0);
         let mut broken = update();
         broken.transaction.as_mut().unwrap().meta = None;
         let id = intake.retain(&broken).unwrap();
         assert!(intake.process(id, &broken).is_err());
-        assert_eq!(Intake::report(&path).unwrap()["unresolved_items"], 1);
-        let wire: Vec<u8> = intake
-            .log
+        assert_eq!(Intake::report(path).unwrap()["unresolved_items"], 1);
+        let wire: Vec<u8> = test
             .sql()
-            .query_row(
-                "SELECT protobuf FROM live_raw WHERE id=?1 AND length(protobuf)<=16777216",
-                [id],
-                |r| r.get(0),
+            .query_one(
+                "SELECT protobuf FROM live_raw WHERE id=$1 AND octet_length(protobuf)<=16777216",
+                &[&id],
             )
-            .unwrap();
+            .unwrap()
+            .get(0);
         assert_eq!(
             SubscribeUpdateTransaction::decode(wire.as_slice()).unwrap(),
             broken
         );
-        intake
-            .log
-            .sql()
+        test.sql()
             .execute(
-                "UPDATE live_raw SET proto_schema='future-schema' WHERE id=?1",
-                [id],
+                "UPDATE live_raw SET proto_schema='future-schema' WHERE id=$1",
+                &[&id],
             )
             .unwrap();
         assert_eq!(
             intake.retry().unwrap_err().0,
             "unsupported_stored_proto_schema"
         );
-        assert_eq!(Store::query(&path, Some(USDC), 100).unwrap().len(), 1);
+        assert_eq!(Store::query(path, Some(USDC), 100).unwrap().len(), 1);
     }
     #[test]
     fn reports_preserve_the_stored_run_decoder_scope() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("live.sqlite");
-        let intake = Intake::open(&path).unwrap();
-        intake.log.sql().execute("INSERT INTO live_runs(from_slot,mint,decoder,status) VALUES(123,?1,'previous-decoder','time_limit')",[USDC]).unwrap();
-        let report = Intake::report(&path).unwrap();
+        let test = TestDatabase::new();
+        let path = &test.0;
+        let intake = Intake::open(path).unwrap();
+        drop(intake);
+        test.sql().execute("INSERT INTO live_runs(from_slot,mint,decoder,status) VALUES(123,$1,'previous-decoder','time_limit')",&[&USDC]).unwrap();
+        let report = Intake::report(path).unwrap();
         assert_eq!(report["runs"][0]["decoder_version"], "previous-decoder");
         assert_eq!(report["runs"][0]["mint"], USDC);
         assert!(report["runs"][0]["verified_boundary"].is_null());
     }
     #[test]
     fn failed_output_write_preserves_retryable_raw_without_transfers() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("live.sqlite");
-        let mut intake = Intake::open(&path).unwrap();
-        intake.log.sql().execute_batch("CREATE TRIGGER fail_transfers BEFORE INSERT ON transfers BEGIN SELECT RAISE(ABORT,'injected'); END;").unwrap();
+        let test = TestDatabase::new();
+        let path = &test.0;
+        let mut intake = Intake::open(path).unwrap();
+        test.sql().batch_execute("CREATE FUNCTION fail() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RAISE EXCEPTION 'injected'; END$$; CREATE TRIGGER fail_transfers BEFORE INSERT ON transfers FOR EACH ROW EXECUTE FUNCTION fail();").unwrap();
         let tx = update();
         let id = intake.retain(&tx).unwrap();
         assert!(intake.process(id, &tx).is_err());
-        assert!(Store::query(&path, None, 100).unwrap().is_empty());
-        assert_eq!(Intake::report(&path).unwrap()["unresolved_items"], 1);
-        let recent = &Intake::report(&path).unwrap()["recent"];
+        assert!(Store::query(path, None, 100).unwrap().is_empty());
+        assert_eq!(Intake::report(path).unwrap()["unresolved_items"], 1);
+        let recent = &Intake::report(path).unwrap()["recent"];
         assert_eq!(
             (recent["received"].as_i64(), recent["pending"].as_i64()),
             (Some(1), Some(1))
         );
-        intake
-            .log
-            .sql()
-            .execute_batch("DROP TRIGGER fail_transfers;")
+        test.sql()
+            .batch_execute("DROP TRIGGER fail_transfers ON transfers;")
             .unwrap();
         assert_eq!(intake.retry().unwrap()["decoded"], 1);
-        assert_eq!(Intake::report(&path).unwrap()["recent"]["decoded"], 1);
-        assert_eq!(Store::query(&path, None, 100).unwrap().len(), 1);
+        assert_eq!(Intake::report(path).unwrap()["recent"]["decoded"], 1);
+        assert_eq!(Store::query(path, None, 100).unwrap().len(), 1);
     }
     #[tokio::test(flavor = "current_thread")]
     async fn transport_end_failure_and_inactivity_are_distinct() {
@@ -886,7 +870,7 @@ mod tests {
     fn bounds_checked_before_environment_or_network() {
         assert_eq!(
             run(
-                Path::new("unused"),
+                &Database::new("postgres://unused@127.0.0.1/x", "unused").unwrap(),
                 1,
                 0,
                 &mut crate::telemetry::Telemetry::default()
@@ -897,7 +881,7 @@ mod tests {
         );
         assert_eq!(
             run(
-                Path::new("unused"),
+                &Database::new("postgres://unused@127.0.0.1/x", "unused").unwrap(),
                 1,
                 301,
                 &mut crate::telemetry::Telemetry::default()

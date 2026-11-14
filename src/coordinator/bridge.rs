@@ -1,5 +1,6 @@
 //! Frozen, measured source boundaries with bounded resumable work.
 use super::WriteGate;
+use crate::storage::Database;
 use crate::{
     Error, Result, archive,
     backfill::{BlockSource, History, Metrics, RpcSource},
@@ -77,14 +78,14 @@ fn save(db: &BridgeLog, plan: &Plan) -> Result<()> {
     )
 }
 fn prepare(
-    path: &Path,
+    database: &Database,
     cache: &Path,
     mint: &str,
     start: u64,
     telemetry: &mut Telemetry,
 ) -> Result<Plan> {
     crate::backfill::scope(mint, start, start)?;
-    let db = BridgeLog::open(path)?;
+    let db = BridgeLog::open(database)?;
     if let Some(plan) = load(&db, mint, start)? {
         return Ok(plan);
     }
@@ -226,18 +227,18 @@ fn report(db: &BridgeLog, plan: &Plan) -> Result<Value> {
     )
 }
 pub fn plan(
-    path: &Path,
+    database: &Database,
     cache: &Path,
     mint: &str,
     start: u64,
     telemetry: &mut Telemetry,
 ) -> Result<Value> {
-    let plan = prepare(path, cache, mint, start, telemetry)?;
-    report(&BridgeLog::open(path)?, &plan)
+    let plan = prepare(database, cache, mint, start, telemetry)?;
+    report(&BridgeLog::open(database)?, &plan)
 }
-pub fn status(path: &Path, mint: &str, start: u64) -> Result<Value> {
+pub fn status(database: &Database, mint: &str, start: u64) -> Result<Value> {
     crate::backfill::scope(mint, start, start)?;
-    let db = BridgeLog::open(path)?;
+    let db = BridgeLog::open(database)?;
     report(
         &db,
         &load(&db, mint, start)?.ok_or(Error("bridge_plan_missing"))?,
@@ -245,7 +246,7 @@ pub fn status(path: &Path, mint: &str, start: u64) -> Result<Value> {
 }
 
 fn batch<A: BlockSource, R: BlockSource>(
-    path: &Path,
+    database: &Database,
     plan: &Plan,
     archive: &mut A,
     rpc: &mut R,
@@ -253,9 +254,9 @@ fn batch<A: BlockSource, R: BlockSource>(
     telemetry: &mut Telemetry,
     cancelled: impl Fn() -> bool,
 ) -> Result<Value> {
-    let db = BridgeLog::open(path)?;
+    let db = BridgeLog::open(database)?;
     let before = progress(&db, plan)?;
-    let mut history = History::open(path)?;
+    let mut history = History::open(database)?;
     history.set_gate(Arc::clone(&gate));
     let mut attempts: Vec<Value> = vec![];
     if let Some(start) = before.next_pending_slot.filter(|_| !cancelled()) {
@@ -295,7 +296,7 @@ fn batch<A: BlockSource, R: BlockSource>(
     output["attempts"] = json!(attempts);
     output["cancelled"] = json!(cancelled());
     output["source_diagnostics"] = json!({"archive":archive.diagnostics(),"rpc":rpc.diagnostics()});
-    output["summary"] = crate::storage::Store::summary(path, &plan.mint)?;
+    output["summary"] = crate::storage::Store::summary(database, &plan.mint)?;
     output["batch_limits"] = json!({"unique_slots":BATCH_SLOTS,"archive_response_bytes":128*1024*1024,"archive_requests":32,"rpc_block_responses":9,"rpc_block_response_bytes_each":crate::backfill::MAX_BLOCK_BYTES,"request_seconds":20});
     telemetry.set_context("coordinator", "archive_rpc", "historical");
     let mut event = telemetry.event(
@@ -338,7 +339,7 @@ fn boundary<A: BlockSource, R: BlockSource>(
 }
 
 pub fn run(
-    path: &Path,
+    database: &Database,
     cache: &Path,
     mint: &str,
     start: u64,
@@ -352,7 +353,8 @@ pub fn run(
         crate::live::validate_options(start, seconds)?;
     }
     crate::backfill::scope(mint, start, start)?;
-    let plan = load(&BridgeLog::open(path)?, mint, start)?.ok_or(Error("bridge_plan_missing"))?;
+    let plan =
+        load(&BridgeLog::open(database)?, mint, start)?.ok_or(Error("bridge_plan_missing"))?;
     let job = |gate: Arc<WriteGate>| {
         let began = Instant::now();
         let cancel = std::env::var_os("BACKFILL_CANCEL_FILE");
@@ -372,7 +374,7 @@ pub fn run(
         )?;
         let mut context = Telemetry::default();
         batch(
-            path,
+            database,
             &plan,
             &mut archive,
             &mut rpc,
@@ -385,7 +387,7 @@ pub fn run(
         )
     };
     if let Some(seconds) = live_seconds {
-        super::run_with_job(path, plan.end, seconds, telemetry, job)
+        super::run_with_job(database, plan.end, seconds, telemetry, job)
     } else {
         job(Arc::new(WriteGate::default()))
     }

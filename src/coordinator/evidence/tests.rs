@@ -23,14 +23,14 @@ fn captured_truncation_is_recovered_without_acknowledging_native_rpc() {
         );
         let a = block(&case["archive"]);
         let b = block(&case["rpc"]);
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("evidence.sqlite");
-        let mut history = History::open(&path).unwrap();
+        let path = crate::storage::pg::TestDatabase::new();
+        let path = &path.0;
+        let mut history = History::open(path).unwrap();
         let outcome = ingest(&mut history, mint, slot, a.clone(), b.clone(), &|| false).unwrap();
         assert!(outcome.ready() && outcome.recovered && outcome.archive_complete);
         assert!(!outcome.rpc_complete);
         assert_eq!(outcome.repaired_transactions, 1);
-        let rows = Store::query(&path, None, 100).unwrap();
+        let rows = Store::query(path, None, 100).unwrap();
         assert_eq!(rows.len(), case["expected"].as_array().unwrap().len());
         for (row, edge) in rows.iter().zip(case["expected"].as_array().unwrap()) {
             let actual = serde_json::to_value(row).unwrap();
@@ -38,18 +38,18 @@ fn captured_truncation_is_recovered_without_acknowledging_native_rpc() {
                 assert_eq!(&actual[field], want, "{field}");
             }
         }
-        let db = rusqlite::Connection::open(&path).unwrap();
-        let native:String=db.query_row("SELECT status FROM historical_source_slots WHERE source_kind='finalized-mainnet-rpc'",[],|r|r.get(0)).unwrap();
+        let mut db = path.test_client();
+        let native:String=db.query_one("SELECT status FROM historical_source_slots WHERE source_kind='finalized-mainnet-rpc'", &[]).unwrap().get(0);
         assert_eq!(native, "unknown");
         assert_eq!(
-            db.query_row("SELECT COUNT(*) FROM historical_inputs", [], |r| r
-                .get::<_, i64>(0))
-                .unwrap(),
+            db.query_one("SELECT COUNT(*) FROM historical_inputs", &[])
+                .unwrap()
+                .get::<_, i64>(0),
             3
         );
-        let original:Vec<u8>=db.query_row("SELECT response FROM historical_inputs WHERE source_kind='finalized-mainnet-rpc' ORDER BY attempt DESC LIMIT 1",[],|r|r.get(0)).unwrap();
+        let original:Vec<u8>=db.query_one("SELECT response FROM historical_inputs WHERE source_kind='finalized-mainnet-rpc' ORDER BY attempt DESC LIMIT 1", &[]).unwrap().get(0);
         assert_eq!(original, b);
-        let raw:Vec<u8>=db.query_row("SELECT response FROM historical_inputs WHERE source_kind='archive-rpc-corroborated' ORDER BY attempt DESC LIMIT 1",[],|r|r.get(0)).unwrap();
+        let raw:Vec<u8>=db.query_one("SELECT response FROM historical_inputs WHERE source_kind='archive-rpc-corroborated' ORDER BY attempt DESC LIMIT 1", &[]).unwrap().get(0);
         let restored: Value = serde_json::from_slice(&raw).unwrap();
         assert_eq!(
             restored["evidence_provenance"]["archive_input_sha256"],
@@ -70,7 +70,7 @@ fn captured_truncation_is_recovered_without_acknowledging_native_rpc() {
         let count = rows.len();
         let again = ingest(&mut history, mint, slot, a, b, &|| false).unwrap();
         assert!(again.ready());
-        assert_eq!(Store::query(&path, None, 100).unwrap().len(), count);
+        assert_eq!(Store::query(path, None, 100).unwrap().len(), count);
     }
 }
 #[test]

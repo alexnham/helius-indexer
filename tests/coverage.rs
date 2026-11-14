@@ -7,9 +7,9 @@ use std::collections::BTreeMap;
 fn sampled_classic_usdc_edges_have_exact_amounts_and_positions() {
     let cases: Vec<Value> =
         serde_json::from_slice(include_bytes!("fixtures/mainnet-coverage.json")).unwrap();
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("index.sqlite");
-    let mut store = Store::open(&path).unwrap();
+    let path = helius_indexer::storage::pg::TestDatabase::new();
+    let path = &path.0;
+    let mut store = Store::open(path).unwrap();
     let mut volume = 0u128;
     let mut expected_count = 0;
     let mut found = 0;
@@ -48,7 +48,7 @@ fn sampled_classic_usdc_edges_have_exact_amounts_and_positions() {
     assert_eq!(expected_count, 97);
     println!("found={found}/{expected_count}; unresolved={failures:?}");
     assert_eq!(found, 97);
-    let summary = Store::summary(&path, USDC).unwrap();
+    let summary = Store::summary(path, USDC).unwrap();
     assert_eq!(summary["transfer_count"], 97);
     assert_eq!(summary["known_volume_raw"], volume.to_string());
     assert_eq!(summary["unknown_fee_count"], 0);

@@ -1,13 +1,10 @@
 use helius_indexer::{
     decoder::{self, SPL_TOKEN, TOKEN_2022},
     model::Transfer,
-    storage::Store,
+    storage::{Database, Store, pg::TestDatabase},
 };
 use serde_json::{Value, json};
-use std::{
-    path::Path,
-    process::{Command, Output},
-};
+use std::process::{Command, Output};
 use tempfile::TempDir;
 
 fn key(byte: u8) -> String {
@@ -43,7 +40,7 @@ fn decode(value: &Value) -> helius_indexer::Result<Vec<Transfer>> {
         &serde_json::to_vec(value).unwrap(),
     )?)
 }
-fn persist(db: &Path, value: &Value) -> helius_indexer::Result<usize> {
+fn persist(db: &Database, value: &Value) -> helius_indexer::Result<usize> {
     let raw = serde_json::to_vec(value).unwrap();
     let parsed = decoder::parse_capture(&raw)?;
     let decoded = decoder::decode(&parsed);
@@ -53,6 +50,7 @@ fn persist(db: &Path, value: &Value) -> helius_indexer::Result<usize> {
 }
 fn cli(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_helius-indexer"))
+        .env("DATABASE_URL", TestDatabase::url())
         .args(args)
         .output()
         .unwrap()
@@ -89,10 +87,10 @@ fn exact_u64_zero_self_checked_and_inner_positions_survive_queries() {
         format!("Program {SPL_TOKEN} invoke [1]"),
         format!("Program {SPL_TOKEN} success"),
     ]);
-    let dir = TempDir::new().unwrap();
-    let db = dir.path().join("test.sqlite");
-    assert_eq!(persist(&db, &value).unwrap(), 3);
-    let rows = Store::query(&db, None, 1000).unwrap();
+    let db = TestDatabase::new();
+    let db = &db.0;
+    assert_eq!(persist(db, &value).unwrap(), 3);
+    let rows = Store::query(db, None, 1000).unwrap();
     assert_eq!(
         rows.iter().map(|t| t.amount_raw).collect::<Vec<_>>(),
         [u64::MAX, 1, 0]
@@ -261,55 +259,54 @@ fn versioned_loaded_addresses_are_resolved_in_runtime_order() {
 
 #[test]
 fn replay_is_idempotent_and_conflicting_input_does_not_overwrite() {
-    let dir = TempDir::new().unwrap();
-    let db = dir.path().join("test.sqlite");
+    let db = TestDatabase::new();
+    let db = &db.0;
     let mut value = capture();
     let expected = decode(&value).unwrap();
-    assert_eq!(persist(&db, &value).unwrap(), 1);
+    assert_eq!(persist(db, &value).unwrap(), 1);
     value["source"] = json!("solana-mainnet-rpc");
-    assert_eq!(persist(&db, &value).unwrap(), 0);
-    assert_eq!(Store::query(&db, Some(&key(3)), 1000).unwrap(), expected);
-    assert!(Store::query(&db, Some(&key(8)), 1000).unwrap().is_empty());
+    assert_eq!(persist(db, &value).unwrap(), 0);
+    assert_eq!(Store::query(db, Some(&key(3)), 1000).unwrap(), expected);
+    assert!(Store::query(db, Some(&key(8)), 1000).unwrap().is_empty());
     value["result"]["transaction"]["message"]["instructions"][0] =
         instruction(3, 999, vec![1, 2, 4]);
-    assert_eq!(persist(&db, &value).unwrap_err().0, "capture_conflict");
-    assert_eq!(Store::query(&db, None, 1000).unwrap(), expected);
+    assert_eq!(persist(db, &value).unwrap_err().0, "capture_conflict");
+    assert_eq!(Store::query(db, None, 1000).unwrap(), expected);
 }
 
 #[test]
 fn failed_decode_is_retained_without_partial_transfers() {
-    let dir = TempDir::new().unwrap();
-    let db = dir.path().join("test.sqlite");
+    let db = TestDatabase::new();
+    let db = &db.0;
     let mut value = capture();
     value["result"]["transaction"]["message"]["instructions"]
         .as_array_mut()
         .unwrap()
         .push(instruction(255, 1, vec![1, 2, 4]));
-    assert!(persist(&db, &value).is_err());
-    assert!(Store::query(&db, None, 1000).unwrap().is_empty());
-    let conn = rusqlite::Connection::open(db).unwrap();
-    let (raw, status): (Vec<u8>, String) = conn
-        .query_row("SELECT capture_json,status FROM captures", [], |r| {
-            Ok((r.get(0)?, r.get(1)?))
-        })
+    assert!(persist(db, &value).is_err());
+    assert!(Store::query(db, None, 1000).unwrap().is_empty());
+    let mut conn = db.test_client();
+    let row = conn
+        .query_one("SELECT capture_json,status FROM captures", &[])
         .unwrap();
+    let (raw, status): (Vec<u8>, String) = (row.get(0), row.get(1));
     assert_eq!(serde_json::from_slice::<Value>(&raw).unwrap(), value);
     assert_eq!(status, "unsupported_token_instruction");
 }
 
 #[test]
 fn storage_failure_rolls_back_raw_and_all_transfers() {
-    let dir = TempDir::new().unwrap();
-    let db = dir.path().join("test.sqlite");
-    drop(Store::open(&db).unwrap());
-    let conn = rusqlite::Connection::open(&db).unwrap();
-    conn.execute_batch("CREATE TRIGGER fail_write BEFORE INSERT ON transfers BEGIN SELECT RAISE(ABORT,'test failure'); END;").unwrap();
-    assert!(persist(&db, &capture()).is_err());
+    let db = TestDatabase::new();
+    let db = &db.0;
+    drop(Store::open(db).unwrap());
+    let mut conn = db.test_client();
+    conn.batch_execute("CREATE FUNCTION fail() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RAISE EXCEPTION 'test failure'; END$$; CREATE TRIGGER fail_write BEFORE INSERT ON transfers FOR EACH ROW EXECUTE FUNCTION fail();").unwrap();
+    assert!(persist(db, &capture()).is_err());
     for table in ["captures", "transfers"] {
         assert_eq!(
-            conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r
-                .get::<_, u32>(0))
-                .unwrap(),
+            conn.query_one(&format!("SELECT COUNT(*) FROM {table}"), &[])
+                .unwrap()
+                .get::<_, i64>(0),
             0
         );
     }
@@ -318,13 +315,14 @@ fn storage_failure_rolls_back_raw_and_all_transfers() {
 #[test]
 fn cli_process_restart_metrics_replay_and_redaction() {
     let dir = TempDir::new().unwrap();
-    let db = dir.path().join("index.sqlite");
+    let db = TestDatabase::new();
+    let db = &db.0;
     let fixture = dir.path().join("capture.json");
     let metrics = dir.path().join("metrics.prom");
     std::fs::write(&fixture, serde_json::to_vec(&capture()).unwrap()).unwrap();
     let args = [
         "ingest",
-        db.to_str().unwrap(),
+        db.session(),
         fixture.to_str().unwrap(),
         "--metrics",
         metrics.to_str().unwrap(),
@@ -338,7 +336,7 @@ fn cli_process_restart_metrics_replay_and_redaction() {
     let result: Value = serde_json::from_slice(&ingest.stdout).unwrap();
     assert_eq!(result["inserted"], 1);
     assert_eq!(result["coverage"], "unknown");
-    let query = cli(&["query", db.to_str().unwrap()]);
+    let query = cli(&["query", db.session()]);
     assert!(query.status.success());
     let rows: Value = serde_json::from_slice(&query.stdout).unwrap();
     assert_eq!(rows["transfers"][0]["amount_raw"], "42");
@@ -363,24 +361,27 @@ fn cli_process_restart_metrics_replay_and_redaction() {
     let mut invalid = capture();
     invalid["source"] = json!("https://example.invalid?api-key=private-secret");
     std::fs::write(&fixture, serde_json::to_vec(&invalid).unwrap()).unwrap();
-    let bad = cli(&["ingest", db.to_str().unwrap(), fixture.to_str().unwrap()]);
+    let bad = cli(&["ingest", db.session(), fixture.to_str().unwrap()]);
     assert!(!bad.status.success());
     assert!(!String::from_utf8_lossy(&bad.stderr).contains("private-secret"));
     assert!(!String::from_utf8_lossy(&bad.stderr).contains("example.invalid"));
-    assert_eq!(Store::query(&db, None, 1000).unwrap().len(), 1);
+    assert_eq!(Store::query(db, None, 1000).unwrap().len(), 1);
 }
 
 #[test]
 fn telemetry_export_failure_cannot_overwrite_database_or_capture() {
     let dir = TempDir::new().unwrap();
-    let db = dir.path().join("index.sqlite");
+    let db = TestDatabase::new();
+    let db = &db.0;
     let input = dir.path().join("capture.json");
     let bytes = serde_json::to_vec(&capture()).unwrap();
     std::fs::write(&input, &bytes).unwrap();
-    for destination in [&input, &db] {
+    // A database is no longer a file, so the input is the only overwrite target.
+    {
+        let destination = &input;
         let output = cli(&[
             "ingest",
-            db.to_str().unwrap(),
+            db.session(),
             input.to_str().unwrap(),
             "--metrics",
             destination.to_str().unwrap(),
@@ -388,26 +389,32 @@ fn telemetry_export_failure_cannot_overwrite_database_or_capture() {
         assert!(output.status.success());
         assert!(String::from_utf8_lossy(&output.stderr).contains("metrics_export_failed"));
         assert_eq!(std::fs::read(&input).unwrap(), bytes);
-        assert_eq!(Store::query(&db, None, 1000).unwrap().len(), 1);
+        assert_eq!(Store::query(db, None, 1000).unwrap().len(), 1);
     }
 }
 
 #[test]
 fn malformed_input_and_decode_errors_export_sanitized_failure_metrics() {
     let dir = TempDir::new().unwrap();
-    let db = dir.path().join("index.sqlite");
+    let db = TestDatabase::new();
+    let db = &db.0;
     let input = dir.path().join("capture.json");
     let metrics = dir.path().join("bad.prom");
     std::fs::write(&input, b"not-json-private-secret").unwrap();
     let malformed = cli(&[
         "ingest",
-        db.to_str().unwrap(),
+        db.session(),
         input.to_str().unwrap(),
         "--metrics",
         metrics.to_str().unwrap(),
     ]);
     assert!(!malformed.status.success());
-    assert!(!db.exists());
+    let schema_created: bool = postgres::Client::connect(&TestDatabase::url(), postgres::NoTls)
+        .unwrap()
+        .query_one("SELECT to_regnamespace($1) IS NOT NULL", &[&db.session()])
+        .unwrap()
+        .get(0);
+    assert!(!schema_created);
     assert!(!String::from_utf8_lossy(&malformed.stderr).contains("private-secret"));
     let text = std::fs::read_to_string(metrics).unwrap();
     assert!(text.contains("stage=\"input\",outcome=\"rejected\""));
@@ -419,7 +426,7 @@ fn malformed_input_and_decode_errors_export_sanitized_failure_metrics() {
     let metrics = dir.path().join("decode.prom");
     let failed = cli(&[
         "ingest",
-        db.to_str().unwrap(),
+        db.session(),
         input.to_str().unwrap(),
         "--metrics",
         metrics.to_str().unwrap(),
@@ -431,7 +438,7 @@ fn malformed_input_and_decode_errors_export_sanitized_failure_metrics() {
     );
     assert!(text.contains("stage=\"decode\",outcome=\"failed\""));
     assert!(text.contains("stage=\"storage\",outcome=\"success\""));
-    assert!(Store::query(&db, None, 1000).unwrap().is_empty());
+    assert!(Store::query(db, None, 1000).unwrap().is_empty());
     let oversized = vec![b' '; decoder::MAX_CAPTURE_BYTES + 1];
     assert_eq!(
         decoder::parse_capture(&oversized).unwrap_err().0,
@@ -443,18 +450,20 @@ fn malformed_input_and_decode_errors_export_sanitized_failure_metrics() {
 fn unavailable_stderr_does_not_abort_ingestion() {
     use std::process::Stdio;
     let dir = TempDir::new().unwrap();
-    let db = dir.path().join("index.sqlite");
+    let db = TestDatabase::new();
+    let db = &db.0;
     let input = dir.path().join("capture.json");
     std::fs::write(&input, serde_json::to_vec(&capture()).unwrap()).unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_helius-indexer"))
-        .args(["ingest", db.to_str().unwrap(), input.to_str().unwrap()])
+        .env("DATABASE_URL", TestDatabase::url())
+        .args(["ingest", db.session(), input.to_str().unwrap()])
         .stderr(Stdio::piped())
         .stdout(Stdio::null())
         .spawn()
         .unwrap();
     drop(child.stderr.take());
     assert!(child.wait().unwrap().success());
-    assert_eq!(Store::query(&db, None, 1000).unwrap().len(), 1);
+    assert_eq!(Store::query(db, None, 1000).unwrap().len(), 1);
 }
 
 #[test]
@@ -491,14 +500,21 @@ fn every_failure_event_keeps_context_even_when_decode_and_storage_fail() {
     value["result"]["transaction"]["message"]["instructions"][0] =
         instruction(255, 1, vec![1, 2, 4]);
     std::fs::write(&input, serde_json::to_vec(&value).unwrap()).unwrap();
-    // A directory cannot be opened as a SQLite database or as a new metrics file.
-    let result = cli(&[
-        "ingest",
-        dir.path().to_str().unwrap(),
-        input.to_str().unwrap(),
-        "--metrics",
-        dir.path().to_str().unwrap(),
-    ]);
+    // Nothing listens on port 1, and a directory cannot be opened as a new metrics file.
+    let result = Command::new(env!("CARGO_BIN_EXE_helius-indexer"))
+        .env(
+            "DATABASE_URL",
+            "postgres://indexer:unused@127.0.0.1:1/indexer",
+        )
+        .args([
+            "ingest",
+            "unreachable",
+            input.to_str().unwrap(),
+            "--metrics",
+            dir.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
     assert!(!result.status.success());
     let events: Vec<Value> = String::from_utf8(result.stderr)
         .unwrap()
@@ -564,11 +580,11 @@ fn token_2022_fee_evidence_survives_persistence_exactly() {
             format!("Program {TOKEN_2022} success"),
             format!("Program {TOKEN_2022} success")
         ]);
-        let dir = TempDir::new().unwrap();
-        let db = dir.path().join("fee.sqlite");
-        assert_eq!(persist(&db, &value).unwrap(), 2);
-        assert_eq!(persist(&db, &value).unwrap(), 0);
-        let rows = Store::query(&db, None, 1000).unwrap();
+        let db = TestDatabase::new();
+        let db = &db.0;
+        assert_eq!(persist(db, &value).unwrap(), 2);
+        assert_eq!(persist(db, &value).unwrap(), 0);
+        let rows = Store::query(db, None, 1000).unwrap();
         assert_eq!(rows.len(), 2);
         for row in &rows {
             assert_eq!(row.amount_raw, amount);
@@ -588,23 +604,22 @@ fn token_2022_fee_evidence_survives_persistence_exactly() {
 
 #[test]
 fn unknown_fee_preserves_transfer_and_zero_remains_known() {
-    let dir = TempDir::new().unwrap();
-    let db = dir.path().join("unknown.sqlite");
+    let db = TestDatabase::new();
+    let db = &db.0;
     let value = token_2022_capture(100, None);
-    assert_eq!(persist(&db, &value).unwrap(), 1);
-    let rows = Store::query(&db, None, 1000).unwrap();
+    assert_eq!(persist(db, &value).unwrap(), 1);
+    let rows = Store::query(db, None, 1000).unwrap();
     assert_eq!(rows[0].amount_raw, 100);
     assert_eq!(rows[0].fee_raw, None);
-    let summary = Store::summary(&db, &rows[0].mint).unwrap();
+    let summary = Store::summary(db, &rows[0].mint).unwrap();
     assert_eq!(summary["known_volume_raw"], "100");
     assert_eq!(summary["known_fees_raw"], "0");
     assert_eq!(summary["unknown_fee_count"], 1);
-    let conn = rusqlite::Connection::open(&db).unwrap();
-    let (status, raw): (String, Vec<u8>) = conn
-        .query_row("SELECT status,capture_json FROM captures", [], |r| {
-            Ok((r.get(0)?, r.get(1)?))
-        })
+    let mut conn = db.test_client();
+    let row = conn
+        .query_one("SELECT status,capture_json FROM captures", &[])
         .unwrap();
+    let (status, raw): (String, Vec<u8>) = (row.get(0), row.get(1));
     assert_eq!(status, "decoded");
     assert_eq!(serde_json::from_slice::<Value>(&raw).unwrap(), value);
     assert_eq!(
@@ -650,19 +665,20 @@ fn token_2022_caught_parent_failure_and_metrics_are_bounded() {
         "unsupported_caught_token_failure"
     );
     let dir = TempDir::new().unwrap();
-    let db = dir.path().join("failed.sqlite");
+    let db = TestDatabase::new();
+    let db = &db.0;
     let input = dir.path().join("input.json");
     let metrics = dir.path().join("metrics.prom");
     std::fs::write(&input, serde_json::to_vec(&value).unwrap()).unwrap();
     let result = cli(&[
         "ingest",
-        db.to_str().unwrap(),
+        db.session(),
         input.to_str().unwrap(),
         "--metrics",
         metrics.to_str().unwrap(),
     ]);
     assert!(!result.status.success());
-    assert!(Store::query(&db, None, 1000).unwrap().is_empty());
+    assert!(Store::query(db, None, 1000).unwrap().is_empty());
     let text = std::fs::read_to_string(metrics).unwrap();
     assert!(text.contains("failure_class=\"invalid_or_unsupported\""));
     assert!(!text.contains(TOKEN_2022));
@@ -864,68 +880,69 @@ fn withheld_withdrawals_are_not_ordinary_edges_or_evidence_of_transfer_fees() {
 
 #[test]
 fn recent_query_limits_after_ordering_and_preserves_exact_values() {
-    let directory = TempDir::new().unwrap();
-    let path = directory.path().join("recent.sqlite");
+    let path = TestDatabase::new();
+    let path = &path.0;
     let cases: Vec<Value> =
         serde_json::from_slice(include_bytes!("fixtures/mainnet-coverage.json")).unwrap();
-    let mut store = Store::open(&path).unwrap();
+    let mut store = Store::open(path).unwrap();
     for case in cases.iter().take(8) {
         let raw = serde_json::to_vec(&case["capture"]).unwrap();
         let capture = decoder::parse_capture(&raw).unwrap();
         let decoded = decoder::decode(&capture);
         store.persist(&capture, &raw, &decoded).unwrap();
     }
-    let mut ascending = Store::query(&path, None, 1000).unwrap();
+    let mut ascending = Store::query(path, None, 1000).unwrap();
     assert!(ascending.len() > 3);
     ascending.reverse();
-    let recent = Store::query_recent(&path, None, 3).unwrap();
+    let recent = Store::query_recent(path, None, 3).unwrap();
     assert_eq!(
         serde_json::to_value(&recent).unwrap(),
         serde_json::to_value(&ascending[..3]).unwrap()
     );
     let mint = recent[0].mint.clone();
     assert!(
-        Store::query_recent(&path, Some(&mint), 3)
+        Store::query_recent(path, Some(&mint), 3)
             .unwrap()
             .iter()
             .all(|row| row.mint == mint)
     );
-    assert!(Store::query_recent(&path, None, 1001).is_err());
+    assert!(Store::query_recent(path, None, 1001).is_err());
 }
 
 #[test]
 fn monitor_rejects_invalid_scope_before_network_access() {
-    let dir = TempDir::new().unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_helius-indexer"))
-        .args([
-            "monitor",
-            dir.path().join("invalid.sqlite").to_str().unwrap(),
-            "invalid-mint",
-            "10",
-            "1",
-            "4",
-            "60",
-        ])
-        .env("INDEXER_LIVE_OPT_IN", "0")
-        .env_remove("HELIUS_API_KEY")
-        .output()
-        .unwrap();
+    let db = TestDatabase::new();
+    let db = &db.0;
+    let output = cli(&[
+        "monitor",
+        db.session(),
+        "invalid-mint",
+        "10",
+        "1",
+        "4",
+        "60",
+    ]);
     assert!(!output.status.success());
     assert!(
         String::from_utf8(output.stderr)
             .unwrap()
             .contains("invalid_mint")
     );
-    assert!(!dir.path().join("invalid.sqlite").exists());
+    let schema_created: bool = postgres::Client::connect(&TestDatabase::url(), postgres::NoTls)
+        .unwrap()
+        .query_one("SELECT to_regnamespace($1) IS NOT NULL", &[&db.session()])
+        .unwrap()
+        .get(0);
+    assert!(!schema_created);
 }
 
 #[test]
 fn prune_keeps_newest_transfers_and_marks_older_slots_unknown() {
-    let directory = TempDir::new().unwrap();
-    let path = directory.path().join("prune.sqlite");
+    let path = TestDatabase::new();
+    let path = &path.0;
     let cases: Vec<Value> =
         serde_json::from_slice(include_bytes!("fixtures/mainnet-coverage.json")).unwrap();
-    let mut store = Store::open(&path).unwrap();
+    let mut store = Store::open(path).unwrap();
     for case in cases.iter().take(8) {
         let raw = serde_json::to_vec(&case["capture"]).unwrap();
         let capture = decoder::parse_capture(&raw).unwrap();
@@ -933,17 +950,21 @@ fn prune_keeps_newest_transfers_and_marks_older_slots_unknown() {
         store.persist(&capture, &raw, &decoded).unwrap();
     }
     drop(store);
-    let newest = Store::query_recent(&path, None, 3).unwrap();
-    let before = Store::query(&path, None, 1000).unwrap().len();
+    let newest = Store::query_recent(path, None, 3).unwrap();
+    let before = Store::query(path, None, 1000).unwrap().len();
     assert!(before > 3);
     let boundary = newest.iter().map(|row| row.slot).min().unwrap();
-    let history = helius_indexer::backfill::History::open(&path).unwrap();
-    let db = rusqlite::Connection::open(&path).unwrap();
-    db.execute("INSERT INTO historical_slots(mint,decoder,slot,status,first_pending) VALUES(?1,?2,?3,'complete',1)",
-        rusqlite::params![newest[0].mint,decoder::DECODER_VERSION,boundary as i64]).unwrap();
+    let history = helius_indexer::backfill::History::open(path).unwrap();
+    let mut db = path.test_client();
+    db.execute("INSERT INTO historical_slots(mint,decoder,slot,status,first_pending) VALUES($1,$2,$3,'complete',1)",
+        &[&newest[0].mint,&decoder::DECODER_VERSION,&(boundary as i64)]).unwrap();
     db.execute(
-        "INSERT INTO historical_source_slots VALUES(?1,?2,?3,'finalized-mainnet-rpc','complete')",
-        rusqlite::params![newest[0].mint, decoder::DECODER_VERSION, boundary as i64],
+        "INSERT INTO historical_source_slots VALUES($1,$2,$3,'finalized-mainnet-rpc','complete')",
+        &[
+            &newest[0].mint,
+            &decoder::DECODER_VERSION,
+            &(boundary as i64),
+        ],
     )
     .unwrap();
     assert!(
@@ -952,17 +973,18 @@ fn prune_keeps_newest_transfers_and_marks_older_slots_unknown() {
             .unwrap()
             .complete
     );
-    db.execute_batch("CREATE TRIGGER fail_prune BEFORE DELETE ON historical_slots BEGIN SELECT RAISE(ABORT,'injected'); END;").unwrap();
-    assert!(Store::prune(&path, 3).is_err());
-    assert_eq!(Store::query(&path, None, 1000).unwrap().len(), before);
+    db.batch_execute("CREATE FUNCTION fail() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RAISE EXCEPTION 'injected'; END$$; CREATE TRIGGER fail_prune BEFORE DELETE ON historical_slots FOR EACH ROW EXECUTE FUNCTION fail();").unwrap();
+    assert!(Store::prune(path, 3).is_err());
+    assert_eq!(Store::query(path, None, 1000).unwrap().len(), before);
     assert!(
         history
             .coverage(&newest[0].mint, boundary, boundary)
             .unwrap()
             .complete
     );
-    db.execute_batch("DROP TRIGGER fail_prune").unwrap();
-    let report = Store::prune(&path, 3).unwrap();
+    db.batch_execute("DROP TRIGGER fail_prune ON historical_slots")
+        .unwrap();
+    let report = Store::prune(path, 3).unwrap();
     assert!(
         !history
             .coverage(&newest[0].mint, boundary, boundary)
@@ -971,29 +993,25 @@ fn prune_keeps_newest_transfers_and_marks_older_slots_unknown() {
         "a partially retained slot must lose its completion evidence"
     );
     let proofs: i64 = db
-        .query_row(
-            "SELECT COUNT(*) FROM historical_source_slots WHERE slot=?1",
-            [boundary as i64],
-            |r| r.get(0),
+        .query_one(
+            "SELECT COUNT(*) FROM historical_source_slots WHERE slot=$1",
+            &[&(boundary as i64)],
         )
-        .unwrap();
+        .unwrap()
+        .get(0);
     assert_eq!(proofs, 0);
     assert_eq!(report["removed_transfers"], before - 3);
     assert_eq!(
-        serde_json::to_value(Store::query_recent(&path, None, 1000).unwrap()).unwrap(),
+        serde_json::to_value(Store::query_recent(path, None, 1000).unwrap()).unwrap(),
         serde_json::to_value(&newest).unwrap()
     );
     let cutoff = report["oldest_retained_slot"].as_i64().unwrap();
-    let db = rusqlite::Connection::open(&path).unwrap();
     let older: i64 = db
-        .query_row(
-            "SELECT COUNT(*) FROM captures WHERE json_extract(result_json,'$.slot') < ?1",
-            [cutoff],
-            |r| r.get(0),
-        )
-        .unwrap();
+        .query_one("SELECT COUNT(*) FROM captures WHERE slot < $1", &[&cutoff])
+        .unwrap()
+        .get(0);
     assert_eq!(older, 0);
     // Idempotent once within the limit.
-    assert_eq!(Store::prune(&path, 3).unwrap()["removed_transfers"], 0);
-    assert!(Store::prune(&path, 0).is_err());
+    assert_eq!(Store::prune(path, 3).unwrap()["removed_transfers"], 0);
+    assert!(Store::prune(path, 0).is_err());
 }
