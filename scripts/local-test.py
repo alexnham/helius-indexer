@@ -126,7 +126,7 @@ def persistent_session(path, binary):
 
 def readiness(session):
     metadata = json.loads((session / "session.json").read_text())
-    command(session, "summary", metadata["database"], USDC, timeout=5)
+    command(session, "health", metadata["database"], timeout=3)
     return {"status": "ready", "mode": metadata.get("mode", "captured data"), "coverage": "unknown"}
 
 
