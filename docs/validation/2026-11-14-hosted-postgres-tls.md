@@ -60,6 +60,9 @@ trips whatever its size. Statements are prepared once per connection, and the
 input payload is copied inside PostgreSQL instead of being uploaded twice. At 100
 items the remaining time is mostly uploading about 1.1 MB over this laptop's
 connection. That is an environment limit: a writer near the database would see the
-round-trip cost only. This is inference from the measurements, not measured. USDC
-needs about 80 transactions/s, so from this link it takes two parallel writers (#36
-consumer group) or a writer co-located with the database.
+round-trip cost only. This is inference from the measurements, not measured.
+
+**45 transactions/s per writer is below the measured ~80 transactions/s of USDC.**
+Hosted live USDC is not yet sustainable from this link with one writer: it needs
+parallel writers (#36 consumer group), larger batches, or a writer co-located with
+the database. Until then, a single hosted writer falls behind during sustained load.

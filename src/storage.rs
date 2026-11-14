@@ -214,7 +214,10 @@ impl Store {
                         ids: &[],
                         failed: a.failed,
                     };
-                    let _ = self.write_batch(&[], Some(&empty));
+                    if self.write_batch(&[], Some(&empty)).is_err() {
+                        // Those inputs stay pending and retryable; the failure is still counted.
+                        self.stats.failed_writes += 1;
+                    }
                 }
                 results
             }
