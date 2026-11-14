@@ -34,10 +34,10 @@ pub(crate) fn migrate(db: &mut Client, migrations: &[(i32, &str)]) -> Result<i32
         .transaction()
         .map_err(|_| Error("storage_migration_failed"))?;
     // The lock serializes migrators before the table exists; it is released at commit or rollback.
-    tx.batch_execute(
-        "SELECT pg_advisory_xact_lock(7311946001);
-        CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now());",
-    )
+    tx.batch_execute(&format!(
+        "SELECT pg_advisory_xact_lock({MIGRATION_LOCK});
+        CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now());"
+    ))
     .map_err(|_| Error("storage_migration_failed"))?;
     let current: i32 = tx
         .query_one(
@@ -399,6 +399,30 @@ mod tests {
                 .unwrap()
                 .get(0);
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn concurrent_first_connections_to_a_new_session_all_migrate() {
+        let test = TestDatabase::new();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(6));
+        let workers: Vec<_> = (0..6)
+            .map(|_| {
+                let (db, barrier) = (test.0.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    db.connect().map(drop)
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap().unwrap();
+        }
+        let versions: i64 = test
+            .sql()
+            .query_one("SELECT COUNT(*) FROM schema_migrations", &[])
+            .unwrap()
+            .get(0);
+        assert_eq!(versions, MIGRATIONS.len() as i64);
     }
 
     #[test]
