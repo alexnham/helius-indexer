@@ -239,3 +239,9 @@ readiness, and the live tail remains unknown. Recovery requires matching block/
 transaction/known metadata, an exact observed log prefix plus consistent suffix,
 and unchanged strict decoding of complete evidence. See
 [RPC evidence recovery](docs/rpc-evidence-recovery.md) for trust limits and tests.
+
+Docker Compose now packages the captured-data console for local beta testing,
+using one non-root image and a dedicated SQLite/session volume. This selects
+local packaging only; it does not select production queues, databases, deployment
+infrastructure or enable ingestion. Health reports availability separately from
+unknown chain coverage. See [Docker operation](docs/docker.md).

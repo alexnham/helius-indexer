@@ -78,3 +78,12 @@ cover captured values, mint filtering, null fees, duplicate-free replay, read-on
 queries, invalid request bounds, foreign Host rejection and blocked filesystem/
 write routes. They run in the existing default CI job after Rust tests. No Rust
 behavior or storage schema is changed by this testing wrapper.
+
+
+## Container alternative
+
+[Docker Compose](docker.md) provides the same console with a prebuilt CLI and a
+dedicated persistent session. Native startup still defaults to loopback and fresh
+sessions. `--persistent-session PATH` explicitly enables locked, resumable
+initialization; `--bind 0.0.0.0` is reserved for deliberate container use. Neither
+option changes transfer semantics or verifies chain coverage.

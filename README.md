@@ -1,5 +1,17 @@
 # helius-indexer
 
+## Docker testing
+
+```sh
+docker compose up --build
+```
+
+Open **http://127.0.0.1:8765**. A dedicated named volume keeps the same captured
+session across restarts; the image contains the compiled CLI, so Rust/Python do
+not need to be installed on the host. No ingestion or credentials are enabled.
+If the native console is already using 8765, set `INDEXER_CONSOLE_PORT=8766` before
+the command. See [Docker operation and data reset](docs/docker.md).
+
 ## Start testing
 
 ```sh
