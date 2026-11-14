@@ -15,7 +15,7 @@ use std::{
     time::Instant,
 };
 
-const USAGE: &str = "usage: helius-indexer monitor DB MINT LIVE_FROM START END SECONDS | query-recent DB [MINT] | ingest DB CAPTURE [--metrics FILE] | query DB [MINT] | backfill DB MINT START END [--metrics FILE] | coverage DB MINT START END | live DB FROM_SLOT SECONDS [MINT] | prune DB KEEP | live-status DB | live-retry DB | summary DB MINT | overlap DB START END SECONDS | repair DB START END | repair-status DB START END | repair-history-archive DB MINT START END | repair-history DB MINT START END | [feature archive] archive/archive-replay/archive-overlap DB CACHE MINT START END | bridge-plan DB CACHE MINT START | bridge DB CACHE MINT START | bridge-status DB MINT START | bridge-live DB CACHE START SECONDS | archive-overlap-replay DB MINT START END | archive-tip CACHE | archive-live DB CACHE START END SECONDS";
+const USAGE: &str = "usage: helius-indexer migrate (uses DATABASE_URL) | monitor DB MINT LIVE_FROM START END SECONDS | query-recent DB [MINT] | ingest DB CAPTURE [--metrics FILE] | query DB [MINT] | backfill DB MINT START END [--metrics FILE] | coverage DB MINT START END | live DB FROM_SLOT SECONDS [MINT] | prune DB KEEP | live-status DB | live-retry DB | summary DB MINT | overlap DB START END SECONDS | repair DB START END | repair-status DB START END | repair-history-archive DB MINT START END | repair-history DB MINT START END | [feature archive] archive/archive-replay/archive-overlap DB CACHE MINT START END | bridge-plan DB CACHE MINT START | bridge DB CACHE MINT START | bridge-status DB MINT START | bridge-live DB CACHE START SECONDS | archive-overlap-replay DB MINT START END | archive-tip CACHE | archive-live DB CACHE START END SECONDS";
 
 fn ingest(db: &str, input: &str, telemetry: &mut Telemetry) -> Result<serde_json::Value> {
     let started = Instant::now();
@@ -215,6 +215,9 @@ fn run(args: &[String], telemetry: &mut Telemetry) -> Result<serde_json::Value> 
         }
         [command, db] if command == "query-recent" => query_recent(db, None),
         [command, db, mint] if command == "query-recent" => query_recent(db, Some(mint)),
+        [command] if command == "migrate" => {
+            Store::migrate(&env::var("DATABASE_URL").map_err(|_| Error("missing_database_url"))?)
+        }
         [command, db, mint] if command == "summary" => Store::summary(Path::new(db), mint),
         [command, db, start, end, seconds] if command == "overlap" => {
             helius_indexer::coordinator::run(

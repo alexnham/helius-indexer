@@ -54,6 +54,32 @@ services:
     pids_limit: 64
     stop_grace_period: 20s
 
+  # Local PostgreSQL for development and tests (`docker compose --profile db up -d postgres`).
+  # Loopback only; the default password is for this local container, never a hosted database.
+  postgres:
+    profiles: [db]
+    image: postgres:18.6-alpine@sha256:9ba53c7d41ea093baf5c1ba635ba5434c4f979880527d49bb7d9237d3193085b
+    environment:
+      POSTGRES_USER: indexer
+      POSTGRES_PASSWORD: ${INDEXER_POSTGRES_PASSWORD:-indexer}
+      POSTGRES_DB: indexer
+    ports:
+      - "127.0.0.1:${INDEXER_POSTGRES_PORT:-55432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      test: [CMD, pg_isready, -U, indexer, -d, indexer]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]
+    security_opt: [no-new-privileges:true]
+    cpus: 1.0
+    mem_limit: 512m
+    pids_limit: 128
+    stop_grace_period: 30s
+
 secrets:
   helius:
     file: ${INDEXER_SECRET_FILE:-.env}
@@ -61,3 +87,4 @@ secrets:
 volumes:
   console-data:
   runtime-data:
+  postgres-data:
