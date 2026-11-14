@@ -61,6 +61,24 @@ impl LiveLog {
         Ok(ids)
     }
 
+    /// Stored consumer positions for one group and topic: (partition, next offset).
+    pub(crate) fn kafka_offsets(
+        db: &Database,
+        group: &str,
+        topic: &str,
+    ) -> Result<Vec<(i32, i64)>> {
+        Ok(db
+            .connect()?
+            .query(
+                "SELECT partition,next_offset FROM kafka_offsets WHERE consumer_group=$1 AND topic=$2",
+                &[&group, &topic],
+            )
+            .map_err(read_failed)?
+            .iter()
+            .map(|r| (r.get(0), r.get(1)))
+            .collect())
+    }
+
     /// Monotonic: a stale producer can never move the replay position backwards. A late
     /// transaction for an older slot is covered by `kafka::REORDER_MARGIN_SLOTS` at resume.
     pub(crate) fn advance_producer_cursor(&self, stream: &str, slot: i64) -> Result<()> {

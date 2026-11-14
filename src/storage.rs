@@ -200,20 +200,24 @@ impl Store {
                     .iter()
                     .enumerate()
                     .map(|(index, item)| {
-                        let single = acknowledge.map(|a| Acknowledge {
-                            ids: &a.ids[index..=index],
-                            failed: &[],
-                        });
+                        // Consumer positions are never written item by item: the consumer
+                        // stops and replays the batch from its stored positions instead.
+                        let single = match acknowledge {
+                            Some(Acknowledge::Live { ids, .. }) => Some(Acknowledge::Live {
+                                ids: &ids[index..=index],
+                                failed: &[],
+                            }),
+                            _ => None,
+                        };
                         self.write_batch(std::slice::from_ref(item), single.as_ref())
                             .and_then(|mut r| r.remove(0))
                     })
                     .collect();
-                if let Some(a) = acknowledge.filter(|a| !a.failed.is_empty()) {
+                if let Some(Acknowledge::Live { failed, .. }) = acknowledge
+                    .filter(|a| matches!(a, Acknowledge::Live { failed, .. } if !failed.is_empty()))
+                {
                     // Inputs that failed before storage have no output; record them on their own.
-                    let empty = Acknowledge {
-                        ids: &[],
-                        failed: a.failed,
-                    };
+                    let empty = Acknowledge::Live { ids: &[], failed };
                     if self.write_batch(&[], Some(&empty)).is_err() {
                         // Those inputs stay pending and retryable; the failure is still counted.
                         self.stats.failed_writes += 1;
@@ -367,9 +371,39 @@ impl Store {
             .into_iter()
             .map(|r| r.unwrap_or(Err(Error("storage_write_failed"))))
             .collect();
-        if let Some(acknowledge) = acknowledge {
+        if let Some(Acknowledge::Kafka {
+            group,
+            topic,
+            offsets,
+            retained,
+        }) = acknowledge
+        {
+            if !retained.is_empty() {
+                tx.execute(
+                    "INSERT INTO live_raw(slot,protobuf,status,received_at) SELECT s,p,st,$4 FROM unnest($1::bigint[],$2::bytea[],$3::text[]) AS u(s,p,st)",
+                    &[
+                        &retained.iter().map(|r| r.0).collect::<Vec<_>>(),
+                        &retained.iter().map(|r| r.1.as_slice()).collect::<Vec<_>>(),
+                        &retained.iter().map(|r| r.2).collect::<Vec<_>>(),
+                        &live::now(),
+                    ],
+                )?;
+            }
+            // Monotonic: a consumer fenced out by a rebalance can never rewind progress.
+            tx.execute(
+                "INSERT INTO kafka_offsets(consumer_group,topic,partition,next_offset) SELECT $1,$2,p,o FROM unnest($3::int[],$4::bigint[]) AS u(p,o)
+                 ON CONFLICT(consumer_group,topic,partition) DO UPDATE SET next_offset=GREATEST(kafka_offsets.next_offset,excluded.next_offset)",
+                &[
+                    group,
+                    topic,
+                    &offsets.iter().map(|o| o.0).collect::<Vec<_>>(),
+                    &offsets.iter().map(|o| o.1).collect::<Vec<_>>(),
+                ],
+            )?;
+        }
+        if let Some(Acknowledge::Live { ids, failed }) = acknowledge {
             // Progress commits with the output it describes, never before or without it.
-            let mut ids: Vec<i64> = acknowledge.ids.to_vec();
+            let mut ids: Vec<i64> = ids.to_vec();
             let mut statuses: Vec<&str> = results
                 .iter()
                 .zip(items)
@@ -378,7 +412,7 @@ impl Store {
                     (Ok(_), Err(error)) | (Err(error), _) => error.0,
                 })
                 .collect();
-            for (id, status) in acknowledge.failed {
+            for (id, status) in *failed {
                 ids.push(*id);
                 statuses.push(status);
             }
@@ -595,11 +629,21 @@ pub struct BatchItem<'a> {
     pub decoded: &'a Result<Vec<Transfer>>,
 }
 
-/// Live raw-input progress written in the same transaction as the batch output: `ids`
-/// align with the batch items, and `failed` holds inputs that never reached storage.
-pub(crate) struct Acknowledge<'a> {
-    pub ids: &'a [i64],
-    pub failed: &'a [(i64, &'static str)],
+/// Progress written in the same transaction as the batch output it describes.
+pub(crate) enum Acknowledge<'a> {
+    /// Live raw rows: `ids` align with the batch items; `failed` never reached storage.
+    Live {
+        ids: &'a [i64],
+        failed: &'a [(i64, &'static str)],
+    },
+    /// Kafka consumer positions, plus inputs that failed before storage, retained in
+    /// live_raw as (slot, wire payload, error class) so they stay retryable offline.
+    Kafka {
+        group: &'a str,
+        topic: &'a str,
+        offsets: &'a [(i32, i64)],
+        retained: &'a [(i64, Vec<u8>, &'static str)],
+    },
 }
 
 struct Prepared<'a> {

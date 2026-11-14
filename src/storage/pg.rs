@@ -6,6 +6,7 @@ use postgres::{Client, NoTls};
 pub(crate) const MIGRATIONS: &[(i32, &str)] = &[
     (1, include_str!("migrations/0001_initial.sql")),
     (2, include_str!("migrations/0002_kafka_producer_cursor.sql")),
+    (3, include_str!("migrations/0003_kafka_offsets.sql")),
 ];
 
 /// Connection errors are reduced to a class: driver messages can echo the URL or credentials.
