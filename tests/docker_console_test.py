@@ -61,6 +61,15 @@ class PersistentConsole(unittest.TestCase):
                 self.assertEqual(len(rows), metadata["transfer_count"])
                 self.assertEqual(len({r["transfer_id"] for r in rows}), len(rows))
 
+    def test_health_does_not_create_an_uninitialized_postgres_schema(self):
+        with tempfile.TemporaryDirectory() as directory, fresh_database():
+            path = Path(directory)
+            (path / "helius-indexer").write_bytes(BINARY.read_bytes())
+            (path / "helius-indexer").chmod(0o700)
+            (path / "session.json").write_text(json.dumps({"database": os.environ["INDEXER_DB_SESSION"]}))
+            with self.assertRaises(RuntimeError):
+                CONSOLE.readiness(path)
+
     def test_health_requires_a_seeded_session_record(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)

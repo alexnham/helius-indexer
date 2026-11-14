@@ -266,3 +266,14 @@ resume position for the next cycle. Pruning invalidates historical/source/overla
 retained boundary slot in the same transaction as deletion. Shutdown tracks both
 intake and prune subprocesses; timeout kills and reaps the current child. Pruning
 keeps coverage `unknown`.
+
+## PostgreSQL readiness and identity integrity
+
+The console health path uses `health SESSION`, a read-only schema-version/table
+probe with a three-second subprocess limit. It does not create a schema or run
+migrations, and availability never implies verified chain coverage. Block identity
+checks and inserts hold a transaction advisory lock scoped to the session,
+including absent parent/child anchors. Conflicting concurrent observations fail
+closed. Summary rows stream through checked u128 accumulation instead of loading
+a mint's history into a client-side vector. Existing bounded error classes and
+credential redaction apply.
