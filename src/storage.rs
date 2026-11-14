@@ -1,3 +1,4 @@
+pub(crate) mod live;
 pub(crate) mod repair;
 use crate::{
     Error, Result,
