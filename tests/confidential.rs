@@ -63,7 +63,13 @@ fn confidential_outer_inner_hidden_values_survive_restart_replay_and_summary() {
         let summary = Store::summary(&db.0, &rows[0].mint).unwrap();
         assert_eq!(summary["known_volume_raw"], "0");
         assert_eq!(summary["unknown_amount_count"], 2);
-        assert_eq!(summary["unknown_fee_count"], 2);
+        // Plain Transfer proves a no-fee mint; TransferWithFee's fee stays hidden.
+        let unknown_fees = if case["expected"]["fee_raw"].is_null() {
+            2
+        } else {
+            0
+        };
+        assert_eq!(summary["unknown_fee_count"], unknown_fees);
         assert_eq!(summary["confidential_transfer_count"], 2);
         assert_eq!(summary["coverage"], "unknown");
         value["result"]["meta"]["logMessages"] = json!([]);
@@ -268,8 +274,29 @@ fn known_zero_and_exact_volume_remain_distinct_from_hidden_amounts() {
     assert_eq!(summary["transfer_count"], 3);
     assert_eq!(summary["known_volume_raw"], u64::MAX.to_string());
     assert_eq!(summary["unknown_amount_count"], 1);
-    assert_eq!(summary["unknown_fee_count"], 1);
+    assert_eq!(summary["unknown_fee_count"], 0);
     assert_eq!(summary["confidential_transfer_count"], 1);
+}
+
+#[test]
+fn transfer_with_fee_on_no_fee_mint_needs_no_fee_proof_accounts() {
+    let mut value = cases()[1]["capture"].clone();
+    let encoded = value["result"]["transaction"]["message"]["instructions"][0]["data"]
+        .as_str()
+        .unwrap();
+    let mut data = bs58::decode(encoded).into_vec().unwrap();
+    // Zero fee offsets are ignored on chain when the mint has no transfer fee.
+    data[168..170].fill(0);
+    set_instruction(&mut value, &data, json!([1, 3, 2, 5, 4]));
+    let rows = decode(&value).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].fee_raw, None);
+    data[170] = 0;
+    set_instruction(&mut value, &data, json!([1, 3, 2, 5, 4]));
+    assert_eq!(
+        decode(&value).unwrap_err().0,
+        "invalid_confidential_instruction"
+    );
 }
 
 #[test]

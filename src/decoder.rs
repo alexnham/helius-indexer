@@ -315,11 +315,17 @@ fn decode_instruction(
         }
         // A proof offset of zero consumes a context account; any nonzero
         // offset requires one shared instructions sysvar, plus the authority.
-        let offsets = &data[166..];
+        // Equality, validity and range proofs are always read; TransferWithFee's
+        // middle fee offsets are read only for fee mints, unknown from the instruction.
+        let offsets = [data[166], data[167], data[length - 1]];
         let proof_accounts = offsets.iter().filter(|&&offset| offset == 0).count()
             + usize::from(offsets.iter().any(|&offset| offset != 0));
         if ix.accounts.len() < 4 + proof_accounts {
             return Err(Error("invalid_confidential_instruction"));
+        }
+        // Token-2022 rejects plain confidential Transfer on transfer-fee mints.
+        if variant == 7 {
+            fee_raw = Some(0);
         }
         (
             ix.accounts[0],

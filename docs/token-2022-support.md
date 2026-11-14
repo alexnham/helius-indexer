@@ -105,8 +105,10 @@ lengths are 169 and 171 bytes respectively: two discriminators, a 36-byte
 [decryptable balance](https://github.com/solana-program/token-2022/blob/e8ca680ca8aeb12f9598524b003c776c6a4168f2/clients/js/src/generated/types/decryptableBalance.ts),
 two 64-byte [auditor ciphertexts](https://github.com/solana-program/token-2022/blob/e8ca680ca8aeb12f9598524b003c776c6a4168f2/clients/js/src/generated/types/encryptedBalance.ts),
 and three/five proof offsets. Context accounts or the shared instructions sysvar
-and authority must fit the encoded offsets. Record accounts and multisig signers
-may add accounts. Older split-proof layouts and unknown variants remain unresolved.
+and authority must fit the equality, validity and range offsets. TransferWithFee's
+fee offsets (bytes 168–169) are read only on transfer-fee mints, which the
+instruction does not reveal, so they impose no account minimum. Record accounts
+and multisig signers may add accounts. Older split-proof layouts and unknown variants remain unresolved.
 
 Successful finalized execution is the evidence for program/proof validation; this
 indexer does not verify cryptography, signatures or consensus. Captures must come
@@ -115,7 +117,9 @@ establishing valid proofs or on-chain availability. Inner execution evidence and
 atomic whole-transaction rejection follow the ordinary transfer rules above.
 
 `confidential=true`, `amount_raw=null` and `fee_raw=null` survive persistence,
-query and replay, including self transfers. No encrypted field or balance delta
+query and replay, including self transfers. Plain `Transfer` (27, 7) records
+`fee_raw=0` instead: Token-2022 rejects it on transfer-fee mints, so success
+proves no fee. `TransferWithFee` keeps a null fee. No encrypted field or balance delta
 is treated as an amount. The explicit mint is sufficient even without token
 balance metadata. `decimals` is then null; consistent execution-time token-balance
 metadata may enrich it. Conflicting mint, decimals or token-program evidence
