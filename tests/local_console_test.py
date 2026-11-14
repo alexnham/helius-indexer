@@ -1,6 +1,8 @@
 """Local console acceptance checks using the real Rust CLI, never a provider."""
 import importlib.util
 import json
+import os
+import secrets
 from pathlib import Path
 import tempfile
 import threading
@@ -12,6 +14,9 @@ ROOT = Path(__file__).resolve().parent.parent
 SPEC = importlib.util.spec_from_file_location("local_test", ROOT / "scripts/local-test.py")
 CONSOLE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(CONSOLE)
+# The local test container; never a hosted database.
+os.environ.setdefault("DATABASE_URL", os.environ.get(
+    "INDEXER_TEST_DATABASE_URL", "postgres://indexer:indexer@127.0.0.1:55432/indexer"))
 
 
 class LocalConsole(unittest.TestCase):
@@ -19,7 +24,8 @@ class LocalConsole(unittest.TestCase):
     def setUpClass(cls):
         cls.directory = tempfile.TemporaryDirectory()
         cls.session = Path(cls.directory.name)
-        cls.metadata = CONSOLE.seed(cls.session, ROOT / "target/debug/helius-indexer")
+        cls.metadata = CONSOLE.seed(cls.session, ROOT / "target/debug/helius-indexer",
+                                    "pytest_" + secrets.token_hex(6))
         cls.server = CONSOLE.HTTPServer(("127.0.0.1", 0), CONSOLE.BaseHTTPRequestHandler)
         cls.server.RequestHandlerClass = CONSOLE.handler_for(cls.session, cls.server.server_port)
         cls.thread = threading.Thread(target=cls.server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
@@ -77,10 +83,10 @@ class LocalConsole(unittest.TestCase):
             self.assertIn("BigInt", html)
             self.assertIn("frame-ancestors 'none'", response.headers["Content-Security-Policy"])
         self.assertEqual(self.server.server_address[0], "127.0.0.1")
-        before = CONSOLE.command(self.session, "query", self.session / "index.sqlite")
+        before = CONSOLE.command(self.session, "query", self.metadata["database"])
         self.get("/api/session")
         self.get("/api/transfers")
-        after = CONSOLE.command(self.session, "query", self.session / "index.sqlite")
+        after = CONSOLE.command(self.session, "query", self.metadata["database"])
         self.assertEqual(before, after)
 
 

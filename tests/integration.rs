@@ -1068,3 +1068,41 @@ fn concurrent_duplicate_and_overlapping_writers_store_one_record_set() {
         0
     );
 }
+
+#[test]
+fn comparison_export_is_bounded_to_retained_blocks_and_one_mint() {
+    let db = TestDatabase::new();
+    let db = &db.0;
+    persist(db, &capture()).unwrap();
+    let mint = decode(&capture()).unwrap()[0].mint.clone();
+    let mut sql = db.test_client();
+    for (slot, transactions) in [(123i64, json!([capture()["result"]])), (124, json!([]))] {
+        let response =
+            serde_json::to_vec(&json!({"result":{"transactions":transactions}})).unwrap();
+        sql.execute(
+            "INSERT INTO historical_inputs(mint,decoder,slot,attempt,source_kind,received_at,produced_block,response) VALUES($1,$2,$3,1,'finalized-mainnet-rpc',1,true,$4)",
+            &[&mint, &decoder::DECODER_VERSION, &slot, &response],
+        )
+        .unwrap();
+    }
+    let export = Store::comparison_input(db, &mint, 16).unwrap();
+    assert_eq!(export["blocks"].as_array().unwrap().len(), 2);
+    assert_eq!(export["blocks"][0]["slot"], 123);
+    assert_eq!(
+        export["transfers"],
+        serde_json::to_value(Store::query(db, Some(&mint), 1000).unwrap()).unwrap()
+    );
+    assert_eq!(
+        Store::comparison_input(db, &mint, 1).unwrap()["blocks"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        Store::comparison_input(db, "other-mint", 16).unwrap()["transfers"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}

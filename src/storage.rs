@@ -386,6 +386,52 @@ impl Store {
         )
     }
 
+    /// Read-only export for the independent Python cross-check: retained block responses
+    /// (at most `blocks` observations, 64 MiB) and this mint's stored rows in their slot range.
+    pub fn comparison_input(db: &Database, mint: &str, blocks: i64) -> Result<serde_json::Value> {
+        let mut client = db.connect()?;
+        let mut tx = client
+            .build_transaction()
+            .isolation_level(postgres::IsolationLevel::RepeatableRead)
+            .read_only(true)
+            .start()
+            .map_err(read_failed)?;
+        let mut size = 0;
+        let mut retained = Vec::new();
+        for row in tx
+            .query(
+                "SELECT slot,response FROM historical_inputs ORDER BY slot,attempt LIMIT $1",
+                &[&blocks],
+            )
+            .map_err(read_failed)?
+        {
+            let response: Vec<u8> = row.get(1);
+            size += response.len();
+            if size > 64 * 1024 * 1024 {
+                return Err(Error("comparison_input_limit"));
+            }
+            let response: serde_json::Value =
+                serde_json::from_slice(&response).map_err(|_| Error("stored_record_invalid"))?;
+            retained.push(serde_json::json!({"slot":row.get::<_, i64>(0),"response":response}));
+        }
+        let slots = retained.iter().filter_map(|b| b["slot"].as_i64());
+        let (low, high) = (slots.clone().min(), slots.max());
+        let transfers = match (low, high) {
+            (Some(low), Some(high)) => tx
+                .query(
+                    "SELECT record_json FROM transfers WHERE mint=$1 AND slot BETWEEN $2 AND $3 LIMIT 100001",
+                    &[&mint, &low, &high],
+                )
+                .map_err(read_failed)?
+                .iter()
+                .map(|r| serde_json::from_str(r.get::<_, &str>(0)).map_err(|_| Error("stored_record_invalid")))
+                .collect::<Result<Vec<serde_json::Value>>>()?,
+            _ => Vec::new(),
+        };
+        tx.commit().map_err(read_failed)?;
+        Ok(serde_json::json!({"blocks":retained,"transfers":transfers}))
+    }
+
     pub fn query(db: &Database, mint: Option<&str>, limit: usize) -> Result<Vec<Transfer>> {
         Self::query_ordered(db, mint, limit, false)
     }

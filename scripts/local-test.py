@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""An offline, loopback-only captured-data console. No provider credentials required."""
+"""An offline, loopback-only captured-data console. No provider credentials required.
+
+Data lives in a PostgreSQL session schema; the server comes only from DATABASE_URL,
+which child processes inherit and this script never prints."""
 import argparse
 import errno
 import json
@@ -7,8 +10,8 @@ import os
 import re
 import shutil
 import signal
-import sqlite3
-from contextlib import closing, contextmanager
+import secrets
+from contextlib import contextmanager
 import subprocess
 import sys
 import tempfile
@@ -31,6 +34,15 @@ def valid_mint(value):
     return len(value) - len(value.lstrip("1")) + (number.bit_length() + 7) // 8 == 32
 
 
+def require_database_url():
+    if not os.environ.get("DATABASE_URL"):
+        raise RuntimeError("Set DATABASE_URL to a PostgreSQL server (see .env.example)")
+
+
+def database(session):
+    return json.loads((session / "session.json").read_text())["database"]
+
+
 def command(session, *args, timeout=30):
     with (session / "events.jsonl").open("ab") as log:
         result = subprocess.run(
@@ -50,7 +62,7 @@ def captures():
             yield case["capture"]
 
 
-def seed(session, binary):
+def seed(session, binary, database):
     target = session / "helius-indexer"
     if Path(binary).resolve() != target.resolve():
         temporary = session / ".binary.tmp"
@@ -59,7 +71,6 @@ def seed(session, binary):
         temporary.replace(target)
     inputs = session / "captures"
     inputs.mkdir(exist_ok=True)
-    database = session / "index.sqlite"
     files = []
     for index, capture in enumerate(captures()):
         path = inputs / f"{index:03d}.json"
@@ -80,7 +91,7 @@ def seed(session, binary):
     metadata = {
         "mode": "captured data", "coverage": "unknown", "fixture_count": len(files),
         "transfer_count": len(after["transfers"]), "mints": mints,
-        "query_limit": after["limit"], "replay_verified": True,
+        "query_limit": after["limit"], "replay_verified": True, "database": database,
         "slot_start": min(row["slot"] for row in after["transfers"]),
         "slot_end": max(row["slot"] for row in after["transfers"]),
     }
@@ -104,19 +115,18 @@ def persistent_session(path, binary):
         receipt = session / "session.json"
         if receipt.exists():
             metadata = json.loads(receipt.read_text())
-            if not (session / "index.sqlite").is_file() or not (session / "helius-indexer").is_file():
+            if "database" not in metadata or not (session / "helius-indexer").is_file():
                 raise RuntimeError("Persistent session is incomplete; restore its backup")
         else:
             stored_binary = session / "helius-indexer"
-            metadata = seed(session, stored_binary if stored_binary.exists() else binary)
+            metadata = seed(session, stored_binary if stored_binary.exists() else binary,
+                            os.environ.get("INDEXER_DB_SESSION", "console"))
         yield session, metadata
 
 
 def readiness(session):
-    json.loads((session / "session.json").read_text())
-    with closing(sqlite3.connect((session / "index.sqlite").resolve().as_uri() + "?mode=ro", uri=True, timeout=2)) as db:
-        db.execute("SELECT transfer_id FROM transfers LIMIT 1").fetchone()
     metadata = json.loads((session / "session.json").read_text())
+    command(session, "summary", metadata["database"], USDC, timeout=5)
     return {"status": "ready", "mode": metadata.get("mode", "captured data"), "coverage": "unknown"}
 
 
@@ -154,7 +164,7 @@ def handler_for(session, port, runtime_status=None):
             elif url.path == "/healthz":
                 try:
                     self.send(200, readiness(session))
-                except (OSError, ValueError, sqlite3.Error):
+                except (OSError, ValueError, KeyError, RuntimeError, subprocess.TimeoutExpired):
                     self.send(503, {"status": "unavailable"})
             elif url.path == "/api/session":
                 self.send(200, json.loads((session / "session.json").read_text()))
@@ -174,7 +184,7 @@ def handler_for(session, port, runtime_status=None):
                     self.send(400, {"error": "Use one valid mint address"})
                     return
                 try:
-                    args = ["query-recent" if runtime_status else "query", session / "index.sqlite"] + ([mint] if mint else [])
+                    args = ["query-recent" if runtime_status else "query", database(session)] + ([mint] if mint else [])
                     self.send(200, command(session, *args))
                 except (RuntimeError, subprocess.TimeoutExpired, ValueError):
                     self.send(503, {"error": "Query failed; inspect session events.jsonl"})
@@ -196,6 +206,7 @@ def main():
     args = parser.parse_args()
     if not 1024 <= args.port <= 65535:
         parser.error("port must be between 1024 and 65535")
+    require_database_url()
     if args.persistent_session:
         binary = args.binary.resolve() if args.binary else ROOT / "target/debug/helius-indexer"
         with persistent_session(args.persistent_session, binary) as (session, metadata):
@@ -203,7 +214,7 @@ def main():
         return
     if args.session:
         session = args.session.resolve()
-        if not all((session / name).is_file() for name in ["session.json", "index.sqlite", "helius-indexer"]):
+        if not all((session / name).is_file() for name in ["session.json", "helius-indexer"]) or "database" not in json.loads((session / "session.json").read_text()):
             parser.error("session must contain a seeded local test database and binary")
         metadata = json.loads((session / "session.json").read_text())
     else:
@@ -218,14 +229,14 @@ def main():
         base.mkdir(parents=True, exist_ok=True)
         session = Path(tempfile.mkdtemp(prefix="run-", dir=base))
         print("Seeding captured transfers and checking replay…", flush=True)
-        metadata = seed(session, binary)
+        metadata = seed(session, binary, "local_" + secrets.token_hex(6))
     serve(session, metadata, args)
 
 
 def serve(session, metadata, args):
     print(f"Ready: {metadata['transfer_count']} unique transfers / {metadata['fixture_count']} captures. Replay verified.")
     print(f"Session: {session}")
-    print(f"CLI: {session / 'helius-indexer'} query {session / 'index.sqlite'}")
+    print(f"CLI (with DATABASE_URL set): {session / 'helius-indexer'} query {metadata['database']}")
     if args.seed_only:
         return
     server = HTTPServer((args.bind, args.port), handler_for(session, args.port))
