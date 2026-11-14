@@ -1,7 +1,7 @@
 use helius_indexer::{
     decoder::{self, SPL_TOKEN, TOKEN_2022},
     model::Transfer,
-    storage::{Database, Store, pg::TestDatabase},
+    storage::{BatchItem, Database, Store, pg::TestDatabase},
 };
 use serde_json::{Value, json};
 use std::process::{Command, Output};
@@ -1149,4 +1149,170 @@ fn write_stats_count_writes_transfers_failures_and_latency_buckets() {
         "indexer_stage_duration_seconds_count{operation=\"transfer_write\",mode=\"historical\"} 3"
     ));
     assert!(text.contains("indexer_storage_write_failures_total{mode=\"historical\"} 1"));
+}
+
+/// A parsed capture, its decoder output and the raw bytes it came from.
+type Decoded = (
+    helius_indexer::model::Capture,
+    helius_indexer::Result<Vec<Transfer>>,
+    Vec<u8>,
+);
+
+fn coverage_captures() -> Vec<Vec<u8>> {
+    let cases: Vec<Value> =
+        serde_json::from_slice(include_bytes!("fixtures/mainnet-coverage.json")).unwrap();
+    cases
+        .iter()
+        .map(|case| serde_json::to_vec(&case["capture"]).unwrap())
+        .collect()
+}
+
+fn batch_of(raws: &[Vec<u8>]) -> Vec<Decoded> {
+    raws.iter()
+        .map(|raw| {
+            let capture = decoder::parse_capture(raw).unwrap();
+            let decoded = decoder::decode(&capture);
+            (capture, decoded, raw.clone())
+        })
+        .collect()
+}
+
+fn persist_all(store: &mut Store, batch: &[Decoded]) -> Vec<helius_indexer::Result<usize>> {
+    let items: Vec<BatchItem> = batch
+        .iter()
+        .map(|(capture, decoded, raw)| BatchItem {
+            capture,
+            raw,
+            decoded,
+        })
+        .collect();
+    store.persist_batch(&items)
+}
+
+#[test]
+fn one_batch_stores_the_same_records_as_one_by_one_writes() {
+    let raws = coverage_captures();
+    let batched = TestDatabase::new();
+    let single = TestDatabase::new();
+    let mut store = Store::open(&batched.0).unwrap();
+    let results = persist_all(&mut store, &batch_of(&raws));
+    let stats = store.stats();
+    assert_eq!(
+        (stats.batches, stats.writes, stats.fallbacks),
+        (1, raws.len() as u64, 0)
+    );
+    let mut one = Store::open(&single.0).unwrap();
+    for (index, raw) in raws.iter().enumerate() {
+        let capture = decoder::parse_capture(raw).unwrap();
+        let expected = one.persist(&capture, raw, &decoder::decode(&capture));
+        assert_eq!(results[index], expected, "item {index}");
+    }
+    assert_eq!(
+        Store::query(&batched.0, None, 1000).unwrap(),
+        Store::query(&single.0, None, 1000).unwrap()
+    );
+    // Replaying the whole batch is idempotent.
+    let replay = persist_all(&mut store, &batch_of(&raws));
+    assert!(replay.iter().all(|r| matches!(r, Ok(0))));
+}
+
+#[test]
+fn duplicates_and_quarantine_inside_one_batch_are_deterministic() {
+    let db = TestDatabase::new();
+    let db = &db.0;
+    let mut other = capture();
+    other["source"] = json!("helius-laserstream");
+    let raws = vec![
+        serde_json::to_vec(&capture()).unwrap(),
+        serde_json::to_vec(&other).unwrap(),
+        serde_json::to_vec(&capture()).unwrap(),
+    ];
+    let mut store = Store::open(db).unwrap();
+    let results = persist_all(&mut store, &batch_of(&raws));
+    assert_eq!(results, vec![Ok(1), Ok(0), Ok(0)]);
+    let mut sql = db.test_client();
+    let count =
+        |sql: &mut postgres::Client, q: &str| -> i64 { sql.query_one(q, &[]).unwrap().get(0) };
+    assert_eq!(count(&mut sql, "SELECT COUNT(*) FROM transfers"), 1);
+    assert_eq!(count(&mut sql, "SELECT COUNT(*) FROM capture_inputs"), 2);
+    // A stored capture from another decoder revision is quarantined; the rest of the batch commits.
+    sql.execute(
+        "UPDATE captures SET decoder_version='previous-decoder'",
+        &[],
+    )
+    .unwrap();
+    let fresh = coverage_captures().remove(0);
+    let results = persist_all(&mut store, &batch_of(&[raws[0].clone(), fresh.clone()]));
+    assert_eq!(
+        results[0],
+        Err(helius_indexer::Error("decoder_revision_conflict"))
+    );
+    assert!(results[1].is_ok());
+    assert_eq!(
+        count(
+            &mut sql,
+            "SELECT COUNT(*) FROM capture_inputs WHERE status='decoder_revision_conflict'"
+        ),
+        1
+    );
+}
+
+#[test]
+fn a_poison_item_falls_back_to_item_writes_without_blocking_the_batch() {
+    let db = TestDatabase::new();
+    let db = &db.0;
+    let raws = coverage_captures();
+    let poison = decoder::parse_capture(&raws[1])
+        .unwrap()
+        .result
+        .transaction
+        .signatures[0]
+        .clone();
+    let mut store = Store::open(db).unwrap();
+    db.test_client()
+        .batch_execute(&format!(
+            "CREATE FUNCTION poison() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN IF NEW.signature='{poison}' THEN RAISE EXCEPTION 'poison'; END IF; RETURN NEW; END$$;
+             CREATE TRIGGER poison BEFORE INSERT ON captures FOR EACH ROW EXECUTE FUNCTION poison();"
+        ))
+        .unwrap();
+    let results = persist_all(&mut store, &batch_of(&raws[..3]));
+    assert_eq!(
+        results[1],
+        Err(helius_indexer::Error("storage_write_failed"))
+    );
+    assert!(results[0].is_ok() && results[2].is_ok());
+    let stats = store.stats();
+    assert_eq!((stats.fallbacks, stats.failed_writes), (1, 1));
+}
+
+#[test]
+fn concurrent_overlapping_batches_store_one_record_set() {
+    let db = TestDatabase::new();
+    let raws = coverage_captures();
+    let mut reversed = raws.clone();
+    reversed.reverse();
+    let workers: Vec<_> = [raws.clone(), reversed, raws.clone()]
+        .into_iter()
+        .map(|order| {
+            let db = db.0.clone();
+            std::thread::spawn(move || {
+                let mut store = Store::open(&db).unwrap();
+                let results = persist_all(&mut store, &batch_of(&order));
+                (
+                    results.iter().filter(|r| r.is_err()).count(),
+                    store.stats().fallbacks,
+                )
+            })
+        })
+        .collect();
+    for worker in workers {
+        assert_eq!(worker.join().unwrap(), (0, 0));
+    }
+    let single = TestDatabase::new();
+    let mut one = Store::open(&single.0).unwrap();
+    persist_all(&mut one, &batch_of(&raws));
+    assert_eq!(
+        Store::query(&db.0, None, 1000).unwrap(),
+        Store::query(&single.0, None, 1000).unwrap()
+    );
 }

@@ -1,10 +1,12 @@
 pub mod backfill;
 pub mod coordinator;
 pub mod decoder;
+pub mod kafka;
 pub mod live;
 pub mod model;
 mod reconcile;
 pub mod repair;
+pub mod replay;
 pub mod storage;
 pub mod telemetry;
 

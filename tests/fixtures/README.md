@@ -125,3 +125,8 @@ against the pinned primary sources in `docs/token-2022-support.md`. Expected IDs
 positions, mint, endpoints and null hidden values are explicitly enumerated.
 No secrets or provider data are included. Additional malformed, non-transfer,
 inner invocation and conflicting-context variants are constructed in tests.
+
+`replay-prototype-v2.sql` and `replay-prototype-v3.sql` are exact schema snapshots
+from commit `9febd85` before integrating main's Kafka migration numbers. They contain
+no chain payloads or secrets and exist only to test automatic, data-preserving
+upgrades of the earlier local replay prototypes to canonical schema version 5.

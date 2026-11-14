@@ -21,6 +21,9 @@ os.environ.setdefault("DATABASE_URL", os.environ.get(
     "INDEXER_TEST_DATABASE_URL", "postgres://indexer:indexer@127.0.0.1:55432/indexer"))
 
 
+CONSOLE_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+
+
 def database():
     return "pytest_" + secrets.token_hex(6)
 
@@ -39,6 +42,35 @@ class RuntimeConsole(unittest.TestCase):
                         {"INDEXER_KEEP_TRANSFERS": "0"}]:
             with self.assertRaises(ValueError):
                 RUNTIME.configuration(options, 1000)
+
+    def test_restart_keeps_frozen_replay_scope_and_rejects_changed_requests(self):
+        with tempfile.TemporaryDirectory() as directory:
+            session=Path(directory)
+            original=RUNTIME.resume_configuration(session,{},1000)
+            RUNTIME.atomic_json(session / "session.json",original)
+            restarted=RUNTIME.resume_configuration(session,{},2000)
+            self.assertEqual((restarted["slot_start"],restarted["slot_end"]),(951,1000))
+            self.assertEqual(restarted["live_from"],1996)
+            self.assertEqual(restarted["replay_job"],original["replay_job"])
+            for changed in [{"INDEXER_BACKFILL_SLOTS":"49"},{"INDEXER_BACKFILL_START":"952"},
+                            {"INDEXER_REPLAY_JOB":"different"},{"INDEXER_MINT":"So11111111111111111111111111111111111111112"}]:
+                with self.assertRaises(ValueError):
+                    RUNTIME.resume_configuration(session,changed,2000)
+            self.assertEqual(json.loads((session / "session.json").read_text()),original)
+
+    def test_replay_job_queries_disclose_budget_and_unknown_coverage_after_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            session=Path(directory);db=database()
+            RUNTIME.initialize(session,ROOT / "target/debug/helius-indexer",db)
+            first=RUNTIME.CONSOLE.command(session,"replay-create",db,"recent",RUNTIME.CONSOLE.USDC,100,149)
+            again=RUNTIME.CONSOLE.command(session,"replay-create",db,"recent",RUNTIME.CONSOLE.USDC,100,149)
+            self.assertEqual(first["budget"],again["budget"])
+            self.assertEqual(again["budget"]["seconds_remaining"],60)
+            self.assertEqual(again["retained"]["transfer_count"],0)
+            self.assertEqual(again["coverage"],"unknown")
+            self.assertIsNone(again["verified_boundary"])
+            RUNTIME.CONSOLE.command(session,"prune",db,1000)
+            self.assertEqual(RUNTIME.CONSOLE.command(session,"replay-status",db,"recent")["budget"],first["budget"])
 
     def test_runtime_bootstrap_is_empty_resumable_and_serves_recent_rows(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -94,6 +126,19 @@ class RuntimeConsole(unittest.TestCase):
                 self.assertEqual(result["blocks"], 16)
                 self.assertGreater(result["expected"], 0)
                 self.assertEqual((result["missing"], result["extra"], result["wrong"]), (0, 0, 0))
+
+    def test_kafka_mode_resumes_from_resume_from_never_the_raw_cursor(self):
+        live = {"last_received_slot": 900, "producer_cursors": [
+            {"stream": "other", "slot": 50, "resume_from": 0},
+            {"stream": CONSOLE_MINT, "slot": 1000, "resume_from": 850}]}
+        os.environ.pop("INDEXER_KAFKA_BROKERS", None)
+        self.assertEqual(RUNTIME.resume_slot(live, CONSOLE_MINT), 900)
+        os.environ["INDEXER_KAFKA_BROKERS"] = "127.0.0.1:59092"
+        try:
+            self.assertEqual(RUNTIME.resume_slot(live, CONSOLE_MINT), 850)
+            self.assertIsNone(RUNTIME.resume_slot({"producer_cursors": []}, CONSOLE_MINT))
+        finally:
+            os.environ.pop("INDEXER_KAFKA_BROKERS", None)
 
     def test_supervised_child_is_killed_and_reaped_on_timeout_or_stop(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -3,6 +3,7 @@
 import importlib.util
 import json
 import os
+import re
 from pathlib import Path
 import signal
 import subprocess
@@ -31,13 +32,38 @@ def configuration(env, tip):
     start = integer(env, "INDEXER_BACKFILL_START", max(0, end - slots + 1), 0, end)
     if end - start >= 128:
         raise ValueError("Backfill must contain at most 128 slots")
-    return {"mint": mint, "mints": [mint], "slot_start": start, "slot_end": end,
+    job=env.get("INDEXER_REPLAY_JOB", "recent")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}",job):
+        raise ValueError("Invalid INDEXER_REPLAY_JOB")
+    return {"historical_source":"laserstream_replay","replay_job":job,"mint": mint, "mints": [mint], "slot_start": start, "slot_end": end,
             "live_from": integer(env, "INDEXER_LIVE_FROM", max(0, tip - 4), 0, tip),
             "seconds": integer(env, "INDEXER_LIVE_SECONDS", 60, 1, 300),
             "keep": integer(env, "INDEXER_KEEP_TRANSFERS", 1000, 1, 1_000_000),
             "mode": "live and backfill", "coverage": "unknown", "query_limit": 1000,
             # A PostgreSQL session schema on DATABASE_URL's server, never a file.
             "database": env.get("INDEXER_DB_SESSION", "runtime")}
+
+
+def resume_configuration(session, env, tip):
+    receipt=session / "session.json"
+    if not receipt.exists():
+        return configuration(env,tip)
+    saved=json.loads(receipt.read_text())
+    if saved.get("historical_source")!="laserstream_replay":
+        raise ValueError("Use a fresh replay runtime directory; legacy data is preserved")
+    requested=dict(env)
+    requested.setdefault("INDEXER_MINT",saved["mint"])
+    requested.setdefault("INDEXER_DB_SESSION",saved["database"])
+    requested.setdefault("INDEXER_REPLAY_JOB",saved["replay_job"])
+    requested["INDEXER_BACKFILL_END"]=env.get("INDEXER_BACKFILL_END") or str(saved["slot_end"])
+    requested["INDEXER_BACKFILL_START"]=env.get("INDEXER_BACKFILL_START") or str(saved["slot_start"])
+    if env.get("INDEXER_BACKFILL_SLOTS") and not env.get("INDEXER_BACKFILL_START"):
+        requested["INDEXER_BACKFILL_START"]=str(int(requested["INDEXER_BACKFILL_END"])-int(env["INDEXER_BACKFILL_SLOTS"])+1)
+    current=configuration(requested,tip)
+    for field in ["mint","database","replay_job","slot_start","slot_end"]:
+        if current[field]!=saved[field]:
+            raise ValueError("Frozen replay scope changed; choose a new directory and job ID")
+    return current
 
 
 def credentials(path):
@@ -79,6 +105,14 @@ def atomic_json(path, value):
     temporary.replace(path)
 
 
+def resume_slot(live, mint):
+    """Kafka mode resumes from the producer's resume_from (cursor minus the reorder margin),
+    never the raw cursor; the PostgreSQL path resumes from the newest retained slot."""
+    if os.environ.get("INDEXER_KAFKA_BROKERS"):
+        return next((c["resume_from"] for c in live.get("producer_cursors", []) if c["stream"] == mint), None)
+    return live.get("last_received_slot")
+
+
 def initialize(session, binary, database):
     import shutil
     session.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -88,8 +122,8 @@ def initialize(session, binary, database):
         shutil.copyfile(binary, temporary)
         temporary.chmod(0o700)
         temporary.replace(target)
-    # Creates the shared schema and retries retained unresolved input, offline and bounded.
-    CONSOLE.command(session, "live-retry", database)
+    # Recovery runs behind live-priority admission inside the native paired worker.
+    CONSOLE.command(session, "migrate", database)
 
 
 def execute_cycle(session, args, env, timeout, on_start, report_name="report.json"):
@@ -108,7 +142,7 @@ def execute_cycle(session, args, env, timeout, on_start, report_name="report.jso
 
 def main():
     import fcntl
-    session = Path(os.environ.get("INDEXER_SESSION", "/app/data/runtime"))
+    session = Path(os.environ.get("INDEXER_SESSION", "/app/data/runtime-replay"))
     session.mkdir(parents=True, exist_ok=True, mode=0o700)
     with (session / ".runtime.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -120,11 +154,12 @@ def main():
             configuration(os.environ, 2**63 - 1)
             key = credentials(os.environ.get("INDEXER_SECRET_FILE", "/run/secrets/helius"))
             endpoint = "https://mainnet.helius-rpc.com/?api-key=" + key
-            config = configuration(os.environ, finalized_tip(endpoint))
+            config = resume_configuration(session, os.environ, finalized_tip(endpoint))
             env = {**os.environ, "HELIUS_API_KEY": key, "INDEXER_LIVE_OPT_IN": "1", "SOLANA_RPC_URL": endpoint}
         CONSOLE.require_database_url()
         initialize(session, Path(os.environ.get("INDEXER_BINARY", "/usr/local/bin/helius-indexer")), config["database"])
         if not inspect_only:
+            CONSOLE.command(session,"replay-create",config["database"],config["replay_job"],config["mint"],config["slot_start"],config["slot_end"])
             atomic_json(session / "session.json", config)
             atomic_json(session / "worker.json", {"state": "starting", "coverage": "unknown"})
         stopped = threading.Event()
@@ -136,17 +171,15 @@ def main():
             return execute_cycle(session, args, env, timeout or config["seconds"] + 60, track, report_name)
 
         def worker():
-            # Cycle 1 is the bounded live+backfill run; later cycles resume live intake only.
+            # Both workers resume independently; replay budgets never reset between cycles.
             db, resume, number, last = config["database"], config["live_from"], 0, {}
             while not stopped.is_set():
                 number += 1
                 atomic_json(session / "worker.json", {**last, "state": "running", "cycle": number, "coverage": "unknown"})
                 try:
-                    code, result = cycle(["monitor", db, config["mint"], resume, config["slot_start"],
-                                          config["slot_end"], config["seconds"]] if number == 1
-                                         else ["live", db, resume, config["seconds"], config["mint"]])
-                    failed = not result or code != 0 or any(
-                        result.get(source, {}).get("outcome") == "failed" for source in ["live", "historical"])
+                    code, result = cycle(["replay-monitor",db,config["replay_job"],resume,config["seconds"]])
+                    # Historical expiry/exhaustion remains visible without delaying live reconnects.
+                    failed=not result or code!=0 or result.get("live",{}).get("outcome")=="failed"
                     # A large first prune measured ~30 s; a timeout rolls the prune back.
                     if stopped.is_set():
                         atomic_json(session / "worker.json", {"state": "stopped", "cycle": number, "coverage": "unknown"})
@@ -154,7 +187,7 @@ def main():
                     prune_code, pruned = cycle(["prune", db, config["keep"]], timeout=300, report_name="prune.json")
                     if prune_code != 0:
                         raise RuntimeError("Prune failed")
-                    resume = CONSOLE.command(session, "live-status", db).get("last_received_slot") or resume
+                    resume = resume_slot(CONSOLE.command(session, "live-status", db), config["mint"]) or resume
                 except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
                     code, result, failed, pruned = None, None, True, None
                 last = {"exit_code": code, "report": result, "pruned": pruned, "resume_from": resume}
@@ -166,7 +199,7 @@ def main():
             return {"worker": json.loads((session / "worker.json").read_text()), "configuration": config,
                     "summary": CONSOLE.command(session, "summary", config["database"], config["mint"]),
                     "live": CONSOLE.command(session, "live-status", config["database"]),
-                    "historical": CONSOLE.command(session, "coverage", config["database"], config["mint"], config["slot_start"], config["slot_end"])}
+                    "historical": CONSOLE.command(session, "replay-status", config["database"], config["replay_job"]) if config.get("replay_job") else CONSOLE.command(session,"coverage",config["database"],config["mint"],config["slot_start"],config["slot_end"])}
         port = integer(os.environ, "INDEXER_CONSOLE_PORT", 8767, 1024, 65535)
         server = CONSOLE.HTTPServer(("0.0.0.0", port), CONSOLE.handler_for(session, port, runtime_status=status))
         thread = threading.Thread(target=worker) if not inspect_only else None

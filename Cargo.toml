@@ -22,13 +22,16 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ureq = { version = "3", default-features = false, features = ["rustls", "json"] }
 
-tokio = { version = "1", features = ["rt", "time", "macros"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "macros"] }
 tokio-stream = "0.1"
 tonic = { version = "0.14", features = ["tls-native-roots", "tls-ring"] }
 postgres = "0.19"
 tokio-postgres-rustls = { version = "0.14", default-features = false }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-native-certs = "0.8"
+# curl-static: rdkafka-sys cannot disable librdkafka curl detection, so a bundled static
+# libcurl makes every build identical. Curl is not configured or used at runtime.
+rdkafka = { version = "=0.39.0", default-features = false, features = ["cmake-build", "curl-static"] }
 
 [dev-dependencies]
 rcgen = "0.14"

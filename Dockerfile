@@ -2,6 +2,8 @@
 FROM rust:1.99.0-bookworm@sha256:114c7a4425406451c2866b6aafe69fe29b1b298832db1277d411ac73c82d04d6 AS build
 WORKDIR /build
 ENV CARGO_BUILD_JOBS=2
+# Build stage only: cmake compiles the vendored librdkafka; the runtime image is unchanged.
+RUN apt-get update && apt-get install -y --no-install-recommends cmake && rm -rf /var/lib/apt/lists/*
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 RUN --mount=type=cache,id=helius-indexer-console-registry-v1,target=/usr/local/cargo/registry \

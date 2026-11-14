@@ -3,7 +3,16 @@ use crate::{Error, Result};
 use postgres::{Client, NoTls};
 
 /// Applied in order; never edit a released entry, append a new version instead.
-pub(crate) const MIGRATIONS: &[(i32, &str)] = &[(1, include_str!("migrations/0001_initial.sql"))];
+pub(crate) const MIGRATIONS: &[(i32, &str)] = &[
+    (1, include_str!("migrations/0001_initial.sql")),
+    (2, include_str!("migrations/0002_kafka_producer_cursor.sql")),
+    (3, include_str!("migrations/0003_kafka_offsets.sql")),
+    (4, include_str!("migrations/0004_replay_jobs.sql")),
+    (
+        5,
+        include_str!("migrations/0005_replay_input_provenance.sql"),
+    ),
+];
 
 /// Connection errors are reduced to a class: driver messages can echo the URL or credentials.
 /// Loopback and Unix sockets may be plaintext; every other host requires authenticated TLS.
@@ -231,6 +240,11 @@ impl TestDatabase {
 
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
+        Self::on(Self::url())
+    }
+
+    /// A throwaway session on an explicit server, for opt-in hosted measurements only.
+    pub fn on(url: String) -> Self {
         use std::sync::atomic::{AtomicU32, Ordering};
         static NEXT: AtomicU32 = AtomicU32::new(0);
         let nanos = std::time::SystemTime::now()
@@ -242,7 +256,7 @@ impl TestDatabase {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         );
-        let db = Database::new(Self::url(), &session).unwrap();
+        let db = Database::new(url, &session).unwrap();
         connect(&db.url)
             .and_then(|mut c| {
                 c.batch_execute(&format!("DROP SCHEMA IF EXISTS \"{session}\" CASCADE"))

@@ -64,7 +64,7 @@ existing package. Start live first; allow at most one historical worker initiall
 The historical worker can run an archive batch or replay job without waiting for
 the first live cycle to finish, and can resume after any live-cycle boundary.
 Reuse live-priority write admission, bounded buffers and explicit cancellation.
-Do not turn this into separate ingestion processes sharing only SQLite locks and
+Do not turn this into separate ingestion processes sharing only database locks and
 then claim the existing in-process priority guarantee still applies.
 
 Each job durably records:
@@ -141,7 +141,7 @@ Existing RPC/archive validation commands and evidence remain available.
    coverage evidence before building the job model. Then, as separate PRs,
    implement bounded replay for recent requested ranges, immutable job scopes,
    durable recovery/processing state and independent live/history scheduling.
-   Verify with real SQLite: duplicates, out-of-order input, decoder failures,
+   Verify with real PostgreSQL: duplicates, out-of-order input, decoder failures,
    crashes around input/output/job acknowledgments, restart of the same 50-slot
    scope, expiry of replay availability and provider outage without losing live
    priority. Tests must reject a fake complete checkpoint based on a later slot.
@@ -181,8 +181,8 @@ prerequisites before presenting Docker support as ready.
 
 ## Current implementation and migration
 
-The current Docker runtime still performs a first-cycle bounded RPC backfill and
-then live-only cycles. It is not the completed design above. The existing archive/
+The recent-only runtime now uses frozen PostgreSQL replay jobs with independent
+live and historical workers. Archive routing and the full handoff remain pending. The existing archive/
 RPC bridge validates full-block evidence and remains useful for optional checks.
 The unfinished uncommitted runtime experiment using RPC as the normal recent
 source was removed from build paths; a local ignored copy is retained for reference.
