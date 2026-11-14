@@ -1054,8 +1054,9 @@ mod consumer_tests {
     }
 
     /// Opt-in: drain time for INDEXER_MEASURE_INPUTS inputs (default 2,400) over 6
-    /// partitions with 1, 2 and 4 consumers, against the local broker and the database
-    /// named by INDEXER_TEST_DATABASE_URL (a hosted one needs its TLS settings too).
+    /// partitions with 1, 2 and 4 consumers, against the local broker and the local test
+    /// database, or the hosted one named by INDEXER_HOSTED_DATABASE_URL (with its TLS
+    /// settings). Ordinary tests never use a hosted database.
     #[test]
     #[ignore = "opt-in throughput measurement"]
     fn measure_consumer_group_throughput() {
@@ -1076,7 +1077,8 @@ mod consumer_tests {
             .collect();
         let mut results = Vec::new();
         for consumers in [1usize, 2, 4] {
-            let test = TestDatabase::new();
+            let test = std::env::var("INDEXER_HOSTED_DATABASE_URL")
+                .map_or_else(|_| TestDatabase::new(), TestDatabase::on);
             let topic = TestTopic::new(6);
             produce(&topic.0, &updates);
             Store::open(&test.0).unwrap();

@@ -36,7 +36,7 @@ load, LaserStream reorder distance, and rebalance counts.
 Same day and laptop, local Kafka, consumers writing to the owner's Railway
 PostgreSQL over pinned TLS (190 ms round trip). 600 inputs, 6 partitions, throwaway
 schemas dropped afterwards:
-`INDEXER_TEST_DATABASE_URL=<railway> INDEXER_DB_TLS_SHA256=<pin> INDEXER_MEASURE_INPUTS=600 cargo test --lib measure_consumer_group_throughput -- --ignored --nocapture`.
+`INDEXER_HOSTED_DATABASE_URL=<railway> INDEXER_DB_TLS_SHA256=<pin> INDEXER_MEASURE_INPUTS=600 cargo test --lib measure_consumer_group_throughput -- --ignored --nocapture`.
 
 | Consumers | Drain time | Transactions/s |
 | --- | --- | --- |
