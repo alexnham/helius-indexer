@@ -235,6 +235,11 @@ impl TestDatabase {
 
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
+        Self::on(Self::url())
+    }
+
+    /// A throwaway session on an explicit server, for opt-in hosted measurements only.
+    pub fn on(url: String) -> Self {
         use std::sync::atomic::{AtomicU32, Ordering};
         static NEXT: AtomicU32 = AtomicU32::new(0);
         let nanos = std::time::SystemTime::now()
@@ -246,7 +251,7 @@ impl TestDatabase {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         );
-        let db = Database::new(Self::url(), &session).unwrap();
+        let db = Database::new(url, &session).unwrap();
         connect(&db.url)
             .and_then(|mut c| {
                 c.batch_execute(&format!("DROP SCHEMA IF EXISTS \"{session}\" CASCADE"))

@@ -30,3 +30,22 @@ measured.
 Not measured: hosted PostgreSQL with several consumers (one hosted writer reached
 45 tx/s, see [hosted TLS and batching](2026-11-14-hosted-postgres-tls.md)), sustained
 load, LaserStream reorder distance, and rebalance counts.
+
+## Hosted PostgreSQL (Railway)
+
+Same day and laptop, local Kafka, consumers writing to the owner's Railway
+PostgreSQL over pinned TLS (190 ms round trip). 600 inputs, 6 partitions, throwaway
+schemas dropped afterwards:
+`INDEXER_HOSTED_DATABASE_URL=<railway> INDEXER_DB_TLS_SHA256=<pin> INDEXER_MEASURE_INPUTS=600 cargo test --lib measure_consumer_group_throughput -- --ignored --nocapture`.
+
+| Consumers | Drain time | Transactions/s |
+| --- | --- | --- |
+| 1 | 9.21 s | 65 |
+| 2 | 8.34 s | 72 |
+| 4 | 9.38 s | 64 |
+
+**All three are below the ~80 transactions/s USDC load.** Adding consumers barely
+helps, which points at this laptop's link to Railway (upload volume and round trips)
+rather than writer count. That is inference: the link was not measured. Running
+consumers in the same region as the database is the expected fix and is not yet
+measured. The hosted USDC target therefore remains unproven.
