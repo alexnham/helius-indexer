@@ -1,6 +1,7 @@
 pub mod backfill;
 pub mod coordinator;
 pub mod decoder;
+pub mod kafka;
 pub mod live;
 pub mod model;
 mod reconcile;

@@ -172,12 +172,13 @@ alerts arrive with the corresponding pipeline stages.
 
 ## Verify
 
-Storage tests need the local PostgreSQL container (loopback port 55432; each test
+Kafka tests need the local broker (loopback port 59092; each test uses its own topic).
+Building needs `cmake`, which compiles the vendored librdkafka. Storage tests need the local PostgreSQL container (loopback port 55432; each test
 uses its own schema). Set `INDEXER_TEST_DATABASE_URL` to use another local server.
 This makes no provider calls; never point tests at a hosted database.
 
 ```sh
-docker compose up -d postgres
+docker compose up -d postgres kafka
 cargo fetch --locked
 cargo fmt --check
 cargo clippy --offline --locked --all-targets -- -D warnings
