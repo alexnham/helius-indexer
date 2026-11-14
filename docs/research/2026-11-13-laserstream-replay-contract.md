@@ -2,7 +2,8 @@
 
 Verified 2026-11-13 against current Helius primary documentation using the Helius
 Docs MCP, and the repository's generated `laserstream-core-proto` 14.0.0 client.
-This is the source-contract prerequisite for issue #30, not a completed replay job.
+Rechecked replay availability and check/subscribe races on 2026-11-14 using the
+Helius Docs MCP. The source-completion limitation below remains unchanged.
 
 ## Verified transport capabilities
 

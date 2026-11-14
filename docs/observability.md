@@ -295,3 +295,40 @@ including absent parent/child anchors. Conflicting concurrent observations fail
 closed. Summary rows stream through checked u128 accumulation instead of loading
 a mint's history into a client-side vector. Existing bounded error classes and
 credential redaction apply.
+
+## Replay jobs and source separation
+
+The replay job report includes frozen range/revision, consumed allowance and
+unique/decoded/unresolved/retained-raw counts in a repeatable-read snapshot.
+Attempt history includes availability observation time/age and margin, terminal
+classes and later-slot observations. Failures and pending age remain visible
+after restart. Queryable transfers in scope are separate from processing receipts;
+coverage and verified boundary remain unknown.
+
+The paired worker shares live-priority admission, bounds historical waiting and
+starts history after live initialization rather than after its cycle. Raw-input
+`ingestion_mode` keeps replay out of live arrival/freshness and resume counters.
+The shared intake emits connection/retry/end/failure events and stage duration,
+transaction/input-byte/write diagnostics with mode `historical` for replay.
+`replay_attempt_finished`, retry and explicit budget-grant events use the replay
+component with bounded failure classes. Retrying retained input makes no provider
+request. Telemetry writes remain best-effort and cannot undo durable input/output.
+No mint/slot/signature metric labels are added.
+
+The console shows remaining budgets, processing versus raw retention and unknown
+coverage, alongside live reports and actual query output. Current JSON snapshots
+are inspection telemetry, not a production continuous exporter or alert system.
+See [replay jobs](replay-jobs.md) for bounds and operating commands.
+
+
+### Replay integration with batched writes and Kafka
+
+The shared network driver runs synchronous PostgreSQL and Kafka operations after
+leaving Tokio's network future. Live input retains the 100-input/16-MiB/200-ms
+flush bounds, atomic batch output/status acknowledgment and storage write metrics.
+With Kafka configured, only live input publishes there; delivery-confirmed cursors
+retain the existing reorder margin. Historical replay keeps separate durable raw
+receipts and charged allowances, and cannot advance the live producer cursor.
+The runtime resumes Kafka from the stored `resume_from`, never its maximum raw
+slot. Deterministic tests exercise direct batch acknowledgment and Kafka publication
+alongside a replay receipt using real local PostgreSQL/Kafka, without provider calls.

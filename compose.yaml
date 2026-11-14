@@ -1,6 +1,6 @@
 services:
   console:
-    image: helius-indexer-console:local
+    image: ${INDEXER_CONSOLE_IMAGE:-helius-indexer-console:local}
     build:
       context: .
       target: console
@@ -29,7 +29,7 @@ services:
 
   runtime:
     profiles: [live]
-    image: helius-indexer-console:local
+    image: ${INDEXER_CONSOLE_IMAGE:-helius-indexer-console:local}
     build:
       context: .
       target: console
@@ -39,6 +39,7 @@ services:
       INDEXER_RUN: ${INDEXER_RUN:-1}
       INDEXER_MINT: ${INDEXER_MINT:-EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v}
       INDEXER_LIVE_SECONDS: ${INDEXER_LIVE_SECONDS:-60}
+      INDEXER_REPLAY_JOB: ${INDEXER_REPLAY_JOB:-recent}
       INDEXER_BACKFILL_SLOTS: ${INDEXER_BACKFILL_SLOTS:-50}
       INDEXER_BACKFILL_START: ${INDEXER_BACKFILL_START:-}
       INDEXER_BACKFILL_END: ${INDEXER_BACKFILL_END:-}

@@ -6,6 +6,7 @@ pub mod live;
 pub mod model;
 mod reconcile;
 pub mod repair;
+pub mod replay;
 pub mod storage;
 pub mod telemetry;
 

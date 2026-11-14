@@ -37,6 +37,16 @@ retention, and production analytics are subsequent tickets. This CLI is a bounde
 inspection tool, not a production 30-day API. Captured-query responses report coverage as
 `unknown`; processing one transaction never establishes complete slot coverage.
 
+## Recent replay and live testing
+
+The opt-in runtime now uses LaserStream historical replay for a configurable
+recent range, with durable job scope and budgets. Live intake has priority;
+processing receipts survive the local newest-1,000-transfer cap. Query progress
+and failures through `/api/status` and actual rows through `/api/transfers`.
+Filtered replay does not prove complete slots: verified coverage remains unknown.
+See [runtime testing](docs/runtime-testing.md) and [replay jobs](docs/replay-jobs.md).
+Old Faithful routing and production 30-day retention remain pending.
+
 ## Run the captured example
 
 Requires Rust/Cargo (declared minimum Rust 1.89) and PostgreSQL. The bundled
