@@ -156,14 +156,19 @@ alerts arrive with the corresponding pipeline stages.
 
 ## Verify
 
+Storage tests need the local PostgreSQL container (loopback port 55432; each test
+uses its own schema). Set `INDEXER_TEST_DATABASE_URL` to use another local server.
+This makes no provider calls; never point tests at a hosted database.
+
 ```sh
+docker compose --profile db up -d postgres
 cargo fetch --locked
 cargo fmt --check
 cargo clippy --offline --locked --all-targets -- -D warnings
 cargo test --offline --locked
 ```
 
-CI performs these checks without provider credentials. Tests cover the captured
+CI performs these checks without provider credentials, using a PostgreSQL service container. Tests cover the captured
 transaction, synthetic boundary cases, exact u64 serialization, malformed data,
 unsupported execution, versioned addresses, duplicate ingestion, separate-process
 querying, atomic rollback under a failed database write, retained decode failures,

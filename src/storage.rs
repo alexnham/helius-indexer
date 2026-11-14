@@ -2,6 +2,7 @@
 pub(crate) mod bridge;
 pub(crate) mod history;
 pub(crate) mod live;
+pub(crate) mod pg;
 pub(crate) mod repair;
 use crate::{
     Error, Result,
@@ -227,6 +228,12 @@ impl Store {
             .commit()
             .map_err(|_| Error("storage_commit_failed"))?;
         Ok(inserted)
+    }
+
+    /// Applies pending PostgreSQL schema migrations to the database at `url`.
+    pub fn migrate(url: &str) -> Result<serde_json::Value> {
+        let version = pg::migrate(&mut pg::connect(url)?, pg::MIGRATIONS)?;
+        Ok(serde_json::json!({"schema_version":version}))
     }
 
     pub fn summary(path: &Path, mint: &str) -> Result<serde_json::Value> {
