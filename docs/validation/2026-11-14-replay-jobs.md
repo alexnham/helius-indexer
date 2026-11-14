@@ -65,10 +65,11 @@ The stored inputs remain local; no provider payload or credential is committed.
 
 ## Upgrade and deterministic verification
 
-Migration 0003 upgrades the committed version 2 prototype instead of editing its
-already-applied migration. Existing budgets/receipts survive, raw rows referenced
+Migrations 0004/0005 (renumbered after main's Kafka migrations 0002/0003) upgrade
+the earlier local version 2/3 replay prototypes instead of editing their
+already-applied migrations. Existing budgets/receipts survive, raw rows referenced
 by replay receipts are classified as replay, and unavailable historical provenance
-remains null. The regression retries a version 2 pending input against real
+remains null. The regressions retry a prototype version 2 pending input against real
 PostgreSQL, checks exact query amount/fee and rejects an older binary's schema
 view. Restore a pre-upgrade backup with its matching binary to roll back.
 
