@@ -351,7 +351,19 @@ pub fn consume(
         let due =
             since.is_some_and(|s| s.elapsed() >= BATCH_WINDOW) || buffer.len() >= BATCH_INPUTS;
         if (done || due) && !buffer.is_empty() {
-            write_consumed(&mut store, &group, topic, &buffer, &mut totals)?;
+            if let Err(error) = write_consumed(&mut store, &group, topic, &buffer, &mut totals) {
+                // shortcut: a deterministic per-item storage failure blocks its partition on
+                // every restart; retaining it in live_raw and advancing is a follow-up (#36).
+                let mut telemetry = crate::telemetry::Telemetry::default();
+                telemetry.set_context("kafka_consumer", "kafka", "live");
+                telemetry.emit(
+                    "consumer_stopped_on_storage_failure",
+                    "consume",
+                    "failed",
+                    Some(error.0),
+                );
+                return Err(error);
+            }
             buffer.clear();
             since = None;
         }
@@ -419,10 +431,15 @@ fn write_consumed(
         let next = offsets.entry(message.partition()).or_insert(0);
         *next = (*next).max(message.offset() + 1);
         let payload = message.payload().unwrap_or_default();
-        let slot = message
+        let Some(slot) = message
             .key()
             .and_then(|k| <[u8; 8]>::try_from(k).ok())
-            .map_or(0, u64::from_be_bytes) as i64;
+            .map(|k| u64::from_be_bytes(k) as i64)
+        else {
+            // Every produced message is keyed by slot; anything else is retained, not guessed.
+            retained.push((0, payload.to_vec(), "kafka_message_missing_key"));
+            continue;
+        };
         let schema = message.headers().and_then(|headers| {
             headers
                 .iter()
@@ -815,6 +832,32 @@ mod consumer_tests {
             "a restart resumes from stored positions"
         );
         assert_eq!(Store::query(&test.0, None, 100).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_message_without_a_slot_key_is_retained_with_its_own_class() {
+        use rdkafka::producer::{BaseProducer, BaseRecord, Producer};
+        let test = TestDatabase::new();
+        let topic = TestTopic::new(1);
+        let producer: BaseProducer = super::config(&test_brokers()).create().unwrap();
+        producer
+            .send(BaseRecord::<(), [u8]>::to(&topic.0).payload(&signed(9, 123).encode_to_vec()))
+            .map_err(|(e, _)| e)
+            .unwrap();
+        producer.flush(Duration::from_secs(10)).unwrap();
+        let report = consume(&test.0, &test_brokers(), &topic.0, 5).unwrap();
+        assert_eq!(report["retained_failures"], 1);
+        let status: String = test
+            .sql()
+            .query_one("SELECT status FROM live_raw", &[])
+            .unwrap()
+            .get(0);
+        assert_eq!(status, "kafka_message_missing_key");
+        assert_eq!(
+            stored_positions(&test),
+            1,
+            "the unkeyed message is not replayed forever"
+        );
     }
 
     #[test]
