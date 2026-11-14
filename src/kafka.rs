@@ -911,6 +911,53 @@ mod consumer_tests {
         );
     }
 
+    /// Opt-in: drain time for 2,400 inputs over 6 partitions with 1, 2 and 4 consumers,
+    /// against the local broker and the database named by INDEXER_TEST_DATABASE_URL.
+    #[test]
+    #[ignore = "opt-in throughput measurement"]
+    fn measure_consumer_group_throughput() {
+        const INPUTS: u16 = 2_400;
+        let updates: Vec<_> = (0..INPUTS)
+            .map(|i| {
+                let mut tx = signed(1, 2_000 + u64::from(i));
+                let mut signature = vec![(i % 251) as u8 + 1; 64];
+                signature[..2].copy_from_slice(&i.to_be_bytes());
+                let info = tx.transaction.as_mut().unwrap();
+                info.signature = signature.clone();
+                info.transaction.as_mut().unwrap().signatures = vec![signature];
+                tx
+            })
+            .collect();
+        let mut results = Vec::new();
+        for consumers in [1usize, 2, 4] {
+            let test = TestDatabase::new();
+            let topic = TestTopic::new(6);
+            produce(&topic.0, &updates);
+            Store::open(&test.0).unwrap();
+            let started = std::time::Instant::now();
+            let workers: Vec<_> = (0..consumers)
+                .map(|_| {
+                    let (db, name) = (test.0.clone(), topic.0.clone());
+                    std::thread::spawn(move || consume(&db, &test_brokers(), &name, 60).unwrap())
+                })
+                .collect();
+            let drained = loop {
+                if stored_positions(&test) >= i64::from(INPUTS) {
+                    break started.elapsed().as_secs_f64();
+                }
+                assert!(started.elapsed() < Duration::from_secs(60), "not drained");
+                std::thread::sleep(Duration::from_millis(50));
+            };
+            for worker in workers {
+                worker.join().unwrap();
+            }
+            assert_eq!(Store::query(&test.0, None, 1000).unwrap().len(), 1000);
+            results.push(serde_json::json!({"consumers":consumers,"inputs":INPUTS,
+                "drain_seconds":drained,"transactions_per_second":f64::from(INPUTS)/drained}));
+        }
+        println!("{}", serde_json::Value::Array(results));
+    }
+
     #[test]
     fn a_stale_consumer_cannot_rewind_stored_positions() {
         use crate::storage::Acknowledge;
