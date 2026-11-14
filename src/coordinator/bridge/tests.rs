@@ -1,5 +1,6 @@
 use super::*;
 use crate::storage::Store;
+use rusqlite::params;
 use std::collections::BTreeMap;
 
 struct Source {
@@ -52,7 +53,7 @@ fn setup(end: u64) -> (tempfile::TempDir, std::path::PathBuf, Plan, Source, Sour
         end,
         snapshot: json!({"last_observed_archive_slot":12,"reference_slot":end,"tip_exact_within_probed_epochs":true,"measured_at_unix_seconds":1}),
     };
-    save(&database(&path).unwrap(), &plan).unwrap();
+    save(&BridgeLog::open(&path).unwrap(), &plan).unwrap();
     let a = Source {
         archive: true,
         blocks: (10..=12).map(|s| (s, block(s, s - 1, s == 12))).collect(),
@@ -122,23 +123,24 @@ fn source_failure_keeps_checkpoint_before_boundary_and_resume_repairs_it() {
 #[test]
 fn crash_between_output_and_boundary_proof_cannot_claim_completion() {
     let (_dir, path, plan, mut a, mut r) = setup(15);
-    let db = database(&path).unwrap();
-    db.execute_batch("CREATE TRIGGER fail_proof BEFORE INSERT ON bridge_overlap_proofs BEGIN SELECT RAISE(FAIL,'injected'); END;").unwrap();
+    let db = BridgeLog::open(&path).unwrap();
+    db.sql().execute_batch("CREATE TRIGGER fail_proof BEFORE INSERT ON bridge_overlap_proofs BEGIN SELECT RAISE(FAIL,'injected'); END;").unwrap();
     let interrupted = work(&path, &plan, &mut a, &mut r);
     assert_eq!(interrupted["historical"]["complete"], false);
     assert_eq!(interrupted["historical"]["overlap_verified"], false);
     assert_eq!(Store::query(&path, None, 100).unwrap().len(), 2);
-    db.execute_batch("DROP TRIGGER fail_proof;").unwrap();
+    db.sql().execute_batch("DROP TRIGGER fail_proof;").unwrap();
     assert_eq!(
         work(&path, &plan, &mut a, &mut r)["historical"]["complete"],
         true
     );
     assert_eq!(Store::query(&path, None, 100).unwrap().len(), 2);
-    db.execute(
-        "UPDATE historical_slots SET attempts=attempts+1 WHERE slot=12",
-        [],
-    )
-    .unwrap();
+    db.sql()
+        .execute(
+            "UPDATE historical_slots SET attempts=attempts+1 WHERE slot=12",
+            [],
+        )
+        .unwrap();
     assert_eq!(
         status(&path, &plan.mint, 10).unwrap()["historical"]["overlap_verified"],
         false
@@ -189,7 +191,7 @@ fn cancellation_and_batch_limits_leave_unscheduled_work_visible() {
 #[test]
 fn frozen_plan_is_revision_scoped_and_large_gap_report_is_bounded() {
     let (_dir, path, mut plan, _a, _r) = setup(15);
-    let db = database(&path).unwrap();
+    let db = BridgeLog::open(&path).unwrap();
     plan.end = 1_000_000;
     plan.snapshot["reference_slot"] = json!(plan.end);
     // Save never moves the same plan's endpoint implicitly.
@@ -200,7 +202,8 @@ fn frozen_plan_is_revision_scoped_and_large_gap_report_is_bounded() {
     assert_eq!(state.unfinished.len(), 2);
     assert_eq!(state.unfinished[0].source_kind, "archive");
     assert_eq!(state.unfinished[1].source_kind, "rpc");
-    db.execute("UPDATE bridge_plans SET decoder='old'", [])
+    db.sql()
+        .execute("UPDATE bridge_plans SET decoder='old'", [])
         .unwrap();
     assert!(load(&db, &plan.mint, 10).unwrap().is_none());
     plan.snapshot["tip_exact_within_probed_epochs"] = json!(false);
@@ -231,8 +234,8 @@ fn conflicting_cross_source_parent_link_fails_before_new_transfers() {
 #[test]
 fn skipped_run_longer_than_a_batch_does_not_starve_its_produced_child() {
     let (_dir, path, mut plan, mut a, mut r) = setup(32);
-    let db = database(&path).unwrap();
-    db.execute("DELETE FROM bridge_plans", []).unwrap();
+    let db = BridgeLog::open(&path).unwrap();
+    db.sql().execute("DELETE FROM bridge_plans", []).unwrap();
     plan.tip = 30;
     plan.snapshot["last_observed_archive_slot"] = json!(30);
     save(&db, &plan).unwrap();
@@ -319,21 +322,22 @@ fn parent_arriving_after_child_must_match_its_retained_hash_link() {
             .0,
         "block_parent_conflict"
     );
-    let db = database(&path).unwrap();
+    let db = BridgeLog::open(&path).unwrap();
     assert_eq!(
-        db.query_row("SELECT COUNT(*) FROM historical_block_identity", [], |r| {
-            r.get::<_, i64>(0)
-        })
-        .unwrap(),
+        db.sql()
+            .query_row("SELECT COUNT(*) FROM historical_block_identity", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap(),
         1
     );
 }
 #[test]
 fn missing_interval_samples_truncate_without_losing_total_counts() {
     let (_dir, path, plan, _a, _r) = setup(120);
-    let db = database(&path).unwrap();
+    let db = BridgeLog::open(&path).unwrap();
     for slot in (14i64..=120).step_by(2) {
-        db.execute("INSERT INTO historical_slots(mint,decoder,slot,status,first_pending) VALUES(?1,?2,?3,'skipped',1)",params![plan.mint,decoder::DECODER_VERSION,slot]).unwrap();
+        db.sql().execute("INSERT INTO historical_slots(mint,decoder,slot,status,first_pending) VALUES(?1,?2,?3,'skipped',1)",params![plan.mint,decoder::DECODER_VERSION,slot]).unwrap();
     }
     let report = progress(&db, &plan).unwrap();
     assert!(report.ranges_truncated);
@@ -357,30 +361,33 @@ fn corroborated_boundary_is_ready_but_native_rpc_stays_incomplete_even_after_res
             .blocks
             .insert(12, serde_json::to_vec(&value).unwrap());
     }
-    let db = database(&path).unwrap();
-    db.execute_batch("CREATE TRIGGER fail_pair_proof BEFORE INSERT ON bridge_overlap_proofs BEGIN SELECT RAISE(FAIL,'injected'); END;").unwrap();
+    let db = BridgeLog::open(&path).unwrap();
+    db.sql().execute_batch("CREATE TRIGGER fail_pair_proof BEFORE INSERT ON bridge_overlap_proofs BEGIN SELECT RAISE(FAIL,'injected'); END;").unwrap();
     let interrupted = work(&path, &plan, &mut a, &mut r);
     assert_eq!(interrupted["historical"]["boundary_ready"], false);
     assert_eq!(interrupted["historical"]["complete"], false);
     assert!(!Store::query(&path, None, 100).unwrap().is_empty());
-    db.execute_batch("DROP TRIGGER fail_pair_proof;").unwrap();
+    db.sql()
+        .execute_batch("DROP TRIGGER fail_pair_proof;")
+        .unwrap();
     let ready = work(&path, &plan, &mut a, &mut r);
     assert_eq!(ready["historical"]["boundary_ready"], true);
     assert_eq!(ready["historical"]["complete"], true);
     assert_eq!(ready["historical"]["overlap_verified"], false);
     assert_eq!(ready["historical"]["overlap_recovered"], true);
     assert_eq!(ready["live_tail"]["coverage"], "unknown");
-    let native:String=db.query_row("SELECT status FROM historical_source_slots WHERE slot=12 AND source_kind='finalized-mainnet-rpc'",[],|r|r.get(0)).unwrap();
+    let native:String=db.sql().query_row("SELECT status FROM historical_source_slots WHERE slot=12 AND source_kind='finalized-mainnet-rpc'",[],|r|r.get(0)).unwrap();
     assert_eq!(native, "unknown");
     assert_eq!(
         status(&path, &plan.mint, 10).unwrap()["historical"]["boundary_ready"],
         true
     );
-    db.execute(
-        "UPDATE historical_slots SET attempts=attempts+1 WHERE slot=12",
-        [],
-    )
-    .unwrap();
+    db.sql()
+        .execute(
+            "UPDATE historical_slots SET attempts=attempts+1 WHERE slot=12",
+            [],
+        )
+        .unwrap();
     assert_eq!(
         status(&path, &plan.mint, 10).unwrap()["historical"]["boundary_ready"],
         false

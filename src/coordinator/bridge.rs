@@ -4,9 +4,9 @@ use crate::{
     Error, Result, archive,
     backfill::{BlockSource, History, Metrics, RpcSource},
     decoder,
+    storage::bridge::BridgeLog,
     telemetry::Telemetry,
 };
-use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
@@ -47,47 +47,34 @@ impl Plan {
         Ok(())
     }
 }
-fn database(path: &Path) -> Result<Connection> {
-    History::open(path)?;
-    let db = Connection::open(path).map_err(|_| Error("storage_open_failed"))?;
-    db.busy_timeout(Duration::from_secs(5))
-        .map_err(|_| Error("storage_configuration_failed"))?;
-    db.execute_batch("PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS bridge_plans(mint TEXT NOT NULL,decoder TEXT NOT NULL,start INTEGER NOT NULL,archive_tip INTEGER NOT NULL,reference_slot INTEGER NOT NULL,snapshot TEXT NOT NULL,next_slot INTEGER NOT NULL,PRIMARY KEY(mint,decoder,start)); CREATE TABLE IF NOT EXISTS bridge_overlap_proofs(mint TEXT NOT NULL,decoder TEXT NOT NULL,slot INTEGER NOT NULL,verified_attempt INTEGER NOT NULL,PRIMARY KEY(mint,decoder,slot));").map_err(|_|Error("storage_write_failed"))?;
-    Ok(db)
+fn load(db: &BridgeLog, mint: &str, start: u64) -> Result<Option<Plan>> {
+    db.plan(mint, start)?
+        .map(|(tip, end, snapshot)| {
+            if snapshot.len() > 16384 {
+                return Err(Error("invalid_bridge_plan"));
+            }
+            let plan = Plan {
+                mint: mint.into(),
+                start,
+                tip: u64::try_from(tip).map_err(|_| Error("invalid_bridge_plan"))?,
+                end: u64::try_from(end).map_err(|_| Error("invalid_bridge_plan"))?,
+                snapshot: serde_json::from_str(&snapshot)
+                    .map_err(|_| Error("invalid_bridge_plan"))?,
+            };
+            plan.validate()?;
+            Ok(plan)
+        })
+        .transpose()
 }
-fn load(db: &Connection, mint: &str, start: u64) -> Result<Option<Plan>> {
-    let row:Option<(i64,i64,String)>=db.query_row("SELECT archive_tip,reference_slot,substr(snapshot,1,16385) FROM bridge_plans WHERE mint=?1 AND decoder=?2 AND start=?3",params![mint,decoder::DECODER_VERSION,start as i64],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(|_|Error("storage_read_failed"))?;
-    row.map(|(tip, end, snapshot)| {
-        if snapshot.len() > 16384 {
-            return Err(Error("invalid_bridge_plan"));
-        }
-        let plan = Plan {
-            mint: mint.into(),
-            start,
-            tip: u64::try_from(tip).map_err(|_| Error("invalid_bridge_plan"))?,
-            end: u64::try_from(end).map_err(|_| Error("invalid_bridge_plan"))?,
-            snapshot: serde_json::from_str(&snapshot).map_err(|_| Error("invalid_bridge_plan"))?,
-        };
-        plan.validate()?;
-        Ok(plan)
-    })
-    .transpose()
-}
-fn save(db: &Connection, plan: &Plan) -> Result<()> {
+fn save(db: &BridgeLog, plan: &Plan) -> Result<()> {
     plan.validate()?;
-    db.execute(
-        "INSERT OR IGNORE INTO bridge_plans VALUES(?1,?2,?3,?4,?5,?6,?3)",
-        params![
-            plan.mint,
-            decoder::DECODER_VERSION,
-            plan.start as i64,
-            plan.tip as i64,
-            plan.end as i64,
-            plan.snapshot.to_string()
-        ],
+    db.freeze_plan(
+        &plan.mint,
+        plan.start,
+        plan.tip,
+        plan.end,
+        &plan.snapshot.to_string(),
     )
-    .map_err(|_| Error("storage_write_failed"))?;
-    Ok(())
 }
 fn prepare(
     path: &Path,
@@ -97,7 +84,7 @@ fn prepare(
     telemetry: &mut Telemetry,
 ) -> Result<Plan> {
     crate::backfill::scope(mint, start, start)?;
-    let db = database(path)?;
+    let db = BridgeLog::open(path)?;
     if let Some(plan) = load(&db, mint, start)? {
         return Ok(plan);
     }
@@ -142,38 +129,18 @@ struct Progress {
     boundary_ready: bool,
     oldest_pending_age_seconds: Option<u64>,
 }
-fn progress(db: &Connection, plan: &Plan) -> Result<Progress> {
+fn progress(db: &BridgeLog, plan: &Plan) -> Result<Progress> {
     // Tie overlap proof to the exact durable attempt generation; retries invalidate it.
-    let proof:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM bridge_overlap_proofs p JOIN historical_slots h USING(mint,decoder,slot) WHERE p.mint=?1 AND p.decoder=?2 AND p.slot=?3 AND p.verified_attempt=h.attempts AND h.status='complete')",params![plan.mint,decoder::DECODER_VERSION,plan.tip as i64],|r|r.get(0)).map_err(|_|Error("storage_read_failed"))?;
-    let completed = |source: &str| -> Result<bool> {
-        db.query_row("SELECT EXISTS(SELECT 1 FROM historical_source_slots WHERE mint=?1 AND decoder=?2 AND slot=?3 AND source_kind=?4 AND status='complete')",params![plan.mint,decoder::DECODER_VERSION,plan.tip as i64,source],|r|r.get(0)).map_err(|_|Error("storage_read_failed"))
-    };
+    let proof = db.overlap_proven(&plan.mint, plan.tip)?;
+    let completed = |source: &str| db.source_complete(&plan.mint, plan.tip, source);
     let archive_complete = completed(archive::SOURCE)?;
     let overlap = proof && archive_complete && completed("finalized-mainnet-rpc")?;
     let recovered = proof && archive_complete && !overlap && completed(super::evidence::SOURCE)?;
     let ready = overlap || recovered;
     // The immutable identity ledger protects anchors; capture reconciliation
     // protects execution context. The boundary worker compares before either ack.
-    let mut query=db.prepare("SELECT h.slot FROM historical_slots h WHERE h.mint=?1 AND h.decoder=?2 AND h.slot BETWEEN ?3 AND ?4 AND (h.status='skipped' OR (h.status='complete' AND EXISTS(SELECT 1 FROM historical_source_slots s WHERE s.mint=h.mint AND s.decoder=h.decoder AND s.slot=h.slot AND s.status='complete' AND (s.source_kind=CASE WHEN h.slot<=?5 THEN 'old-faithful-jetstreamer' ELSE 'finalized-mainnet-rpc' END OR (h.slot>?5 AND s.source_kind='archive-rpc-corroborated' AND EXISTS(SELECT 1 FROM bridge_overlap_proofs p WHERE p.mint=h.mint AND p.decoder=h.decoder AND p.slot=h.slot AND p.verified_attempt=h.attempts)))))) ORDER BY h.slot").map_err(|_|Error("storage_read_failed"))?;
-    let rows = query
-        .query_map(
-            params![
-                plan.mint,
-                decoder::DECODER_VERSION,
-                plan.start as i64,
-                plan.end as i64,
-                plan.tip as i64
-            ],
-            |r| r.get::<_, i64>(0),
-        )
-        .map_err(|_| Error("storage_read_failed"))?;
-    let cursor: i64 = db
-        .query_row(
-            "SELECT next_slot FROM bridge_plans WHERE mint=?1 AND decoder=?2 AND start=?3",
-            params![plan.mint, decoder::DECODER_VERSION, plan.start as i64],
-            |r| r.get(0),
-        )
-        .map_err(|_| Error("storage_read_failed"))?;
+    let rows = db.verified_slots(&plan.mint, plan.start, plan.end, plan.tip)?;
+    let cursor = db.next_slot(&plan.mint, plan.start)?;
     let cursor = u64::try_from(cursor).map_err(|_| Error("invalid_bridge_plan"))?;
     if cursor < plan.start || cursor > plan.end + 1 {
         return Err(Error("invalid_bridge_plan"));
@@ -217,8 +184,7 @@ fn progress(db: &Connection, plan: &Plan) -> Result<Progress> {
         }
     };
     for row in rows {
-        let slot = u64::try_from(row.map_err(|_| Error("storage_read_failed"))?)
-            .map_err(|_| Error("invalid_bridge_plan"))?;
+        let slot = u64::try_from(row).map_err(|_| Error("invalid_bridge_plan"))?;
         if slot == plan.tip && !ready {
             continue;
         }
@@ -254,7 +220,7 @@ fn progress(db: &Connection, plan: &Plan) -> Result<Progress> {
     };
     Ok(result)
 }
-fn report(db: &Connection, plan: &Plan) -> Result<Value> {
+fn report(db: &BridgeLog, plan: &Plan) -> Result<Value> {
     Ok(
         json!({"mint":plan.mint,"decoder_version":decoder::DECODER_VERSION,"start":plan.start,"archive_tip":plan.tip,"finalized_reference":plan.end,"boundary_snapshot":plan.snapshot,"historical":progress(db,plan)?,"live_tail":{"start":plan.end+1,"end":null,"coverage":"unknown"}}),
     )
@@ -267,11 +233,11 @@ pub fn plan(
     telemetry: &mut Telemetry,
 ) -> Result<Value> {
     let plan = prepare(path, cache, mint, start, telemetry)?;
-    report(&database(path)?, &plan)
+    report(&BridgeLog::open(path)?, &plan)
 }
 pub fn status(path: &Path, mint: &str, start: u64) -> Result<Value> {
     crate::backfill::scope(mint, start, start)?;
-    let db = database(path)?;
+    let db = BridgeLog::open(path)?;
     report(
         &db,
         &load(&db, mint, start)?.ok_or(Error("bridge_plan_missing"))?,
@@ -287,7 +253,7 @@ fn batch<A: BlockSource, R: BlockSource>(
     telemetry: &mut Telemetry,
     cancelled: impl Fn() -> bool,
 ) -> Result<Value> {
-    let db = database(path)?;
+    let db = BridgeLog::open(path)?;
     let before = progress(&db, plan)?;
     let mut history = History::open(path)?;
     history.set_gate(Arc::clone(&gate));
@@ -321,16 +287,7 @@ fn batch<A: BlockSource, R: BlockSource>(
         history.verify_parent_gaps(&plan.mint, start, end)?;
         {
             let _permit = gate.historical()?;
-            db.execute(
-                "UPDATE bridge_plans SET next_slot=?1 WHERE mint=?2 AND decoder=?3 AND start=?4",
-                params![
-                    end as i64 + 1,
-                    plan.mint,
-                    decoder::DECODER_VERSION,
-                    plan.start as i64
-                ],
-            )
-            .map_err(|_| Error("storage_write_failed"))?;
+            db.advance(&plan.mint, plan.start, end + 1)?;
         }
     }
     let mut output = report(&db, plan)?;
@@ -395,7 +352,7 @@ pub fn run(
         crate::live::validate_options(start, seconds)?;
     }
     crate::backfill::scope(mint, start, start)?;
-    let plan = load(&database(path)?, mint, start)?.ok_or(Error("bridge_plan_missing"))?;
+    let plan = load(&BridgeLog::open(path)?, mint, start)?.ok_or(Error("bridge_plan_missing"))?;
     let job = |gate: Arc<WriteGate>| {
         let began = Instant::now();
         let cancel = std::env::var_os("BACKFILL_CANCEL_FILE");
