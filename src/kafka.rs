@@ -3,10 +3,12 @@
 //! no byte cap; watch broker disk usage instead of letting Kafka delete early.
 use crate::{Error, Result};
 use rdkafka::{
-    ClientConfig,
+    ClientConfig, ClientContext,
     admin::{AdminClient, AdminOptions, NewTopic, ResourceSpecifier, TopicReplication},
     client::DefaultClientContext,
-    error::RDKafkaErrorCode,
+    error::{KafkaError, RDKafkaErrorCode},
+    message::{Header, OwnedHeaders},
+    producer::{BaseProducer, BaseRecord, DeliveryResult, Producer, ProducerContext},
 };
 use std::time::Duration;
 
@@ -20,6 +22,125 @@ pub const MAX_MESSAGE_BYTES: usize = crate::decoder::MAX_CAPTURE_BYTES;
 /// Broker addresses from INDEXER_KAFKA_BROKERS (never logged).
 pub fn brokers() -> Result<String> {
     std::env::var("INDEXER_KAFKA_BROKERS").map_err(|_| Error("missing_kafka_brokers"))
+}
+
+/// shortcut: no TLS or SASL client yet, so only loopback brokers are accepted; a hosted
+/// broker also needs replication factor >= 3 and min.insync.replicas >= 2 (#36).
+pub fn require_loopback(brokers: &str) -> Result<()> {
+    let loopback = |address: &str| {
+        let host = address.rsplit_once(':').map_or(address, |(host, _)| host);
+        matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]")
+    };
+    if brokers.is_empty() || !brokers.split(',').map(str::trim).all(loopback) {
+        return Err(Error("kafka_tls_required"));
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct Deliveries(std::sync::Mutex<Vec<(u64, bool)>>);
+
+impl ClientContext for Deliveries {}
+
+impl ProducerContext for Deliveries {
+    type DeliveryOpaque = Box<u64>;
+
+    fn delivery(&self, result: &DeliveryResult<'_>, sequence: Self::DeliveryOpaque) {
+        if let Ok(mut deliveries) = self.0.lock() {
+            deliveries.push((*sequence, result.is_ok()));
+        }
+    }
+}
+
+/// Idempotent producer of live wire payloads, keyed by slot. Waits for broker room
+/// instead of dropping, and reports the contiguous replay cursor as deliveries confirm.
+pub struct IntakeProducer {
+    producer: BaseProducer<Deliveries>,
+    topic: String,
+    cursor: DeliveryCursor,
+}
+
+impl IntakeProducer {
+    pub fn new(brokers: &str, topic: &str) -> Result<Self> {
+        require_loopback(brokers)?;
+        let producer = config(brokers)
+            .set("enable.idempotence", "true")
+            .set("acks", "all")
+            .set("linger.ms", "20")
+            // Bounded local queue: a full queue applies backpressure to the stream.
+            .set("queue.buffering.max.messages", "10000")
+            .create_with_context(Deliveries::default())
+            .map_err(|_| Error("kafka_unavailable"))?;
+        Ok(Self {
+            producer,
+            topic: topic.into(),
+            cursor: DeliveryCursor::default(),
+        })
+    }
+
+    pub fn send(&mut self, slot: u64, payload: &[u8], schema: &str) -> Result<()> {
+        if payload.len() > MAX_MESSAGE_BYTES {
+            return Err(Error("live_input_limit"));
+        }
+        let sequence = self.cursor.sent(slot);
+        let key = slot.to_be_bytes();
+        let headers = OwnedHeaders::new().insert(Header {
+            key: "proto_schema",
+            value: Some(schema),
+        });
+        let mut record = BaseRecord::with_opaque_to(&self.topic, Box::new(sequence))
+            .key(&key)
+            .payload(payload)
+            .headers(headers);
+        loop {
+            match self.producer.send(record) {
+                Ok(()) => return Ok(()),
+                Err((KafkaError::MessageProduction(RDKafkaErrorCode::QueueFull), back)) => {
+                    record = back;
+                    self.producer.poll(Duration::from_millis(100));
+                }
+                Err(_) => return Err(Error("kafka_produce_failed")),
+            }
+        }
+    }
+
+    /// Serves delivery reports; returns the cursor if it advanced. A failed delivery stops
+    /// intake: the cursor stays behind it, so a restart produces it again.
+    pub fn poll(&mut self, timeout: Duration) -> Result<Option<u64>> {
+        self.producer.poll(timeout);
+        let reports = std::mem::take(
+            &mut *self
+                .producer
+                .context()
+                .0
+                .lock()
+                .map_err(|_| Error("kafka_delivery_failed"))?,
+        );
+        let mut advanced = None;
+        for (sequence, ok) in reports {
+            if !ok {
+                return Err(Error("kafka_delivery_failed"));
+            }
+            advanced = self.cursor.delivered(sequence).or(advanced);
+        }
+        Ok(advanced.and(self.cursor.cursor()))
+    }
+
+    /// Waits for every queued message, then reports the final cursor.
+    pub fn flush(&mut self, timeout: Duration) -> Result<Option<u64>> {
+        self.producer
+            .flush(timeout)
+            .map_err(|_| Error("kafka_delivery_failed"))?;
+        self.poll(Duration::ZERO)?;
+        if self.cursor.in_flight() > 0 {
+            return Err(Error("kafka_delivery_failed"));
+        }
+        Ok(self.cursor.cursor())
+    }
+
+    pub fn cursor(&self) -> Option<u64> {
+        self.cursor.cursor()
+    }
 }
 
 /// Settings every client shares; errors are reduced to a class.
@@ -242,5 +363,88 @@ pub(crate) mod tests {
         };
         assert_eq!(message.payload(), Some(&b"wire"[..]));
         assert_eq!(message.key(), Some(&42u64.to_be_bytes()[..]));
+    }
+}
+
+/// Tracks produced messages in send order and reports the replay cursor: the slot of
+/// the newest message such that it and every earlier message were delivered. Resuming
+/// from that slot (inclusive) can only repeat input, never skip an undelivered message,
+/// even when deliveries are acknowledged out of order.
+#[derive(Debug, Default)]
+pub struct DeliveryCursor {
+    next_sequence: u64,
+    pending: std::collections::BTreeMap<u64, (u64, bool)>,
+    cursor: Option<u64>,
+}
+
+impl DeliveryCursor {
+    /// Registers a message about to be produced and returns its sequence number.
+    pub fn sent(&mut self, slot: u64) -> u64 {
+        let sequence = self.next_sequence;
+        self.next_sequence += 1;
+        self.pending.insert(sequence, (slot, false));
+        sequence
+    }
+
+    /// Records a confirmed delivery; returns the cursor if it advanced.
+    pub fn delivered(&mut self, sequence: u64) -> Option<u64> {
+        if let Some(entry) = self.pending.get_mut(&sequence) {
+            entry.1 = true;
+        }
+        let before = self.cursor;
+        while let Some(entry) = self.pending.first_entry() {
+            if !entry.get().1 {
+                break;
+            }
+            let (slot, _) = entry.remove();
+            self.cursor = Some(self.cursor.map_or(slot, |c| c.max(slot)));
+        }
+        (self.cursor != before).then_some(self.cursor).flatten()
+    }
+
+    pub fn cursor(&self) -> Option<u64> {
+        self.cursor
+    }
+
+    /// Messages sent but not yet acknowledged contiguously.
+    pub fn in_flight(&self) -> usize {
+        self.pending.len()
+    }
+}
+
+#[cfg(test)]
+mod cursor_tests {
+    use super::DeliveryCursor;
+
+    #[test]
+    fn out_of_order_delivery_never_moves_the_cursor_past_a_gap() {
+        let mut cursor = DeliveryCursor::default();
+        let a = cursor.sent(100);
+        let b = cursor.sent(101);
+        let c = cursor.sent(102);
+        assert_eq!(
+            cursor.delivered(c),
+            None,
+            "102 delivered while 100 and 101 are not"
+        );
+        assert_eq!(cursor.delivered(b), None);
+        assert_eq!(cursor.cursor(), None);
+        assert_eq!(cursor.delivered(a), Some(102));
+        assert_eq!(cursor.in_flight(), 0);
+    }
+
+    #[test]
+    fn the_cursor_is_monotonic_and_ignores_duplicate_acknowledgments() {
+        let mut cursor = DeliveryCursor::default();
+        let a = cursor.sent(200);
+        let b = cursor.sent(199);
+        assert_eq!(cursor.delivered(a), Some(200));
+        assert_eq!(cursor.delivered(a), None);
+        assert_eq!(
+            cursor.delivered(b),
+            None,
+            "an older slot never rewinds the cursor"
+        );
+        assert_eq!(cursor.cursor(), Some(200));
     }
 }
