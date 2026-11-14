@@ -300,6 +300,28 @@ pub(crate) mod tests {
         assert_eq!(get("cleanup.policy"), "delete");
     }
 
+    /// Waits until the broker reports `name=value` for `topic`, so a test observes its own change.
+    fn wait_for_config(topic: &str, name: &str, value: &str) {
+        let admin: AdminClient<DefaultClientContext> = config(&test_brokers()).create().unwrap();
+        for _ in 0..80 {
+            let described = block_on(
+                admin.describe_configs([&ResourceSpecifier::Topic(topic)], &AdminOptions::new()),
+            )
+            .unwrap()
+            .unwrap();
+            let current = described
+                .into_iter()
+                .next()
+                .and_then(|r| r.ok())
+                .and_then(|r| r.get(name).and_then(|e| e.value.clone()));
+            if current.as_deref() == Some(value) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(125));
+        }
+        panic!("{name} did not become {value}");
+    }
+
     #[test]
     fn a_short_retention_topic_is_refused() {
         let topic = TestTopic::new(1);
@@ -309,6 +331,7 @@ pub(crate) mod tests {
         block_on(admin.alter_configs([&alter], &AdminOptions::new()))
             .unwrap()
             .unwrap();
+        wait_for_config(&topic.0, "retention.ms", "86400000");
         assert_eq!(
             ensure_topic(&test_brokers(), &topic.0, 1).unwrap_err().0,
             "kafka_topic_retention_too_short"
@@ -327,6 +350,7 @@ pub(crate) mod tests {
         block_on(admin.alter_configs([&alter], &AdminOptions::new()))
             .unwrap()
             .unwrap();
+        wait_for_config(&topic.0, "cleanup.policy", "compact");
         assert_eq!(
             ensure_topic(&test_brokers(), &topic.0, 1).unwrap_err().0,
             "kafka_topic_retention_too_short"
