@@ -16,6 +16,10 @@ every input.
 | 2 | 1.34 s | 1,788 |
 | 4 | 3.31 s | 724 |
 
+**These loopback figures say nothing about hosted throughput.** Against Railway one
+writer reached 45 transactions/s, so the ~80 transactions/s USDC target on hosted
+PostgreSQL stays unproven until an opt-in multi-consumer hosted run is recorded (#36).
+
 Over loopback one consumer already runs at about 17× the ~80 transactions/s USDC load.
 Two consumers help; four are slower. This is likely rebalance churn: consumers start
 at the same moment, and each join triggers an eager rebalance that revokes every
