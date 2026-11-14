@@ -49,3 +49,16 @@ helps, which points at this laptop's link to Railway (upload volume and round tr
 rather than writer count. That is inference: the link was not measured. Running
 consumers in the same region as the database is the expected fix and is not yet
 measured. The hosted USDC target therefore remains unproven.
+
+## LaserStream slot reordering
+
+2026-11-14: one bounded opt-in live run (`live <session> <finalized-5> 60 <USDC>` into a
+throwaway local session, dropped afterwards). The run received 7,323 finalized USDC-filtered
+transactions across 194 slots (122 tx/s into local PostgreSQL; 87 unresolved inputs).
+Ordered by arrival, **no transaction arrived for a slot older than one already seen**, so the
+maximum reorder distance was 0 slots. The 150-slot resume margin is far above this, but one
+short sample is not a bound, so the margin stays provisional.
+
+The same run found that live intake against PostgreSQL panicked on its first storage call
+(a synchronous client inside the stream's async runtime) since #44. The fix runs the stream
+on a multi-threaded runtime and moves each storage call off the async context.
