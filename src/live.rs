@@ -246,7 +246,7 @@ impl Intake {
         let pending = snapshot.pending;
         let (received, decoded) = snapshot.recent;
         Ok(
-            json!({"producer_cursors":snapshot.producer_cursors.iter().map(|(stream,slot)| json!({"stream":stream,"slot":slot})).collect::<Vec<_>>(),"recent":{"window_seconds":RECENT_SECONDS,"received":received,"decoded":decoded,"pending":received-decoded},"last_received_slot":snapshot.last_received_slot,"retry_cursor":snapshot.retry_cursor,"retry_batch_limit":100,"oldest_unresolved_age_seconds":if pending==0{Some(0)}else{snapshot.oldest_pending_at.and_then(age)},"state":if runs.is_empty(){"uninitialized"}else{"partial"},"mint":runs.first().and_then(|r|r.get("mint")),"decoder_version":decoder::DECODER_VERSION,"verified_boundary":null,"coverage":"unknown","unresolved_items":pending,"runs":runs,"limit":100,"reason":"filtered_finalized_stream_has_no_validated_completion_evidence"}),
+            json!({"producer_cursors":snapshot.producer_cursors.iter().map(|(stream,slot)| json!({"stream":stream,"slot":slot,"resume_from":crate::kafka::resume_slot(*slot as u64)})).collect::<Vec<_>>(),"recent":{"window_seconds":RECENT_SECONDS,"received":received,"decoded":decoded,"pending":received-decoded},"last_received_slot":snapshot.last_received_slot,"retry_cursor":snapshot.retry_cursor,"retry_batch_limit":100,"oldest_unresolved_age_seconds":if pending==0{Some(0)}else{snapshot.oldest_pending_at.and_then(age)},"state":if runs.is_empty(){"uninitialized"}else{"partial"},"mint":runs.first().and_then(|r|r.get("mint")),"decoder_version":decoder::DECODER_VERSION,"verified_boundary":null,"coverage":"unknown","unresolved_items":pending,"runs":runs,"limit":100,"reason":"filtered_finalized_stream_has_no_validated_completion_evidence"}),
         )
     }
 }
@@ -1031,7 +1031,7 @@ mod tests {
         intake.log.advance_producer_cursor(USDC, 120).unwrap();
         assert_eq!(
             Intake::report(&test.0).unwrap()["producer_cursors"],
-            json!([{"stream":USDC,"slot":125}])
+            json!([{"stream":USDC,"slot":125,"resume_from":125u64.saturating_sub(crate::kafka::REORDER_MARGIN_SLOTS)}])
         );
         let oversize = vec![0; crate::kafka::MAX_MESSAGE_BYTES + 1];
         assert_eq!(

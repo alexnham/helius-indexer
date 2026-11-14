@@ -61,7 +61,8 @@ impl LiveLog {
         Ok(ids)
     }
 
-    /// Monotonic: a stale producer can never move the replay position backwards.
+    /// Monotonic: a stale producer can never move the replay position backwards. A late
+    /// transaction for an older slot is covered by `kafka::REORDER_MARGIN_SLOTS` at resume.
     pub(crate) fn advance_producer_cursor(&self, stream: &str, slot: i64) -> Result<()> {
         self.0
             .borrow_mut()

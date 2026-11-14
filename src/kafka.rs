@@ -366,15 +366,20 @@ pub(crate) mod tests {
     }
 }
 
-/// Tracks produced messages in send order and reports the replay cursor: the slot of
-/// the newest message such that it and every earlier message were delivered. Resuming
-/// from that slot (inclusive) can only repeat input, never skip an undelivered message,
-/// even when deliveries are acknowledged out of order.
+/// Slots to replay before the stored cursor on resume. The stream delivers transactions
+/// slightly out of slot order, so a transaction for an earlier slot may still be on its way.
+/// shortcut: a fixed margin; replace with per-slot completion tracking when it exists (#36).
+pub const REORDER_MARGIN_SLOTS: u64 = 150;
+
+/// The replay cursor for produced messages: the lowest slot still in flight, or the highest
+/// delivered slot when nothing is in flight. Resuming from it (inclusive, minus
+/// `REORDER_MARGIN_SLOTS`) can repeat input but never skips an undelivered message, even
+/// when deliveries confirm out of order or slots arrive out of order.
 #[derive(Debug, Default)]
 pub struct DeliveryCursor {
     next_sequence: u64,
-    pending: std::collections::BTreeMap<u64, (u64, bool)>,
-    cursor: Option<u64>,
+    in_flight: std::collections::BTreeMap<u64, u64>,
+    highest_delivered: Option<u64>,
 }
 
 impl DeliveryCursor {
@@ -382,69 +387,75 @@ impl DeliveryCursor {
     pub fn sent(&mut self, slot: u64) -> u64 {
         let sequence = self.next_sequence;
         self.next_sequence += 1;
-        self.pending.insert(sequence, (slot, false));
+        self.in_flight.insert(sequence, slot);
         sequence
     }
 
-    /// Records a confirmed delivery; returns the cursor if it advanced.
+    /// Records a confirmed delivery; returns the cursor if it changed.
     pub fn delivered(&mut self, sequence: u64) -> Option<u64> {
-        if let Some(entry) = self.pending.get_mut(&sequence) {
-            entry.1 = true;
+        let before = self.cursor();
+        if let Some(slot) = self.in_flight.remove(&sequence) {
+            self.highest_delivered = Some(self.highest_delivered.map_or(slot, |h| h.max(slot)));
         }
-        let before = self.cursor;
-        while let Some(entry) = self.pending.first_entry() {
-            if !entry.get().1 {
-                break;
-            }
-            let (slot, _) = entry.remove();
-            self.cursor = Some(self.cursor.map_or(slot, |c| c.max(slot)));
-        }
-        (self.cursor != before).then_some(self.cursor).flatten()
+        let after = self.cursor();
+        (after != before).then_some(after).flatten()
     }
 
     pub fn cursor(&self) -> Option<u64> {
-        self.cursor
+        self.in_flight
+            .values()
+            .min()
+            .copied()
+            .or(self.highest_delivered)
     }
 
-    /// Messages sent but not yet acknowledged contiguously.
+    /// Messages sent but not yet confirmed.
     pub fn in_flight(&self) -> usize {
-        self.pending.len()
+        self.in_flight.len()
     }
+}
+
+/// Where live intake resumes for a stored cursor.
+pub fn resume_slot(cursor: u64) -> u64 {
+    cursor.saturating_sub(REORDER_MARGIN_SLOTS)
 }
 
 #[cfg(test)]
 mod cursor_tests {
-    use super::DeliveryCursor;
+    use super::{DeliveryCursor, resume_slot};
 
     #[test]
-    fn out_of_order_delivery_never_moves_the_cursor_past_a_gap() {
+    fn the_cursor_never_passes_a_message_still_in_flight() {
         let mut cursor = DeliveryCursor::default();
         let a = cursor.sent(100);
         let b = cursor.sent(101);
         let c = cursor.sent(102);
-        assert_eq!(
-            cursor.delivered(c),
-            None,
-            "102 delivered while 100 and 101 are not"
-        );
+        assert_eq!(cursor.cursor(), Some(100));
+        assert_eq!(cursor.delivered(c), None, "100 and 101 are still in flight");
         assert_eq!(cursor.delivered(b), None);
-        assert_eq!(cursor.cursor(), None);
         assert_eq!(cursor.delivered(a), Some(102));
         assert_eq!(cursor.in_flight(), 0);
     }
 
     #[test]
-    fn the_cursor_is_monotonic_and_ignores_duplicate_acknowledgments() {
+    fn an_older_slot_in_flight_holds_the_cursor_below_it() {
         let mut cursor = DeliveryCursor::default();
-        let a = cursor.sent(200);
-        let b = cursor.sent(199);
-        assert_eq!(cursor.delivered(a), Some(200));
-        assert_eq!(cursor.delivered(a), None);
-        assert_eq!(
-            cursor.delivered(b),
-            None,
-            "an older slot never rewinds the cursor"
-        );
+        let newer = cursor.sent(200);
+        let older = cursor.sent(199);
+        cursor.delivered(newer);
+        assert!(cursor.cursor().unwrap() <= 199, "199 is undelivered");
+        cursor.delivered(older);
         assert_eq!(cursor.cursor(), Some(200));
+        assert_eq!(
+            cursor.delivered(newer),
+            None,
+            "a duplicate confirmation changes nothing"
+        );
+    }
+
+    #[test]
+    fn resume_replays_a_bounded_reorder_margin() {
+        assert_eq!(resume_slot(1_000), 1_000 - super::REORDER_MARGIN_SLOTS);
+        assert_eq!(resume_slot(10), 0);
     }
 }
