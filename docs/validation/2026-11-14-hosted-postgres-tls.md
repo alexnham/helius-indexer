@@ -40,3 +40,26 @@ transactions/s ([load measurement](2026-11-13-usdc-load.md)). A single writer
 against a remote server is roughly 80× too slow. Batching many inputs per
 transaction, or pipelining (#36), and running the writer close to the database
 are required before hosted use. Local loopback latency hides this cost.
+
+## Batched writes (#36, first slice)
+
+Same environment, `cargo test --test hosted -- --ignored --nocapture`. The run
+used throwaway schemas; the 100-item batch reuses the captured mainnet transaction
+with 100 distinct signatures, in the warm epoch's partition.
+
+| Measure | Value |
+| --- | --- |
+| Round trip, median | 190 ms |
+| One transaction per write | 1.8 transactions/s |
+| First batch, 19 items (creates the partition, prepares statements) | 1.68 s |
+| Next batch, 19 items | 0.61 s, about 3.2 round trips |
+| Batch of 100 items | 2.21 s, **45 transactions/s** |
+
+New transactions use set-based statements, so a warm batch costs about four round
+trips whatever its size. Statements are prepared once per connection, and the
+input payload is copied inside PostgreSQL instead of being uploaded twice. At 100
+items the remaining time is mostly uploading about 1.1 MB over this laptop's
+connection. That is an environment limit: a writer near the database would see the
+round-trip cost only. This is inference from the measurements, not measured. USDC
+needs about 80 transactions/s, so from this link it takes two parallel writers (#36
+consumer group) or a writer co-located with the database.

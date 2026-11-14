@@ -72,11 +72,36 @@ impl WriteStats {
     }
 }
 
+/// Batch statements, prepared once per connection so each later batch costs one round
+/// trip per statement instead of two.
+const BATCH_CAPTURES: &str = "INSERT INTO captures(signature,slot,result_json,capture_json,status,decoder_version)
+                 SELECT s,sl,r,c,st,$6 FROM unnest($1::text[],$2::bigint[],$3::text[],$4::bytea[],$5::text[]) AS u(s,sl,r,c,st)
+                 ON CONFLICT(signature) DO NOTHING RETURNING signature";
+// Copies the payload from the captures just inserted, so it is uploaded once, not twice.
+const BATCH_INPUTS: &str = "INSERT INTO capture_inputs(signature,source,result_digest,slot,result_json,capture_json,status)
+                 SELECT c.signature,u.source,u.digest,c.slot,c.result_json,c.capture_json,c.status
+                 FROM unnest($1::text[],$2::text[],$3::bytea[]) AS u(signature,source,digest)
+                 JOIN captures c ON c.signature=u.signature ORDER BY c.signature
+                 ON CONFLICT(signature,source,result_digest) DO UPDATE SET status=excluded.status";
+const BATCH_TRANSFERS: &str = "INSERT INTO transfers(transfer_id,signature,slot,outer_index,inner_index,mint,record_json)
+         SELECT * FROM unnest($1::text[],$2::text[],$3::bigint[],$4::int[],$5::int[],$6::text[],$7::text[])
+         ON CONFLICT(slot,transfer_id) DO NOTHING RETURNING signature";
+const BATCH_ACKNOWLEDGE: &str = "UPDATE live_raw SET status=u.status FROM unnest($1::bigint[],$2::text[]) AS u(id,status) WHERE live_raw.id=u.id";
+
+#[derive(Clone)]
+struct BatchStatements {
+    captures: postgres::Statement,
+    inputs: postgres::Statement,
+    transfers: postgres::Statement,
+    acknowledge: postgres::Statement,
+}
+
 pub struct Store {
     db: Client,
     /// Partitions this connection has confirmed; partitions are never dropped.
     partitions: HashSet<i64>,
     stats: WriteStats,
+    statements: Option<BatchStatements>,
 }
 
 fn write_failed(_: postgres::Error) -> Error {
@@ -93,6 +118,7 @@ impl Store {
             db: db.connect()?,
             partitions: HashSet::new(),
             stats: WriteStats::default(),
+            statements: None,
         })
     }
 
@@ -252,6 +278,15 @@ impl Store {
         early: &[Option<Result<usize>>],
     ) -> std::result::Result<Vec<Result<usize>>, postgres::Error> {
         let mut results = early.to_vec();
+        if self.statements.is_none() {
+            self.statements = Some(BatchStatements {
+                captures: self.db.prepare(BATCH_CAPTURES)?,
+                inputs: self.db.prepare(BATCH_INPUTS)?,
+                transfers: self.db.prepare(BATCH_TRANSFERS)?,
+                acknowledge: self.db.prepare(BATCH_ACKNOWLEDGE)?,
+            });
+        }
+        let statements = self.statements.clone().expect("prepared above");
         let mut tx = self.db.transaction()?;
         let mut seen = HashSet::new();
         let firsts: Vec<&Prepared<'_>> = prepared
@@ -269,10 +304,15 @@ impl Store {
             HashSet::new()
         } else {
             tx.query(
-                "INSERT INTO captures(signature,slot,result_json,capture_json,status,decoder_version)
-                 SELECT s,sl,r,c,st,$6 FROM unnest($1::text[],$2::bigint[],$3::text[],$4::bytea[],$5::text[]) AS u(s,sl,r,c,st)
-                 ON CONFLICT(signature) DO NOTHING RETURNING signature",
-                &[&signatures, &slots, &references, &raws, &statuses, &DECODER_VERSION],
+                &statements.captures,
+                &[
+                    &signatures,
+                    &slots,
+                    &references,
+                    &raws,
+                    &statuses,
+                    &DECODER_VERSION,
+                ],
             )?
             .iter()
             .map(|r| r.get(0))
@@ -293,18 +333,8 @@ impl Store {
             let sources = column(&|p| p.item.capture.source.clone());
             let digests: Vec<&[u8]> = new.iter().map(|p| p.digest.as_slice()).collect();
             tx.execute(
-                "INSERT INTO capture_inputs(signature,source,result_digest,slot,result_json,capture_json,status)
-                 SELECT * FROM unnest($1::text[],$2::text[],$3::bytea[],$4::bigint[],$5::text[],$6::bytea[],$7::text[])
-                 ON CONFLICT(signature,source,result_digest) DO UPDATE SET status=excluded.status",
-                &[
-                    &column(&|p| p.signature.to_string()),
-                    &sources,
-                    &digests,
-                    &new.iter().map(|p| p.slot).collect::<Vec<_>>(),
-                    &column(&|p| p.result_json.clone()),
-                    &new.iter().map(|p| p.item.raw).collect::<Vec<_>>(),
-                    &column(&|p| p.status.to_string()),
-                ],
+                &statements.inputs,
+                &[&column(&|p| p.signature.to_string()), &sources, &digests],
             )?;
             let mut rows: Vec<(&str, &Transfer)> = new
                 .iter()
@@ -312,7 +342,7 @@ impl Store {
                 .flat_map(|(signature, transfers)| transfers.iter().map(move |t| (signature, t)))
                 .collect();
             rows.sort_by(|a, b| (a.1.slot, &a.1.transfer_id).cmp(&(b.1.slot, &b.1.transfer_id)));
-            let counts = insert_transfer_rows(&mut tx, &rows)?;
+            let counts = insert_transfer_rows(&mut tx, &statements.transfers, &rows)?;
             for p in &new {
                 results[p.index] = Some(Ok(counts.get(p.signature).copied().unwrap_or(0)));
             }
@@ -349,10 +379,7 @@ impl Store {
                 ids.push(*id);
                 statuses.push(status);
             }
-            tx.execute(
-                "UPDATE live_raw SET status=u.status FROM unnest($1::bigint[],$2::text[]) AS u(id,status) WHERE live_raw.id=u.id",
-                &[&ids, &statuses],
-            )?;
+            tx.execute(&statements.acknowledge, &[&ids, &statuses])?;
         }
         tx.commit()?;
         Ok(results)
@@ -368,6 +395,8 @@ impl Store {
             .map_err(read_failed)?;
         let (mut count, mut volume, mut fees, mut unknown_fees) = (0u64, 0u128, 0u128, 0u64);
         let mut other_decoder_transfers = 0u64;
+        let mut unknown_amounts = 0u64;
+        let mut confidential_count = 0u64;
         while let Some(row) = rows.next().map_err(read_failed)? {
             let transfer: Transfer = serde_json::from_str(row.get::<_, &str>(0))
                 .map_err(|_| Error("stored_record_invalid"))?;
@@ -377,9 +406,20 @@ impl Store {
                     .ok_or(Error("aggregate_overflow"))?;
             }
             count = count.checked_add(1).ok_or(Error("aggregate_overflow"))?;
-            volume = volume
-                .checked_add(u128::from(transfer.amount_raw))
-                .ok_or(Error("aggregate_overflow"))?;
+            if let Some(amount) = transfer.amount_raw {
+                volume = volume
+                    .checked_add(u128::from(amount))
+                    .ok_or(Error("aggregate_overflow"))?;
+            } else {
+                unknown_amounts = unknown_amounts
+                    .checked_add(1)
+                    .ok_or(Error("aggregate_overflow"))?;
+            }
+            if transfer.confidential {
+                confidential_count = confidential_count
+                    .checked_add(1)
+                    .ok_or(Error("aggregate_overflow"))?;
+            }
             if let Some(fee) = transfer.fee_raw {
                 fees = fees
                     .checked_add(u128::from(fee))
@@ -391,7 +431,7 @@ impl Store {
             }
         }
         Ok(
-            serde_json::json!({"mint":mint,"transfer_count":count,"target_decoder":DECODER_VERSION,"other_decoder_transfer_count":other_decoder_transfers,"known_volume_raw":volume.to_string(),"known_fees_raw":fees.to_string(),"unknown_fee_count":unknown_fees,"coverage":"unknown","window":"all_stored"}),
+            serde_json::json!({"mint":mint,"transfer_count":count,"target_decoder":DECODER_VERSION,"other_decoder_transfer_count":other_decoder_transfers,"known_volume_raw":volume.to_string(),"known_fees_raw":fees.to_string(),"unknown_fee_count":unknown_fees,"unknown_amount_count":unknown_amounts,"confidential_transfer_count":confidential_count,"coverage":"unknown","window":"all_stored"}),
         )
     }
 
@@ -623,6 +663,7 @@ fn retryable(error: &postgres::Error) -> bool {
 /// Inserts many transactions' transfers in one statement and counts new rows per signature.
 fn insert_transfer_rows(
     tx: &mut Transaction<'_>,
+    statement: &postgres::Statement,
     rows: &[(&str, &Transfer)],
 ) -> std::result::Result<std::collections::HashMap<String, usize>, postgres::Error> {
     let mut counts = std::collections::HashMap::new();
@@ -652,10 +693,10 @@ fn insert_transfer_rows(
             .push(serde_json::to_string(transfer).unwrap_or_default());
     }
     for row in tx.query(
-        "INSERT INTO transfers(transfer_id,signature,slot,outer_index,inner_index,mint,record_json)
-         SELECT * FROM unnest($1::text[],$2::text[],$3::bigint[],$4::int[],$5::int[],$6::text[],$7::text[])
-         ON CONFLICT(slot,transfer_id) DO NOTHING RETURNING signature",
-        &[&columns.0, &columns.1, &columns.2, &columns.3, &columns.4, &columns.5, &columns.6],
+        statement,
+        &[
+            &columns.0, &columns.1, &columns.2, &columns.3, &columns.4, &columns.5, &columns.6,
+        ],
     )? {
         *counts.entry(row.get::<_, String>(0)).or_insert(0) += 1;
     }
