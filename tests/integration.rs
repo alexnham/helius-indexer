@@ -1015,3 +1015,56 @@ fn prune_keeps_newest_transfers_and_marks_older_slots_unknown() {
     assert_eq!(Store::prune(path, 3).unwrap()["removed_transfers"], 0);
     assert!(Store::prune(path, 0).is_err());
 }
+
+#[test]
+fn concurrent_duplicate_and_overlapping_writers_store_one_record_set() {
+    let db = TestDatabase::new();
+    let db = &db.0;
+    let mut other_source = capture();
+    other_source["source"] = json!("helius-laserstream");
+    // Fresh connections first, so every writer races on the same first insert.
+    let writers: Vec<_> = (0..8)
+        .map(|i| {
+            let value = if i % 2 == 0 {
+                capture()
+            } else {
+                other_source.clone()
+            };
+            let raw = serde_json::to_vec(&value).unwrap();
+            let store = Store::open(db).unwrap();
+            (store, raw)
+        })
+        .collect();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(writers.len()));
+    let inserted: usize = writers
+        .into_iter()
+        .map(|(mut store, raw)| {
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let parsed = decoder::parse_capture(&raw).unwrap();
+                let decoded = decoder::decode(&parsed);
+                barrier.wait();
+                store.persist(&parsed, &raw, &decoded).unwrap()
+            })
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .sum();
+    let expected = decode(&capture()).unwrap();
+    assert_eq!(inserted, expected.len(), "exactly one writer inserts");
+    assert_eq!(Store::query(db, None, 1000).unwrap(), expected);
+    let mut sql = db.test_client();
+    let count = |sql: &mut postgres::Client, query: &str| -> i64 {
+        sql.query_one(query, &[]).unwrap().get(0)
+    };
+    assert_eq!(count(&mut sql, "SELECT COUNT(*) FROM captures"), 1);
+    assert_eq!(count(&mut sql, "SELECT COUNT(*) FROM capture_inputs"), 2);
+    assert_eq!(
+        count(
+            &mut sql,
+            "SELECT COUNT(*) FROM capture_inputs WHERE status<>'decoded'"
+        ),
+        0
+    );
+}
