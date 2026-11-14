@@ -1473,6 +1473,7 @@ pub(crate) mod tests {
         write_diagnostic(Broken, &json!({"coverage_valid":0,"freshness":null}));
         assert!(age(now() + 100).is_none());
     }
+
     #[test]
     fn bounds_checked_before_environment_or_network() {
         assert_eq!(
