@@ -5,12 +5,11 @@ use helius_indexer::{
     coordinator::WriteGate,
     decoder,
     live::{self, Intake},
-    storage::Store,
+    storage::{Database, Store, pg::TestDatabase},
 };
 use laserstream_core_proto::{geyser::*, solana::storage::confirmed_block as wire};
 use serde_json::{Value, json};
 use std::{
-    path::Path,
     sync::{Arc, mpsc},
     time::{Duration, Instant},
 };
@@ -19,7 +18,7 @@ const MINT: &str = live::USDC;
 fn fixture() -> Value {
     serde_json::from_slice(include_bytes!("fixtures/mainnet-transfer.json")).unwrap()
 }
-fn persist(path: &Path, value: &Value) -> Result<usize> {
+fn persist(path: &Database, value: &Value) -> Result<usize> {
     let raw = serde_json::to_vec(value).unwrap();
     let capture = decoder::parse_capture(&raw)?;
     let decoded = decoder::decode(&capture);
@@ -163,13 +162,13 @@ fn block(value: &Value, parent: u64, empty: bool) -> Source {
 #[test]
 fn real_store_coalesces_both_source_orders_and_retries_before_queries() {
     for live_first in [true, false] {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("index.sqlite");
+        let path = TestDatabase::new();
+        let path = &path.0;
         let value = fixture();
         let tx = update(&value);
         let slot = tx.slot;
-        let mut history = History::open(&path).unwrap();
-        let mut intake = Intake::open(&path).unwrap();
+        let mut history = History::open(path).unwrap();
+        let mut intake = Intake::open(path).unwrap();
         let run_history = |history: &mut History| {
             history
                 .run(
@@ -197,30 +196,30 @@ fn real_store_coalesces_both_source_orders_and_retries_before_queries() {
             &decoder::parse_capture(include_bytes!("fixtures/mainnet-transfer.json")).unwrap(),
         )
         .unwrap();
-        assert_eq!(Store::query(&path, Some(MINT), 1000).unwrap(), expected);
-        let summary = Store::summary(&path, MINT).unwrap();
+        assert_eq!(Store::query(path, Some(MINT), 1000).unwrap(), expected);
+        let summary = Store::summary(path, MINT).unwrap();
         assert_eq!(summary["transfer_count"], 2);
         assert_eq!(summary["known_volume_raw"], "46720000");
         assert_eq!(summary["known_fees_raw"], "0");
-        let conn = rusqlite::Connection::open(&path).unwrap();
+        let mut conn = path.test_client();
         assert_eq!(
-            conn.query_row("SELECT COUNT(*) FROM capture_inputs", [], |r| r
-                .get::<_, u32>(0))
-                .unwrap(),
+            conn.query_one("SELECT COUNT(*) FROM capture_inputs", &[])
+                .unwrap()
+                .get::<_, i64>(0),
             2
         );
-        assert!(Intake::report(&path).unwrap()["verified_boundary"].is_null());
+        assert!(Intake::report(path).unwrap()["verified_boundary"].is_null());
     }
 }
 #[test]
 fn conflicts_are_quarantined_and_cannot_change_existing_effects() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("index.sqlite");
+    let path = TestDatabase::new();
+    let path = &path.0;
     let mut value = fixture();
-    persist(&path, &value).unwrap();
-    let expected = Store::query(&path, None, 1000).unwrap();
+    persist(path, &value).unwrap();
+    let expected = Store::query(path, None, 1000).unwrap();
     value["result"]["blockTime"] = json!(value["result"]["blockTime"].as_i64().unwrap() + 1);
-    assert_eq!(persist(&path, &value).unwrap_err().0, "capture_conflict");
+    assert_eq!(persist(path, &value).unwrap_err().0, "capture_conflict");
     value = fixture();
     let group = value["result"]["meta"]["innerInstructions"]
         .as_array_mut()
@@ -233,47 +232,50 @@ fn conflicts_are_quarantined_and_cannot_change_existing_effects() {
         .unwrap();
     data[1..9].copy_from_slice(&23360001u64.to_le_bytes());
     group["instructions"][1]["data"] = json!(bs58::encode(data).into_string());
-    assert_eq!(persist(&path, &value).unwrap_err().0, "capture_conflict");
-    assert_eq!(Store::query(&path, None, 1000).unwrap(), expected);
-    let conn = rusqlite::Connection::open(path).unwrap();
+    assert_eq!(persist(path, &value).unwrap_err().0, "capture_conflict");
+    assert_eq!(Store::query(path, None, 1000).unwrap(), expected);
+    let mut conn = path.test_client();
     assert_eq!(
-        conn.query_row(
+        conn.query_one(
             "SELECT COUNT(*) FROM capture_inputs WHERE status='capture_conflict'",
-            [],
-            |r| r.get::<_, u32>(0)
+            &[]
         )
-        .unwrap(),
+        .unwrap()
+        .get::<_, i64>(0),
         2
     );
 }
 #[test]
 fn metadata_enrichment_repairs_same_revision_failures_but_not_decoder_corrections() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("index.sqlite");
+    let path = TestDatabase::new();
+    let path = &path.0;
     let mut incomplete = fixture();
     incomplete["source"] = json!("helius-laserstream");
     incomplete["result"]["blockTime"] = Value::Null;
     incomplete["result"]["meta"]["innerInstructions"] = Value::Null;
     assert_eq!(
-        persist(&path, &incomplete).unwrap_err().0,
+        persist(path, &incomplete).unwrap_err().0,
         "missing_inner_instructions"
     );
-    assert_eq!(persist(&path, &fixture()).unwrap(), 2);
-    assert_eq!(Store::summary(&path, MINT).unwrap()["transfer_count"], 2);
-    let conn = rusqlite::Connection::open(&path).unwrap();
-    conn.execute("UPDATE captures SET decoder_version='previous-decoder'", [])
-        .unwrap();
+    assert_eq!(persist(path, &fixture()).unwrap(), 2);
+    assert_eq!(Store::summary(path, MINT).unwrap()["transfer_count"], 2);
+    let mut conn = path.test_client();
+    conn.execute(
+        "UPDATE captures SET decoder_version='previous-decoder'",
+        &[],
+    )
+    .unwrap();
     assert_eq!(
-        persist(&path, &fixture()).unwrap_err().0,
+        persist(path, &fixture()).unwrap_err().0,
         "decoder_revision_conflict"
     );
-    assert_eq!(Store::summary(&path, MINT).unwrap()["transfer_count"], 2);
+    assert_eq!(Store::summary(path, MINT).unwrap()["transfer_count"], 2);
 }
 #[test]
 fn unresolved_observations_retain_evidence_through_sparse_repair() {
-    let dir = tempfile::tempdir().unwrap();
     for accumulate in [false, true] {
-        let path = dir.path().join(format!("{accumulate}.sqlite"));
+        let path = TestDatabase::new();
+        let path = &path.0;
         let known = fixture();
         let mut pending = known.clone();
         pending["result"]["meta"]["innerInstructions"] = Value::Null;
@@ -284,13 +286,13 @@ fn unresolved_observations_retain_evidence_through_sparse_repair() {
                 .as_object_mut()
                 .unwrap()
                 .remove("recentBlockhash");
-            assert!(persist(&path, &sparse).is_err());
+            assert!(persist(path, &sparse).is_err());
         }
-        assert!(persist(&path, &pending).is_err());
+        assert!(persist(path, &pending).is_err());
         let mut contradictory_pending = pending.clone();
         contradictory_pending["result"]["blockTime"] = json!(1);
         assert_eq!(
-            persist(&path, &contradictory_pending).unwrap_err().0,
+            persist(path, &contradictory_pending).unwrap_err().0,
             "capture_conflict"
         );
         let mut repaired = known.clone();
@@ -299,24 +301,23 @@ fn unresolved_observations_retain_evidence_through_sparse_repair() {
             .as_object_mut()
             .unwrap()
             .remove("recentBlockhash");
-        assert_eq!(persist(&path, &repaired).unwrap(), 2);
-        let conn = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(persist(path, &repaired).unwrap(), 2);
+        let mut conn = path.test_client();
         let record: String = conn
-            .query_row("SELECT record_json FROM transfers LIMIT 1", [], |r| {
-                r.get(0)
-            })
-            .unwrap();
+            .query_one("SELECT record_json FROM transfers LIMIT 1", &[])
+            .unwrap()
+            .get(0);
         let record: Value = serde_json::from_str(&record).unwrap();
         assert_eq!(record["block_time"], known["result"]["blockTime"]);
         let mut conflict = known.clone();
         conflict["result"]["transaction"]["message"]["recentBlockhash"] = json!("contradictory");
-        assert_eq!(persist(&path, &conflict).unwrap_err().0, "capture_conflict");
+        assert_eq!(persist(path, &conflict).unwrap_err().0, "capture_conflict");
     }
 }
 #[test]
 fn complementary_decodable_owner_evidence_enriches_existing_rows() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("index.sqlite");
+    let path = TestDatabase::new();
+    let path = &path.0;
     let mut first = fixture();
     let mut second = fixture();
     for balance in first["result"]["meta"]["postTokenBalances"]
@@ -331,20 +332,20 @@ fn complementary_decodable_owner_evidence_enriches_existing_rows() {
     {
         balance.as_object_mut().unwrap().remove("owner");
     }
-    assert_eq!(persist(&path, &first).unwrap(), 2);
-    assert_eq!(persist(&path, &second).unwrap(), 0);
+    assert_eq!(persist(path, &first).unwrap(), 2);
+    assert_eq!(persist(path, &second).unwrap(), 0);
     let expected =
         decoder::decode(&decoder::parse_capture(&serde_json::to_vec(&fixture()).unwrap()).unwrap())
             .unwrap();
-    let conn = rusqlite::Connection::open(&path).unwrap();
+    let mut conn = path.test_client();
     for transfer in expected {
         let actual: String = conn
-            .query_row(
-                "SELECT record_json FROM transfers WHERE transfer_id=?1",
-                [&transfer.transfer_id],
-                |r| r.get(0),
+            .query_one(
+                "SELECT record_json FROM transfers WHERE transfer_id=$1",
+                &[&transfer.transfer_id],
             )
-            .unwrap();
+            .unwrap()
+            .get(0);
         assert_eq!(
             serde_json::from_str::<Value>(&actual).unwrap(),
             serde_json::to_value(transfer).unwrap()
@@ -352,30 +353,9 @@ fn complementary_decodable_owner_evidence_enriches_existing_rows() {
     }
 }
 #[test]
-fn legacy_raw_is_preserved_and_u128_summary_is_exact() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("index.sqlite");
-    let value = fixture();
-    persist(&path, &value).unwrap();
-    rusqlite::Connection::open(&path)
-        .unwrap()
-        .execute("DROP TABLE capture_inputs", [])
-        .unwrap();
-    let normalized: Value =
-        serde_json::from_slice(&live::normalize(&update(&value)).unwrap()).unwrap();
-    assert_eq!(persist(&path, &normalized).unwrap(), 0);
-    assert_eq!(
-        rusqlite::Connection::open(&path)
-            .unwrap()
-            .query_row(
-                "SELECT COUNT(*) FROM capture_inputs WHERE source='legacy'",
-                [],
-                |r| r.get::<_, u32>(0)
-            )
-            .unwrap(),
-        1
-    );
-    let path = dir.path().join("large.sqlite");
+fn u128_summary_is_exact_at_u64_max() {
+    let path = TestDatabase::new();
+    let path = &path.0;
     let mut large = fixture();
     for group in large["result"]["meta"]["innerInstructions"]
         .as_array_mut()
@@ -391,19 +371,19 @@ fn legacy_raw_is_preserved_and_u128_summary_is_exact() {
             }
         }
     }
-    persist(&path, &large).unwrap();
+    persist(path, &large).unwrap();
     assert_eq!(
-        Store::summary(&path, MINT).unwrap()["known_volume_raw"],
+        Store::summary(path, MINT).unwrap()["known_volume_raw"],
         (u128::from(u64::MAX) * 2).to_string()
     );
 }
 #[test]
 fn later_finished_range_cannot_advance_a_missing_prefix() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("index.sqlite");
+    let path = TestDatabase::new();
+    let path = &path.0;
     let value = fixture();
     let slot = value["result"]["slot"].as_u64().unwrap();
-    let mut history = History::open(&path).unwrap();
+    let mut history = History::open(path).unwrap();
     assert!(
         history
             .run(
@@ -490,20 +470,27 @@ fn downstream_slowdown_bounds_waiters_and_prioritizes_ready_live_work() {
 fn coordinator_rejects_invalid_bounds_without_network() {
     let mut telemetry = helius_indexer::telemetry::Telemetry::default();
     assert_eq!(
-        helius_indexer::coordinator::run(Path::new("unused"), 0, 0, 0, &mut telemetry).unwrap_err(),
+        helius_indexer::coordinator::run(
+            &Database::new("postgres://unused@127.0.0.1/x", "unused").unwrap(),
+            0,
+            0,
+            0,
+            &mut telemetry
+        )
+        .unwrap_err(),
         Error("invalid_live_bounds")
     );
 }
 
 #[test]
 fn later_record_conflict_rolls_back_every_metadata_enrichment() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("index.sqlite");
+    let path = TestDatabase::new();
+    let path = &path.0;
     let value = fixture();
     let normalized: Value =
         serde_json::from_slice(&live::normalize(&update(&value)).unwrap()).unwrap();
-    persist(&path, &normalized).unwrap();
-    let before = Store::query(&path, None, 1000).unwrap();
+    persist(path, &normalized).unwrap();
+    let before = Store::query(path, None, 1000).unwrap();
     assert!(before.iter().all(|t| t.block_time.is_none()));
     let mut conflicting = value;
     for name in ["preTokenBalances", "postTokenBalances"] {
@@ -514,41 +501,41 @@ fn later_record_conflict_rolls_back_every_metadata_enrichment() {
         }
     }
     assert_eq!(
-        persist(&path, &conflicting).unwrap_err().0,
+        persist(path, &conflicting).unwrap_err().0,
         "capture_conflict"
     );
-    assert_eq!(Store::query(&path, None, 1000).unwrap(), before);
+    assert_eq!(Store::query(path, None, 1000).unwrap(), before);
 }
 
 #[test]
 fn a_sparse_observation_cannot_erase_known_identity_evidence() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("index.sqlite");
+    let path = TestDatabase::new();
+    let path = &path.0;
     let value = fixture();
-    persist(&path, &value).unwrap();
+    persist(path, &value).unwrap();
     let normalized: Value =
         serde_json::from_slice(&live::normalize(&update(&value)).unwrap()).unwrap();
-    persist(&path, &normalized).unwrap();
+    persist(path, &normalized).unwrap();
     let mut conflicting = value;
     conflicting["result"]["transaction"]["message"]["recentBlockhash"] =
         json!(bs58::encode([33; 32]).into_string());
     assert_eq!(
-        persist(&path, &conflicting).unwrap_err().0,
+        persist(path, &conflicting).unwrap_err().0,
         "capture_conflict"
     );
-    assert_eq!(Store::summary(&path, MINT).unwrap()["transfer_count"], 2);
+    assert_eq!(Store::summary(path, MINT).unwrap()["transfer_count"], 2);
 }
 
 #[test]
 fn concurrent_source_cores_share_real_storage_without_losing_either_ack() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("index.sqlite");
+    let path = TestDatabase::new();
+    let path = &path.0;
     let value = fixture();
     let tx = update(&value);
     let slot = tx.slot;
     let gate = Arc::new(WriteGate::default());
-    let mut intake = Intake::open(&path).unwrap();
-    let mut history = History::open(&path).unwrap();
+    let mut intake = Intake::open(path).unwrap();
+    let mut history = History::open(path).unwrap();
     history.set_gate(Arc::clone(&gate));
     let source = block(&value, slot - 1, false);
     let live_gate = Arc::clone(&gate);
@@ -566,12 +553,12 @@ fn concurrent_source_cores_share_real_storage_without_losing_either_ack() {
     });
     live_result.unwrap();
     assert!(history_result.unwrap().0.complete);
-    assert_eq!(Store::summary(&path, MINT).unwrap()["transfer_count"], 2);
+    assert_eq!(Store::summary(path, MINT).unwrap()["transfer_count"], 2);
     assert_eq!(
-        Store::summary(&path, MINT).unwrap()["known_volume_raw"],
+        Store::summary(path, MINT).unwrap()["known_volume_raw"],
         "46720000"
     );
-    assert_eq!(Intake::report(&path).unwrap()["unresolved_items"], 0);
+    assert_eq!(Intake::report(path).unwrap()["unresolved_items"], 0);
     assert!(
         gate.snapshot().unwrap()["live_admissions"]
             .as_u64()
@@ -590,12 +577,12 @@ fn mixed_token_transactions_have_the_same_complete_record_set_from_both_sources(
     assert_eq!(decoded.len(), 2);
     assert_eq!(decoded.iter().filter(|t| t.mint == MINT).count(), 1);
     for live_first in [true, false] {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("mixed.sqlite");
+        let path = TestDatabase::new();
+        let path = &path.0;
         let tx = update(&value);
         let slot = tx.slot;
-        let mut intake = Intake::open(&path).unwrap();
-        let mut history = History::open(&path).unwrap();
+        let mut intake = Intake::open(path).unwrap();
+        let mut history = History::open(path).unwrap();
         if live_first {
             let id = intake.retain(&tx).unwrap();
             assert_eq!(intake.process(id, &tx).unwrap(), 2);
@@ -615,95 +602,7 @@ fn mixed_token_transactions_have_the_same_complete_record_set_from_both_sources(
         );
         let id = intake.retain(&tx).unwrap();
         assert_eq!(intake.process(id, &tx).unwrap(), 0);
-        assert_eq!(Store::query(&path, None, 1000).unwrap(), decoded);
-        assert_eq!(Store::summary(&path, MINT).unwrap()["transfer_count"], 1);
+        assert_eq!(Store::query(path, None, 1000).unwrap(), decoded);
+        assert_eq!(Store::summary(path, MINT).unwrap()["transfer_count"], 1);
     }
-}
-
-/// Local captured-input replay; explicitly opted in, never opens a network or reads API credentials.
-#[test]
-#[ignore = "requires locally retained validation database and a fresh destination"]
-fn replay_retained_network_observations() {
-    use prost::Message;
-    use std::collections::BTreeMap;
-    let source = std::env::var("INDEXER_VALIDATION_SOURCE").expect("set source database path");
-    let destination =
-        std::env::var("INDEXER_VALIDATION_DESTINATION").expect("set fresh destination path");
-    let path = Path::new(&destination);
-    assert!(!path.exists(), "destination must be new");
-    let input =
-        rusqlite::Connection::open_with_flags(source, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .unwrap();
-    let mut intake = Intake::open(path).unwrap();
-    let mut attempts = 0;
-    let mut failures = 0;
-    let mut statement = input
-        .prepare("SELECT protobuf,proto_schema FROM live_raw ORDER BY id LIMIT 1001")
-        .unwrap();
-    for row in statement
-        .query_map([], |r| {
-            Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, String>(1)?))
-        })
-        .unwrap()
-    {
-        let (bytes, schema) = row.unwrap();
-        attempts += 1;
-        assert!(attempts <= 1000);
-        assert_eq!(schema, "laserstream-core-proto/14.0.0");
-        let tx = SubscribeUpdateTransaction::decode(bytes.as_slice()).unwrap();
-        let id = intake.retain(&tx).unwrap();
-        failures += usize::from(intake.process(id, &tx).is_err());
-    }
-    let mut blocks = BTreeMap::new();
-    let mut bytes = 0;
-    let mut statement=input.prepare("SELECT slot,response FROM historical_inputs WHERE mint=?1 ORDER BY slot,attempt LIMIT 33").unwrap();
-    for row in statement
-        .query_map([MINT], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?))
-        })
-        .unwrap()
-    {
-        let (slot, data) = row.unwrap();
-        let slot = u64::try_from(slot).expect("nonnegative slot");
-        bytes += data.len();
-        assert!(bytes <= 64 * 1024 * 1024);
-        blocks.insert(slot, data);
-        assert!(blocks.len() <= 16);
-    }
-    let start = *blocks.keys().next().expect("captured block required");
-    let end = *blocks.keys().next_back().unwrap();
-    struct Retained(BTreeMap<u64, Vec<u8>>);
-    impl BlockSource for Retained {
-        fn block(&mut self, slot: u64) -> Result<Vec<u8>> {
-            self.0
-                .get(&slot)
-                .cloned()
-                .ok_or(Error("validation_block_missing"))
-        }
-    }
-    let mut history = History::open(path).unwrap();
-    let (coverage, metrics) = history
-        .run(MINT, start, end, &mut Retained(blocks), || false)
-        .unwrap();
-    let output = rusqlite::Connection::open(path).unwrap();
-    let conflicts:i64=output.query_row("SELECT COUNT(*) FROM capture_inputs WHERE status IN ('capture_conflict','decoder_revision_conflict')",[],|r|r.get(0)).unwrap();
-    let shared:i64=output.query_row("SELECT COUNT(*) FROM (SELECT signature FROM capture_inputs WHERE status='decoded' GROUP BY signature HAVING COUNT(DISTINCT source)>=2)",[],|r|r.get(0)).unwrap();
-    assert_eq!(conflicts, 0);
-    assert!(shared > 0);
-    let before = Store::summary(path, MINT).unwrap();
-    // Repeat captured successful inputs: immediate logical counts and volume stay unchanged.
-    for row in input
-        .prepare("SELECT capture_json FROM capture_inputs WHERE status='decoded'")
-        .unwrap()
-        .query_map([], |r| r.get::<_, Vec<u8>>(0))
-        .unwrap()
-    {
-        let value: Value = serde_json::from_slice(&row.unwrap()).unwrap();
-        assert_eq!(persist(path, &value).unwrap(), 0);
-    }
-    assert_eq!(Store::summary(path, MINT).unwrap(), before);
-    println!(
-        "{}",
-        json!({"live_attempts":attempts,"live_decode_failures":failures,"shared_decoded_transactions":shared,"quarantined_conflicts":conflicts,"historical_complete":coverage.complete,"historical_decode_failures":metrics.decode_failures,"summary":before})
-    );
 }

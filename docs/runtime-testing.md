@@ -61,8 +61,8 @@ historical progress for older slots. Pruned slots, including a partially retaine
 never `complete`. Older deleted raw data needs backup or refetch for repair.
 Evidence still retained at the boundary can be reverified, potentially restoring
 rows that a later prune removes again. At USDC volume 1,000 transfers is only a few seconds of chain activity, so
-the initial backfill is usually pruned after the first cycle. SQLite reuses freed
-pages rather than shrinking the file. The transfer count is not a hard disk-byte cap;
+the initial backfill is usually pruned after the first cycle. PostgreSQL reuses
+freed space after vacuum rather than shrinking the files. The transfer count is not a hard disk-byte cap;
 lower `INDEXER_LIVE_SECONDS` to lower that peak, or `down --volumes` to reclaim it.
 Continuous LaserStream usage is metered by Helius. The initial sample retained
 about 54 MB of protobuf in a minute; this is not billed bandwidth or an authoritative
@@ -98,8 +98,8 @@ curl -fsS http://127.0.0.1:8767/api/transfers
 curl -fsS 'http://127.0.0.1:8767/api/transfers?mint=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
 curl -fsS http://127.0.0.1:8767/api/status
 # Same shared Rust query/storage contracts, without HTTP:
-docker compose exec runtime /app/data/runtime/helius-indexer summary /app/data/runtime/index.sqlite EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
-docker compose exec runtime /app/data/runtime/helius-indexer live-status /app/data/runtime/index.sqlite
+docker compose exec runtime /app/data/runtime/helius-indexer summary runtime EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+docker compose exec runtime /app/data/runtime/helius-indexer live-status runtime
 ```
 
 Check these separately:
@@ -127,7 +127,7 @@ An independent classic SPL USDC instruction parser can spot-check up to the firs
 16 retained block observations (64 MiB maximum), without another provider call:
 
 ```sh
-docker compose exec runtime python3 /app/scripts/compare-captured-usdc.py /app/data/runtime/index.sqlite /app/data/runtime/index.sqlite --sample
+docker compose exec runtime env INDEXER_BINARY=/app/data/runtime/helius-indexer python3 /app/scripts/compare-captured-usdc.py runtime --sample
 ```
 
 It prints `expected`, `stored`, `missing`, `extra`, `wrong` and `blocks`. A successful
@@ -143,16 +143,18 @@ provider exception or endpoint is printed by the Python supervisor.
 
 ## Stop, backup and upgrades
 
-`docker compose stop runtime` terminates the child and preserves committed SQLite
-input/output. An interrupted worker remains unverified; restart explicitly. Never
-back up a live SQLite file by copying only its main file: stop the service and
-preserve the whole session including WAL/SHM and raw provenance, following the
-[Docker backup instructions](docker.md). Runtime data lives under `runtime/`
-in the `runtime-data` volume. Do not run `down --volumes` unless deleting both
+`docker compose stop runtime` terminates the child and preserves committed
+input/output in PostgreSQL. An interrupted worker remains unverified; restart
+explicitly. Back up with `pg_dump --schema=runtime` from the `postgres` service, or
+stop it and archive the `postgres-data` volume, following the
+[Docker backup instructions](docker.md). The runtime's binary, receipt and events
+live under `runtime/` in the `runtime-data` volume; its data is the `runtime` schema.
+Sessions created before PostgreSQL (an `index.sqlite` file) are not migrated: remove
+the old `runtime-data` volume and start fresh. Do not run `down --volumes` unless deleting both
 console and runtime volumes is intentional.
 
-The session retains the CLI that created it. It is architecture specific; move
-SQLite/raw data with a deliberate compatible-binary upgrade, not by overwriting
+The session retains the CLI that created it. It is architecture specific; keep the
+schema with a deliberate compatible-binary upgrade, not by overwriting
 a running session. Retention deletion is intentional and irreversible without
 a backup or refetch; no automatic decoder migration or production capacity claim
 is added.

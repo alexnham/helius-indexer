@@ -1,10 +1,10 @@
-"""Provider console boundaries against the real Rust CLI and SQLite; no network."""
+"""Provider console boundaries against the real Rust CLI and local PostgreSQL; no network."""
 import importlib.util
 import json
 import contextlib
 import io
-import sqlite3
 import os
+import secrets
 import sys
 from pathlib import Path
 import tempfile
@@ -16,6 +16,13 @@ ROOT = Path(__file__).resolve().parent.parent
 SPEC = importlib.util.spec_from_file_location("runtime", ROOT / "scripts/indexer-runtime.py")
 RUNTIME = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(RUNTIME)
+# The local test container; never a hosted database.
+os.environ.setdefault("DATABASE_URL", os.environ.get(
+    "INDEXER_TEST_DATABASE_URL", "postgres://indexer:indexer@127.0.0.1:55432/indexer"))
+
+
+def database():
+    return "pytest_" + secrets.token_hex(6)
 
 
 class RuntimeConsole(unittest.TestCase):
@@ -37,15 +44,16 @@ class RuntimeConsole(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             session = Path(directory)
             binary = ROOT / "target/debug/helius-indexer"
-            RUNTIME.initialize(session, binary)
-            config = RUNTIME.configuration({}, 1000)
+            config = RUNTIME.configuration({"INDEXER_DB_SESSION": database()}, 1000)
+            db = config["database"]
+            RUNTIME.initialize(session, binary, db)
             RUNTIME.atomic_json(session / "session.json", config)
-            self.assertEqual(RUNTIME.CONSOLE.command(session, "query", session / "index.sqlite")["transfers"], [])
+            self.assertEqual(RUNTIME.CONSOLE.command(session, "query", db)["transfers"], [])
             capture = ROOT / "tests/fixtures/mainnet-transfer.json"
-            RUNTIME.CONSOLE.command(session, "ingest", session / "index.sqlite", capture)
-            before = RUNTIME.CONSOLE.command(session, "query-recent", session / "index.sqlite")
-            RUNTIME.initialize(session, Path("missing-image-binary"))
-            self.assertEqual(before, RUNTIME.CONSOLE.command(session, "query-recent", session / "index.sqlite"))
+            RUNTIME.CONSOLE.command(session, "ingest", db, capture)
+            before = RUNTIME.CONSOLE.command(session, "query-recent", db)
+            RUNTIME.initialize(session, Path("missing-image-binary"), db)
+            self.assertEqual(before, RUNTIME.CONSOLE.command(session, "query-recent", db))
             server = RUNTIME.CONSOLE.HTTPServer(("127.0.0.1", 0), RUNTIME.CONSOLE.BaseHTTPRequestHandler)
             server.RequestHandlerClass = RUNTIME.CONSOLE.handler_for(session, server.server_port,
                 runtime_status=lambda: {"worker": {"state": "finished"}, "coverage": "unknown"})
@@ -69,19 +77,19 @@ class RuntimeConsole(unittest.TestCase):
         spec.loader.exec_module(comparison)
         with tempfile.TemporaryDirectory() as directory:
             session = Path(directory)
-            RUNTIME.initialize(session, ROOT / "target/debug/helius-indexer")
+            db = database()
+            RUNTIME.initialize(session, ROOT / "target/debug/helius-indexer", db)
             fixture = ROOT / "tests/fixtures/mainnet-transfer.json"
-            RUNTIME.CONSOLE.command(session, "ingest", session / "index.sqlite", fixture)
+            RUNTIME.CONSOLE.command(session, "ingest", db, fixture)
             capture = json.loads(fixture.read_text())
             slot = capture["result"]["slot"]
-            with sqlite3.connect(session / "index.sqlite") as db:
-                db.execute("CREATE TABLE historical_inputs(slot INTEGER,attempt INTEGER,response BLOB)")
-                for index in range(20):
-                    response = {"result": {"transactions": [capture["result"]] if index == 0 else []}}
-                    db.execute("INSERT INTO historical_inputs VALUES(?,0,?)", (slot + index, json.dumps(response).encode()))
-                output = io.StringIO()
-                with contextlib.redirect_stdout(output):
-                    self.assertFalse(comparison.compare(db, db, sample=True))
+            # Stored rows come from the Rust decoder; the blocks feed the independent parser.
+            stored = [row for row in RUNTIME.CONSOLE.command(session, "query", db, comparison.MINT)["transfers"]]
+            blocks = [{"slot": slot + index, "response": {"result": {"transactions": [capture["result"]] if index == 0 else []}}}
+                      for index in range(16)]
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertFalse(comparison.compare({"blocks": blocks, "transfers": stored}))
                 result = json.loads(output.getvalue())
                 self.assertEqual(result["blocks"], 16)
                 self.assertGreater(result["expected"], 0)

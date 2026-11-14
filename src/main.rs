@@ -2,7 +2,7 @@ use helius_indexer::{
     Error, Result,
     backfill::{History, RpcSource},
     decoder::{self, MAX_CAPTURE_BYTES},
-    storage::Store,
+    storage::{Database, Store},
     telemetry::Telemetry,
 };
 use serde_json::json;
@@ -15,7 +15,7 @@ use std::{
     time::Instant,
 };
 
-const USAGE: &str = "usage: helius-indexer migrate (uses DATABASE_URL) | monitor DB MINT LIVE_FROM START END SECONDS | query-recent DB [MINT] | ingest DB CAPTURE [--metrics FILE] | query DB [MINT] | backfill DB MINT START END [--metrics FILE] | coverage DB MINT START END | live DB FROM_SLOT SECONDS [MINT] | prune DB KEEP | live-status DB | live-retry DB | summary DB MINT | overlap DB START END SECONDS | repair DB START END | repair-status DB START END | repair-history-archive DB MINT START END | repair-history DB MINT START END | [feature archive] archive/archive-replay/archive-overlap DB CACHE MINT START END | bridge-plan DB CACHE MINT START | bridge DB CACHE MINT START | bridge-status DB MINT START | bridge-live DB CACHE START SECONDS | archive-overlap-replay DB MINT START END | archive-tip CACHE | archive-live DB CACHE START END SECONDS";
+const USAGE: &str = "usage: DATABASE_URL=postgres://... helius-indexer COMMAND, where SESSION is a schema name (^[a-z][a-z0-9_]*$), not a file path: migrate SESSION | comparison-input SESSION MINT [--sample] | monitor SESSION MINT LIVE_FROM START END SECONDS | query-recent SESSION [MINT] | ingest SESSION CAPTURE [--metrics FILE] | query SESSION [MINT] | backfill SESSION MINT START END [--metrics FILE] | coverage SESSION MINT START END | live SESSION FROM_SLOT SECONDS [MINT] | prune SESSION KEEP | live-status SESSION | live-retry SESSION | summary SESSION MINT | overlap SESSION START END SECONDS | repair SESSION START END | repair-status SESSION START END | repair-history-archive SESSION MINT START END | repair-history SESSION MINT START END | [feature archive] archive/archive-replay/archive-overlap SESSION CACHE MINT START END | bridge-plan SESSION CACHE MINT START | bridge SESSION CACHE MINT START | bridge-status SESSION MINT START | bridge-live SESSION CACHE START SECONDS | archive-overlap-replay SESSION MINT START END | archive-tip CACHE | archive-live SESSION CACHE START END SECONDS";
 
 fn ingest(db: &str, input: &str, telemetry: &mut Telemetry) -> Result<serde_json::Value> {
     let started = Instant::now();
@@ -52,8 +52,8 @@ fn ingest(db: &str, input: &str, telemetry: &mut Telemetry) -> Result<serde_json
         telemetry.decode_failure,
     );
     let started = Instant::now();
-    let stored =
-        Store::open(Path::new(db)).and_then(|mut store| store.persist(&capture, &raw, &decoded));
+    let stored = Store::open(&Database::from_env(db)?)
+        .and_then(|mut store| store.persist(&capture, &raw, &decoded));
     telemetry.observe(
         "storage",
         if stored.is_ok() { "success" } else { "failed" },
@@ -73,7 +73,7 @@ fn run(args: &[String], telemetry: &mut Telemetry) -> Result<serde_json::Value> 
         #[cfg(feature = "archive")]
         [command, db, mint, start, end] if command == "archive-overlap-replay" => {
             helius_indexer::archive::replay_overlap(
-                Path::new(db),
+                &Database::from_env(db)?,
                 mint,
                 start.parse().map_err(|_| Error("invalid_archive_range"))?,
                 end.parse().map_err(|_| Error("invalid_archive_range"))?,
@@ -83,7 +83,7 @@ fn run(args: &[String], telemetry: &mut Telemetry) -> Result<serde_json::Value> 
         #[cfg(feature = "archive")]
         [command, db, cache, mint, start] if command == "bridge-plan" => {
             helius_indexer::coordinator::bridge::plan(
-                Path::new(db),
+                &Database::from_env(db)?,
                 Path::new(cache),
                 mint,
                 start.parse().map_err(|_| Error("invalid_bridge_plan"))?,
@@ -93,7 +93,7 @@ fn run(args: &[String], telemetry: &mut Telemetry) -> Result<serde_json::Value> 
         #[cfg(feature = "archive")]
         [command, db, cache, mint, start] if command == "bridge" => {
             helius_indexer::coordinator::bridge::run(
-                Path::new(db),
+                &Database::from_env(db)?,
                 Path::new(cache),
                 mint,
                 start.parse().map_err(|_| Error("invalid_bridge_plan"))?,
@@ -104,7 +104,7 @@ fn run(args: &[String], telemetry: &mut Telemetry) -> Result<serde_json::Value> 
         #[cfg(feature = "archive")]
         [command, db, mint, start] if command == "bridge-status" => {
             helius_indexer::coordinator::bridge::status(
-                Path::new(db),
+                &Database::from_env(db)?,
                 mint,
                 start.parse().map_err(|_| Error("invalid_bridge_plan"))?,
             )
@@ -112,7 +112,7 @@ fn run(args: &[String], telemetry: &mut Telemetry) -> Result<serde_json::Value> 
         #[cfg(feature = "archive")]
         [command, db, cache, start, seconds] if command == "bridge-live" => {
             helius_indexer::coordinator::bridge::run(
-                Path::new(db),
+                &Database::from_env(db)?,
                 Path::new(cache),
                 helius_indexer::live::USDC,
                 start.parse().map_err(|_| Error("invalid_bridge_plan"))?,
@@ -135,7 +135,7 @@ fn run(args: &[String], telemetry: &mut Telemetry) -> Result<serde_json::Value> 
             let end = end.parse().map_err(|_| Error("invalid_archive_range"))?;
             if command == "archive-overlap" {
                 helius_indexer::archive::overlap(
-                    Path::new(db),
+                    &Database::from_env(db)?,
                     Path::new(cache),
                     mint,
                     start,
@@ -144,7 +144,7 @@ fn run(args: &[String], telemetry: &mut Telemetry) -> Result<serde_json::Value> 
                 )
             } else {
                 helius_indexer::archive::run(
-                    Path::new(db),
+                    &Database::from_env(db)?,
                     Path::new(cache),
                     mint,
                     start,
@@ -157,7 +157,7 @@ fn run(args: &[String], telemetry: &mut Telemetry) -> Result<serde_json::Value> 
         #[cfg(feature = "archive")]
         [command, db, cache, start, end, seconds] if command == "archive-live" => {
             helius_indexer::archive::live(
-                Path::new(db),
+                &Database::from_env(db)?,
                 Path::new(cache),
                 start.parse().map_err(|_| Error("invalid_archive_range"))?,
                 end.parse().map_err(|_| Error("invalid_archive_range"))?,
@@ -173,7 +173,7 @@ fn run(args: &[String], telemetry: &mut Telemetry) -> Result<serde_json::Value> 
             let cancel = env::var_os("REPAIR_CANCEL_FILE");
             if command == "repair-history-archive" {
                 helius_indexer::repair::archive_history(
-                    Path::new(db),
+                    &Database::from_env(db)?,
                     telemetry,
                     mint,
                     start,
@@ -181,26 +181,31 @@ fn run(args: &[String], telemetry: &mut Telemetry) -> Result<serde_json::Value> 
                     || cancel.as_ref().is_some_and(|p| Path::new(p).exists()),
                 )
             } else {
-                helius_indexer::repair::history(Path::new(db), telemetry, mint, start, end, || {
-                    cancel.as_ref().is_some_and(|p| Path::new(p).exists())
-                })
+                helius_indexer::repair::history(
+                    &Database::from_env(db)?,
+                    telemetry,
+                    mint,
+                    start,
+                    end,
+                    || cancel.as_ref().is_some_and(|p| Path::new(p).exists()),
+                )
             }
         }
         [command, db, start, end] if command == "repair" || command == "repair-status" => {
             let start = start.parse().map_err(|_| Error("invalid_repair_range"))?;
             let end = end.parse().map_err(|_| Error("invalid_repair_range"))?;
             if command == "repair-status" {
-                helius_indexer::repair::status(Path::new(db), start, end)
+                helius_indexer::repair::status(&Database::from_env(db)?, start, end)
             } else {
                 let cancel = env::var_os("REPAIR_CANCEL_FILE");
-                helius_indexer::repair::run(Path::new(db), start, end, telemetry, || {
+                helius_indexer::repair::run(&Database::from_env(db)?, start, end, telemetry, || {
                     cancel.as_ref().is_some_and(|p| Path::new(p).exists())
                 })
             }
         }
         [command, db, mint, from, start, end, seconds] if command == "monitor" => {
             helius_indexer::coordinator::monitor(
-                Path::new(db),
+                &Database::from_env(db)?,
                 helius_indexer::coordinator::MonitorConfig {
                     mint,
                     live_from: from.parse().map_err(|_| Error("invalid_live_bounds"))?,
@@ -215,13 +220,19 @@ fn run(args: &[String], telemetry: &mut Telemetry) -> Result<serde_json::Value> 
         }
         [command, db] if command == "query-recent" => query_recent(db, None),
         [command, db, mint] if command == "query-recent" => query_recent(db, Some(mint)),
-        [command] if command == "migrate" => {
-            Store::migrate(&env::var("DATABASE_URL").map_err(|_| Error("missing_database_url"))?)
+        [command, db] if command == "migrate" => Store::migrate(&Database::from_env(db)?),
+        [command, db, mint] if command == "comparison-input" => {
+            Store::comparison_input(&Database::from_env(db)?, mint, 33)
         }
-        [command, db, mint] if command == "summary" => Store::summary(Path::new(db), mint),
+        [command, db, mint, flag] if command == "comparison-input" && flag == "--sample" => {
+            Store::comparison_input(&Database::from_env(db)?, mint, 16)
+        }
+        [command, db, mint] if command == "summary" => {
+            Store::summary(&Database::from_env(db)?, mint)
+        }
         [command, db, start, end, seconds] if command == "overlap" => {
             helius_indexer::coordinator::run(
-                Path::new(db),
+                &Database::from_env(db)?,
                 start
                     .parse()
                     .map_err(|_| Error("invalid_historical_range"))?,
@@ -235,10 +246,10 @@ fn run(args: &[String], telemetry: &mut Telemetry) -> Result<serde_json::Value> 
                 .parse()
                 .map_err(|_| Error("invalid_historical_range"))?;
             let end = end.parse().map_err(|_| Error("invalid_historical_range"))?;
-            Ok(
-                serde_json::to_value(History::open(Path::new(db))?.coverage(mint, start, end)?)
-                    .map_err(|_| Error("serialization_failed"))?,
+            Ok(serde_json::to_value(
+                History::open(&Database::from_env(db)?)?.coverage(mint, start, end)?,
             )
+            .map_err(|_| Error("serialization_failed"))?)
         }
         [command, db, mint, start, end, rest @ ..] if command == "backfill" => {
             let metrics_file = match rest {
@@ -251,7 +262,7 @@ fn run(args: &[String], telemetry: &mut Telemetry) -> Result<serde_json::Value> 
                 .map_err(|_| Error("invalid_historical_range"))?;
             let end = end.parse().map_err(|_| Error("invalid_historical_range"))?;
             telemetry.set_context("backfill", "rpc", "historical");
-            let mut history = History::open(Path::new(db))?;
+            let mut history = History::open(&Database::from_env(db)?)?;
             telemetry.run_id = history.run_id().to_owned();
             history.coverage(mint, start, end)?;
             let endpoint = env::var("SOLANA_RPC_URL")
@@ -279,13 +290,13 @@ fn run(args: &[String], telemetry: &mut Telemetry) -> Result<serde_json::Value> 
             Ok(json!({"coverage":coverage,"metrics":metrics}))
         }
         [command, db, from, seconds] if command == "live" => helius_indexer::live::run(
-            Path::new(db),
+            &Database::from_env(db)?,
             from.parse().map_err(|_| Error("invalid_live_bounds"))?,
             seconds.parse().map_err(|_| Error("invalid_live_bounds"))?,
             telemetry,
         ),
         [command, db, from, seconds, mint] if command == "live" => helius_indexer::live::run_mint(
-            Path::new(db),
+            &Database::from_env(db)?,
             from.parse().map_err(|_| Error("invalid_live_bounds"))?,
             seconds.parse().map_err(|_| Error("invalid_live_bounds"))?,
             mint,
@@ -294,17 +305,17 @@ fn run(args: &[String], telemetry: &mut Telemetry) -> Result<serde_json::Value> 
         [command, db, keep] if command == "prune" => {
             telemetry.set_context("storage", "local", "retention");
             let report = Store::prune(
-                Path::new(db),
+                &Database::from_env(db)?,
                 keep.parse().map_err(|_| Error("invalid_retention_limit"))?,
             )?;
             telemetry.emit("retention_pruned", "prune", "success", None);
             Ok(report)
         }
         [command, db] if command == "live-status" => {
-            helius_indexer::live::Intake::report(Path::new(db))
+            helius_indexer::live::Intake::report(&Database::from_env(db)?)
         }
         [command, db] if command == "live-retry" => {
-            helius_indexer::live::Intake::open(Path::new(db))?.retry()
+            helius_indexer::live::Intake::open(&Database::from_env(db)?)?.retry()
         }
         [command, db, input] if command == "ingest" => ingest(db, input, telemetry),
         [command, db, input, flag, _] if command == "ingest" && flag == "--metrics" => {
@@ -317,17 +328,17 @@ fn run(args: &[String], telemetry: &mut Telemetry) -> Result<serde_json::Value> 
 }
 
 fn query(db: &str, mint: Option<&str>) -> Result<serde_json::Value> {
-    let transfers = Store::query(Path::new(db), mint, 1000)?;
+    let transfers = Store::query(&Database::from_env(db)?, mint, 1000)?;
     Ok(
-        json!({"coverage":"unknown","limit":1000,"transfers":transfers,"live":helius_indexer::live::Intake::report(Path::new(db))?}),
+        json!({"coverage":"unknown","limit":1000,"transfers":transfers,"live":helius_indexer::live::Intake::report(&Database::from_env(db)?)?}),
     )
 }
 
 fn query_recent(db: &str, mint: Option<&str>) -> Result<serde_json::Value> {
     Ok(
         json!({"coverage":"unknown","limit":1000,"order":"newest_first",
-        "transfers":Store::query_recent(Path::new(db), mint, 1000)?,
-        "live":helius_indexer::live::Intake::report(Path::new(db))?}),
+        "transfers":Store::query_recent(&Database::from_env(db)?, mint, 1000)?,
+        "live":helius_indexer::live::Intake::report(&Database::from_env(db)?)?}),
     )
 }
 

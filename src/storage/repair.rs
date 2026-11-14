@@ -1,9 +1,7 @@
 //! Transaction-scoped replacement; scheduling and range diagnostics live in crate::repair.
-use super::Store;
+use super::{Database, Store, insert_transfers, read_failed, write_failed};
 use crate::{Error, Result, decoder};
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde_json::Value;
-use std::path::Path;
 
 /// Retained-capture repair progress for one slot range and the current decoder revision.
 pub(crate) struct RepairCounts {
@@ -25,13 +23,24 @@ pub(crate) struct Correction {
 
 impl Store {
     pub(crate) fn correct(&mut self, signature: &str) -> Result<Correction> {
-        let tx = self
-            .0
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .map_err(|_| Error("storage_write_failed"))?;
-        let (raw_len, result_len, slot, previous): (i64, i64, i64, String) = tx.query_row(
-            "SELECT length(capture_json),length(CAST(result_json AS BLOB)),json_extract(result_json,'$.slot'),decoder_version FROM captures WHERE signature=?1", [signature],
-            |r| Ok((r.get(0)?, r.get(1)?,r.get(2)?,r.get(3)?))).map_err(|_| Error("storage_read_failed"))?;
+        let slot: Option<i64> = self
+            .db
+            .query_opt(
+                "SELECT slot FROM captures WHERE signature=$1",
+                &[&signature],
+            )
+            .map_err(read_failed)?
+            .map(|r| r.get(0));
+        let slot = u64::try_from(slot.ok_or(Error("storage_read_failed"))?)
+            .map_err(|_| Error("stored_record_invalid"))?;
+        self.ensure_partitions([slot])?;
+        let mut tx = self.db.transaction().map_err(write_failed)?;
+        // Locks the capture so a concurrent observation or repair waits for this replacement.
+        let row = tx.query_one(
+            "SELECT octet_length(capture_json),octet_length(result_json),decoder_version FROM captures WHERE signature=$1 FOR UPDATE", &[&signature])
+            .map_err(read_failed)?;
+        let (raw_len, result_len, previous): (i32, i32, String) =
+            (row.get(0), row.get(1), row.get(2));
         let revision_number = |value: &str| {
             value
                 .strip_prefix("token-transfers-v")
@@ -44,35 +53,30 @@ impl Store {
         {
             return Err(Error("decoder_downgrade_not_supported"));
         }
-        let slot = u64::try_from(slot).map_err(|_| Error("stored_record_invalid"))?;
-        let bounded = raw_len <= decoder::MAX_CAPTURE_BYTES as i64
-            && result_len <= decoder::MAX_CAPTURE_BYTES as i64;
+        let bounded = raw_len as usize <= decoder::MAX_CAPTURE_BYTES
+            && result_len as usize <= decoder::MAX_CAPTURE_BYTES;
         let mut transaction_failed = false;
         let mut merged_reference = None;
         let decoded = (|| {
             if !bounded {
                 return Err(Error("capture_too_large"));
             }
-            let (raw, reference): (Vec<u8>, String) = tx
-                .query_row(
-                    "SELECT capture_json,result_json FROM captures WHERE signature=?1",
-                    [signature],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
+            let row = tx
+                .query_one(
+                    "SELECT capture_json,result_json FROM captures WHERE signature=$1",
+                    &[&signature],
                 )
-                .map_err(|_| Error("storage_read_failed"))?;
+                .map_err(read_failed)?;
+            let (raw, reference): (Vec<u8>, String) = (row.get(0), row.get(1));
             let mut reference: Value =
                 serde_json::from_str(&reference).map_err(|_| Error("stored_record_invalid"))?;
             // Audit receipts may contain compatible execution metadata received after the old decoder failed.
-            let mut statement=tx.prepare("SELECT CASE WHEN length(CAST(result_json AS BLOB))<=16777216 THEN result_json END FROM capture_inputs WHERE signature=?1 AND status!='capture_conflict' ORDER BY source,result_json LIMIT 33")
-                .map_err(|_|Error("storage_read_failed"))?;
+            let observations = tx.query("SELECT CASE WHEN octet_length(result_json)<=16777216 THEN result_json END FROM capture_inputs WHERE signature=$1 AND status<>'capture_conflict' ORDER BY source,result_digest LIMIT 33", &[&signature])
+                .map_err(read_failed)?;
             let mut total = 0;
-            for (count, observation) in statement
-                .query_map([signature], |r| r.get::<_, Option<String>>(0))
-                .map_err(|_| Error("storage_read_failed"))?
-                .enumerate()
-            {
-                let observation = observation
-                    .map_err(|_| Error("storage_read_failed"))?
+            for (count, observation) in observations.iter().enumerate() {
+                let observation: String = observation
+                    .get::<_, Option<String>>(0)
                     .ok_or(Error("capture_too_large"))?;
                 total += observation.len();
                 if count >= 32 || total > 64 * 1024 * 1024 {
@@ -127,74 +131,44 @@ impl Store {
             return Err(*error);
         }
         let old_rows: i64 = tx
-            .query_row(
-                "SELECT COUNT(*) FROM transfers WHERE signature=?1",
-                [signature],
-                |r| r.get(0),
+            .query_one(
+                "SELECT COUNT(*) FROM transfers WHERE signature=$1",
+                &[&signature],
             )
-            .map_err(|_| Error("storage_read_failed"))?;
+            .map_err(read_failed)?
+            .get(0);
         let old_rows = usize::try_from(old_rows).map_err(|_| Error("stored_record_invalid"))?;
         let error = decoded.as_ref().err().copied();
-        if bounded {
-            tx.execute("INSERT OR IGNORE INTO capture_inputs SELECT signature,'legacy',result_json,capture_json,status FROM captures WHERE signature=?1 AND NOT EXISTS(SELECT 1 FROM capture_inputs WHERE signature=?1)", [signature])
-            .map_err(|_| Error("storage_write_failed"))?;
-        }
-        tx.execute("INSERT INTO decoder_repairs VALUES(?1,?2,?3,?4,?5,?6,1,unixepoch()) ON CONFLICT(signature,target_decoder) DO UPDATE SET status=excluded.status,error_class=excluded.error_class,attempts=decoder_repairs.attempts+1",
-            params![signature,decoder::DECODER_VERSION,slot as i64,previous,if error.is_some(){"unresolved"}else{"complete"},error.map(|e|e.0)])
-            .map_err(|_| Error("storage_write_failed"))?;
+        let slot_key = slot as i64;
+        tx.execute("INSERT INTO decoder_repairs VALUES($1,$2,$3,$4,$5,$6,1,extract(epoch from now())::bigint) ON CONFLICT(signature,target_decoder) DO UPDATE SET status=excluded.status,error_class=excluded.error_class,attempts=decoder_repairs.attempts+1",
+            &[&signature,&decoder::DECODER_VERSION,&slot_key,&previous,&if error.is_some(){"unresolved"}else{"complete"},&error.map(|e|e.0)])
+            .map_err(write_failed)?;
         // Retained captures can be filtered or incomplete; only a full block replay can verify coverage.
-        let history: Option<String> = tx
-            .query_row(
-                "SELECT name FROM sqlite_master WHERE name='historical_slots'",
-                [],
-                |r| r.get(0),
-            )
-            .optional()
-            .map_err(|_| Error("storage_read_failed"))?;
-        if history.is_some() {
-            tx.execute("UPDATE historical_slots SET status='unknown',error_class='decoder_repair_requires_verification' WHERE slot=?1 AND decoder=?2 AND status='complete'",params![slot as i64,decoder::DECODER_VERSION])
-                .map_err(|_| Error("storage_write_failed"))?;
-        }
+        tx.execute("UPDATE historical_slots SET status='unknown',error_class='decoder_repair_requires_verification' WHERE slot=$1 AND decoder=$2 AND status='complete'",&[&slot_key,&decoder::DECODER_VERSION])
+            .map_err(write_failed)?;
         let mut new_rows = 0;
         if let Ok(transfers) = decoded {
-            tx.execute("DELETE FROM transfers WHERE signature=?1", [signature])
-                .map_err(|_| Error("storage_write_failed"))?;
-            for transfer in &transfers {
-                let json =
-                    serde_json::to_string(transfer).map_err(|_| Error("serialization_failed"))?;
-                tx.execute(
-                    "INSERT INTO transfers VALUES(?1,?2,?3,?4,?5,?6,?7)",
-                    params![
-                        transfer.transfer_id,
-                        signature,
-                        transfer.slot as i64,
-                        transfer.instruction_index as i64,
-                        transfer.inner_instruction_index.map_or(-1, |n| n as i64),
-                        transfer.mint,
-                        json
-                    ],
-                )
-                .map_err(|_| Error("storage_write_failed"))?;
-            }
-            new_rows = transfers.len();
-            tx.execute("UPDATE capture_inputs SET status='revision_reconciled' WHERE signature=?1 AND status='decoder_revision_conflict'",[signature])
-                .map_err(|_|Error("storage_write_failed"))?;
-            tx.execute("UPDATE decoder_repairs SET status='superseded',error_class=NULL WHERE signature=?1 AND target_decoder!=?2", params![signature,decoder::DECODER_VERSION])
-                .map_err(|_| Error("storage_write_failed"))?;
+            tx.execute("DELETE FROM transfers WHERE signature=$1", &[&signature])
+                .map_err(write_failed)?;
+            new_rows = insert_transfers(&mut tx, signature, Some(&transfers))?;
+            tx.execute("UPDATE capture_inputs SET status='revision_reconciled' WHERE signature=$1 AND status='decoder_revision_conflict'",&[&signature])
+                .map_err(write_failed)?;
+            tx.execute("UPDATE decoder_repairs SET status='superseded',error_class=NULL WHERE signature=$1 AND target_decoder<>$2", &[&signature,&decoder::DECODER_VERSION])
+                .map_err(write_failed)?;
             tx.execute(
-                "UPDATE captures SET decoder_version=?1,status=?2,result_json=?4 WHERE signature=?3",
-                params![
-                    decoder::DECODER_VERSION,
-                    if transaction_failed {
+                "UPDATE captures SET decoder_version=$1,status=$2,result_json=$4 WHERE signature=$3",
+                &[
+                    &decoder::DECODER_VERSION,
+                    &if transaction_failed {
                         "failed_transaction"
                     } else {
                         "decoded"
                     },
-                    signature,
-                    merged_reference
+                    &signature,
+                    &merged_reference,
                 ],
             )
-            .map_err(|_| Error("storage_write_failed"))?;
+            .map_err(write_failed)?;
         }
         tx.commit().map_err(|_| Error("storage_commit_failed"))?;
         Ok(Correction {
@@ -204,45 +178,30 @@ impl Store {
             new_rows,
         })
     }
-}
 
-impl Store {
     /// Read-only and consistent: all counts come from one snapshot.
-    pub(crate) fn repair_counts(path: &Path, start: u64, end: u64) -> Result<RepairCounts> {
-        let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .map_err(|_| Error("storage_open_failed"))?;
-        let _snapshot = db
-            .unchecked_transaction()
-            .map_err(|_| Error("storage_read_failed"))?;
-        let exists: bool = db
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='decoder_repairs')",
-                [],
-                |r| r.get(0),
-            )
-            .map_err(|_| Error("storage_read_failed"))?;
-        let (total, remaining_other_revision): (i64,i64) = db.query_row("SELECT COUNT(*),COALESCE(SUM(decoder_version!=?3),0) FROM captures WHERE json_extract(result_json,'$.slot') BETWEEN ?1 AND ?2",
-            params![start as i64,end as i64,decoder::DECODER_VERSION],|r|Ok((r.get(0)?,r.get(1)?))).map_err(|_|Error("storage_read_failed"))?;
-        let (corrected, unresolved, first_unresolved_at): (i64, i64, Option<i64>) = if exists {
-            db.query_row("SELECT COALESCE(SUM(status='complete'),0),COALESCE(SUM(status='unresolved'),0),MIN(CASE WHEN status='unresolved' THEN first_pending END) FROM decoder_repairs WHERE slot BETWEEN ?1 AND ?2 AND target_decoder=?3",
-                params![start as i64,end as i64,decoder::DECODER_VERSION],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(|_|Error("storage_read_failed"))?
-        } else {
-            (0, 0, None)
-        };
-        let mut failure_classes = Vec::new();
-        if exists {
-            let mut statement=db.prepare("SELECT error_class,COUNT(*) FROM decoder_repairs WHERE target_decoder=?3 AND slot BETWEEN ?1 AND ?2 AND status='unresolved' GROUP BY error_class ORDER BY COUNT(*) DESC,error_class LIMIT 16")
-                .map_err(|_|Error("storage_read_failed"))?;
-            let classes = statement
-                .query_map(
-                    params![start as i64, end as i64, decoder::DECODER_VERSION],
-                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
-                )
-                .map_err(|_| Error("storage_read_failed"))?;
-            for class in classes {
-                failure_classes.push(class.map_err(|_| Error("storage_read_failed"))?);
-            }
-        }
+    pub(crate) fn repair_counts(db: &Database, start: u64, end: u64) -> Result<RepairCounts> {
+        let mut client = db.connect()?;
+        let mut tx = client
+            .build_transaction()
+            .isolation_level(postgres::IsolationLevel::RepeatableRead)
+            .read_only(true)
+            .start()
+            .map_err(read_failed)?;
+        let (start, end) = (start as i64, end as i64);
+        let row = tx.query_one("SELECT COUNT(*),COUNT(*) FILTER (WHERE decoder_version<>$3) FROM captures WHERE slot BETWEEN $1 AND $2",
+            &[&start,&end,&decoder::DECODER_VERSION]).map_err(read_failed)?;
+        let (total, remaining_other_revision) = (row.get(0), row.get(1));
+        let row = tx.query_one("SELECT COUNT(*) FILTER (WHERE status='complete'),COUNT(*) FILTER (WHERE status='unresolved'),MIN(CASE WHEN status='unresolved' THEN first_pending END) FROM decoder_repairs WHERE slot BETWEEN $1 AND $2 AND target_decoder=$3",
+            &[&start,&end,&decoder::DECODER_VERSION]).map_err(read_failed)?;
+        let (corrected, unresolved, first_unresolved_at) = (row.get(0), row.get(1), row.get(2));
+        let failure_classes = tx.query("SELECT error_class,COUNT(*) FROM decoder_repairs WHERE target_decoder=$3 AND slot BETWEEN $1 AND $2 AND status='unresolved' GROUP BY error_class ORDER BY COUNT(*) DESC,error_class LIMIT 16",
+            &[&start,&end,&decoder::DECODER_VERSION])
+            .map_err(read_failed)?
+            .iter()
+            .map(|r| (r.get::<_, String>(0), r.get::<_, i64>(1)))
+            .collect();
+        tx.commit().map_err(read_failed)?;
         Ok(RepairCounts {
             total,
             remaining_other_revision,
@@ -255,27 +214,17 @@ impl Store {
 
     /// Captures in range that are on another revision or unresolved, fewest prior attempts first.
     pub(crate) fn repair_candidates(
-        path: &Path,
+        db: &Database,
         start: u64,
         end: u64,
         limit: usize,
     ) -> Result<Vec<String>> {
-        let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .map_err(|_| Error("storage_open_failed"))?;
-        let mut statement = db.prepare("SELECT c.signature FROM captures c LEFT JOIN decoder_repairs r ON r.signature=c.signature AND r.target_decoder=?3 WHERE (c.decoder_version!=?3 OR r.status='unresolved') AND json_extract(c.result_json,'$.slot') BETWEEN ?1 AND ?2 ORDER BY COALESCE(r.attempts,0),c.signature LIMIT ?4")
-            .map_err(|_|Error("storage_read_failed"))?;
-        statement
-            .query_map(
-                params![
-                    start as i64,
-                    end as i64,
-                    decoder::DECODER_VERSION,
-                    limit as i64
-                ],
-                |r| r.get(0),
-            )
-            .map_err(|_| Error("storage_read_failed"))?
-            .collect::<std::result::Result<_, _>>()
-            .map_err(|_| Error("storage_read_failed"))
+        Ok(db.connect()?
+            .query("SELECT c.signature FROM captures c LEFT JOIN decoder_repairs r ON r.signature=c.signature AND r.target_decoder=$3 WHERE (c.decoder_version<>$3 OR r.status='unresolved') AND c.slot BETWEEN $1 AND $2 ORDER BY COALESCE(r.attempts,0),c.signature LIMIT $4",
+                &[&(start as i64), &(end as i64), &decoder::DECODER_VERSION, &(limit as i64)])
+            .map_err(read_failed)?
+            .iter()
+            .map(|r| r.get(0))
+            .collect())
     }
 }

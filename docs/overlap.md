@@ -132,9 +132,6 @@ raw inputs/backups and use a fresh validation database when reverting ingestion
 until a production migration/rollback policy is established. Audit indexing stores
 additional raw/reference bytes; measure its cost before selecting production storage.
 
-The optional ignored test `replay_retained_network_observations` replays a local
-captured database into a fresh destination without network access. Set
-INDEXER_VALIDATION_SOURCE and INDEXER_VALIDATION_DESTINATION and run it with
-`cargo test --offline --locked --test overlap replay_retained_network_observations -- --ignored`.
-It bounds replay to 1,000 live records and 16 historical blocks / 64 MiB; it is
-excluded from normal CI because local validation captures are not committed.
+The former ignored test `replay_retained_network_observations` replayed a retained
+SQLite validation database. It was removed with SQLite (#35); retained validation
+data from that period must be refetched into a PostgreSQL session to replay.

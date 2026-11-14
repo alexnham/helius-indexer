@@ -35,7 +35,9 @@ def configuration(env, tip):
             "live_from": integer(env, "INDEXER_LIVE_FROM", max(0, tip - 4), 0, tip),
             "seconds": integer(env, "INDEXER_LIVE_SECONDS", 60, 1, 300),
             "keep": integer(env, "INDEXER_KEEP_TRANSFERS", 1000, 1, 1_000_000),
-            "mode": "live and backfill", "coverage": "unknown", "query_limit": 1000}
+            "mode": "live and backfill", "coverage": "unknown", "query_limit": 1000,
+            # A PostgreSQL session schema on DATABASE_URL's server, never a file.
+            "database": env.get("INDEXER_DB_SESSION", "runtime")}
 
 
 def credentials(path):
@@ -77,7 +79,7 @@ def atomic_json(path, value):
     temporary.replace(path)
 
 
-def initialize(session, binary):
+def initialize(session, binary, database):
     import shutil
     session.mkdir(parents=True, exist_ok=True, mode=0o700)
     target = session / "helius-indexer"
@@ -87,7 +89,7 @@ def initialize(session, binary):
         temporary.chmod(0o700)
         temporary.replace(target)
     # Creates the shared schema and retries retained unresolved input, offline and bounded.
-    CONSOLE.command(session, "live-retry", session / "index.sqlite")
+    CONSOLE.command(session, "live-retry", database)
 
 
 def execute_cycle(session, args, env, timeout, on_start, report_name="report.json"):
@@ -120,7 +122,8 @@ def main():
             endpoint = "https://mainnet.helius-rpc.com/?api-key=" + key
             config = configuration(os.environ, finalized_tip(endpoint))
             env = {**os.environ, "HELIUS_API_KEY": key, "INDEXER_LIVE_OPT_IN": "1", "SOLANA_RPC_URL": endpoint}
-        initialize(session, Path(os.environ.get("INDEXER_BINARY", "/usr/local/bin/helius-indexer")))
+        CONSOLE.require_database_url()
+        initialize(session, Path(os.environ.get("INDEXER_BINARY", "/usr/local/bin/helius-indexer")), config["database"])
         if not inspect_only:
             atomic_json(session / "session.json", config)
             atomic_json(session / "worker.json", {"state": "starting", "coverage": "unknown"})
@@ -134,7 +137,7 @@ def main():
 
         def worker():
             # Cycle 1 is the bounded live+backfill run; later cycles resume live intake only.
-            db, resume, number, last = session / "index.sqlite", config["live_from"], 0, {}
+            db, resume, number, last = config["database"], config["live_from"], 0, {}
             while not stopped.is_set():
                 number += 1
                 atomic_json(session / "worker.json", {**last, "state": "running", "cycle": number, "coverage": "unknown"})
@@ -161,9 +164,9 @@ def main():
                     stopped.wait(30)  # bounded backoff before reconnecting
         def status():
             return {"worker": json.loads((session / "worker.json").read_text()), "configuration": config,
-                    "summary": CONSOLE.command(session, "summary", session / "index.sqlite", config["mint"]),
-                    "live": CONSOLE.command(session, "live-status", session / "index.sqlite"),
-                    "historical": CONSOLE.command(session, "coverage", session / "index.sqlite", config["mint"], config["slot_start"], config["slot_end"])}
+                    "summary": CONSOLE.command(session, "summary", config["database"], config["mint"]),
+                    "live": CONSOLE.command(session, "live-status", config["database"]),
+                    "historical": CONSOLE.command(session, "coverage", config["database"], config["mint"], config["slot_start"], config["slot_end"])}
         port = integer(os.environ, "INDEXER_CONSOLE_PORT", 8767, 1024, 65535)
         server = CONSOLE.HTTPServer(("0.0.0.0", port), CONSOLE.handler_for(session, port, runtime_status=status))
         thread = threading.Thread(target=worker) if not inspect_only else None
