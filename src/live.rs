@@ -371,7 +371,15 @@ pub fn run_mint_admitted(
         if let Some(producer) = producer.as_mut() {
             let operation = Instant::now();
             for tx in buffer.iter() {
+                let late = producer.late_beyond_margin;
                 producer.send(tx.slot, &tx.encode_to_vec(), PROTO_SCHEMA)?;
+                if producer.late_beyond_margin > late {
+                    event(
+                        telemetry,
+                        "late_slot_beyond_reorder_margin",
+                        "late_slot_beyond_reorder_margin",
+                    );
+                }
             }
             count += buffer.len();
             if let Some(slot) = producer.poll(Duration::ZERO)? {
@@ -567,7 +575,7 @@ pub fn run_mint_admitted(
     }
     event(telemetry, "shutdown", status);
     let elapsed = started.elapsed().as_secs_f64();
-    let report = json!({"status":status,"received":count,"unresolved_attempts":failures,"input_protobuf_bytes":bytes,"elapsed_seconds":elapsed,"reconnect_attempts":reconnects,"inserted_transfers":inserted,"input_transactions_per_second":count as f64/elapsed,"decoded_write_successes":output_successes,"coverage_valid":false,"verified_boundary":null,"freshness_seconds":null,"storage":intake.store.stats(),"kafka":producer.as_ref().map(|p| json!({"topic":crate::kafka::TOPIC,"producer_cursor":p.cursor()})),"coverage":Intake::report(database)?});
+    let report = json!({"status":status,"received":count,"unresolved_attempts":failures,"input_protobuf_bytes":bytes,"elapsed_seconds":elapsed,"reconnect_attempts":reconnects,"inserted_transfers":inserted,"input_transactions_per_second":count as f64/elapsed,"decoded_write_successes":output_successes,"coverage_valid":false,"verified_boundary":null,"freshness_seconds":null,"storage":intake.store.stats(),"kafka":producer.as_ref().map(|p| json!({"topic":crate::kafka::TOPIC,"producer_cursor":p.cursor(),"late_beyond_reorder_margin":p.late_beyond_margin,"reorder_margin_slots":crate::kafka::REORDER_MARGIN_SLOTS})),"coverage":Intake::report(database)?});
     diagnostic(
         telemetry,
         &json!({"event":"live_metrics","mode":"live","source_kind":"laserstream","indexer_transactions_total":count,"indexer_decode_failures_total":failures,"indexer_input_bytes_total":bytes,"indexer_reconnects_total":reconnects,"indexer_coverage_valid":0,"indexer_live_freshness_seconds":null,"indexer_live_slot_gap":null,
@@ -1025,6 +1033,7 @@ mod tests {
                 .send(slot, &tx.encode_to_vec(), PROTO_SCHEMA)
                 .unwrap();
         }
+        assert_eq!(producer.late_beyond_margin, 0, "123..125 are in order");
         assert_eq!(producer.flush(Duration::from_secs(20)).unwrap(), Some(125));
         intake.log.advance_producer_cursor(USDC, 125).unwrap();
         // A stale producer reporting an older slot cannot rewind the stored position.
@@ -1032,6 +1041,14 @@ mod tests {
         assert_eq!(
             Intake::report(&test.0).unwrap()["producer_cursors"],
             json!([{"stream":USDC,"slot":125,"resume_from":125u64.saturating_sub(crate::kafka::REORDER_MARGIN_SLOTS)}])
+        );
+        // A slot far behind the newest one sent is outside the resume margin: counted.
+        producer.send(1_000, b"newest", PROTO_SCHEMA).unwrap();
+        producer.send(10, b"late", PROTO_SCHEMA).unwrap();
+        assert_eq!(producer.late_beyond_margin, 1);
+        assert_eq!(
+            producer.flush(Duration::from_secs(20)).unwrap(),
+            Some(1_000)
         );
         let oversize = vec![0; crate::kafka::MAX_MESSAGE_BYTES + 1];
         assert_eq!(

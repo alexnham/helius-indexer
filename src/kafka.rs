@@ -58,6 +58,10 @@ pub struct IntakeProducer {
     producer: BaseProducer<Deliveries>,
     topic: String,
     cursor: DeliveryCursor,
+    highest_sent: Option<u64>,
+    /// Messages older than the newest sent slot by more than the reorder margin: a resume
+    /// from a cursor stored after them could skip them, so they are counted and reported.
+    pub late_beyond_margin: u64,
 }
 
 impl IntakeProducer {
@@ -75,6 +79,8 @@ impl IntakeProducer {
             producer,
             topic: topic.into(),
             cursor: DeliveryCursor::default(),
+            highest_sent: None,
+            late_beyond_margin: 0,
         })
     }
 
@@ -82,6 +88,13 @@ impl IntakeProducer {
         if payload.len() > MAX_MESSAGE_BYTES {
             return Err(Error("live_input_limit"));
         }
+        if self
+            .highest_sent
+            .is_some_and(|highest| slot < highest.saturating_sub(REORDER_MARGIN_SLOTS))
+        {
+            self.late_beyond_margin += 1;
+        }
+        self.highest_sent = Some(self.highest_sent.map_or(slot, |h| h.max(slot)));
         let sequence = self.cursor.sent(slot);
         let key = slot.to_be_bytes();
         let headers = OwnedHeaders::new().insert(Header {
@@ -368,6 +381,7 @@ pub(crate) mod tests {
 
 /// Slots to replay before the stored cursor on resume. The stream delivers transactions
 /// slightly out of slot order, so a transaction for an earlier slot may still be on its way.
+/// Provisional and unmeasured: how far LaserStream reorders has not been recorded yet.
 /// shortcut: a fixed margin; replace with per-slot completion tracking when it exists (#36).
 pub const REORDER_MARGIN_SLOTS: u64 = 150;
 
