@@ -17,6 +17,7 @@ use tonic::{
 pub const USDC: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 const MAX_MESSAGES: usize = 10_000;
 const PROTO_SCHEMA: &str = "laserstream-core-proto/14.0.0";
+const RECENT_SECONDS: i64 = 60;
 
 pub fn request(from: u64) -> SubscribeRequest {
     request_mint(from, USDC)
@@ -271,8 +272,16 @@ impl Intake {
         let last_received_slot: Option<i64> = db
             .query_row("SELECT MAX(slot) FROM live_raw", [], |r| r.get(0))
             .map_err(|_| Error("storage_read_failed"))?;
+        // Raw inputs by arrival time show flow during a cycle; attempts, not unique transfers.
+        let (received, decoded): (i64, i64) = db
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(status='decoded'),0) FROM live_raw WHERE received_at>=?1",
+                [now() - RECENT_SECONDS],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map_err(|_| Error("storage_read_failed"))?;
         Ok(
-            json!({"last_received_slot":last_received_slot,"retry_cursor":retry_cursor,"retry_batch_limit":100,"oldest_unresolved_age_seconds":if pending==0{Some(0)}else{oldest.and_then(age)},"state":if runs.is_empty(){"uninitialized"}else{"partial"},"mint":runs.first().and_then(|r|r.get("mint")),"decoder_version":decoder::DECODER_VERSION,"verified_boundary":null,"coverage":"unknown","unresolved_items":pending,"runs":runs,"limit":100,"reason":"filtered_finalized_stream_has_no_validated_completion_evidence"}),
+            json!({"recent":{"window_seconds":RECENT_SECONDS,"received":received,"decoded":decoded,"pending":received-decoded},"last_received_slot":last_received_slot,"retry_cursor":retry_cursor,"retry_batch_limit":100,"oldest_unresolved_age_seconds":if pending==0{Some(0)}else{oldest.and_then(age)},"state":if runs.is_empty(){"uninitialized"}else{"partial"},"mint":runs.first().and_then(|r|r.get("mint")),"decoder_version":decoder::DECODER_VERSION,"verified_boundary":null,"coverage":"unknown","unresolved_items":pending,"runs":runs,"limit":100,"reason":"filtered_finalized_stream_has_no_validated_completion_evidence"}),
         )
     }
 }
@@ -841,11 +850,17 @@ mod tests {
         assert!(intake.process(id, &tx).is_err());
         assert!(Store::query(&path, None, 100).unwrap().is_empty());
         assert_eq!(Intake::report(&path).unwrap()["unresolved_items"], 1);
+        let recent = &Intake::report(&path).unwrap()["recent"];
+        assert_eq!(
+            (recent["received"].as_i64(), recent["pending"].as_i64()),
+            (Some(1), Some(1))
+        );
         intake
             .db
             .execute_batch("DROP TRIGGER fail_transfers;")
             .unwrap();
         assert_eq!(intake.retry().unwrap()["decoded"], 1);
+        assert_eq!(Intake::report(&path).unwrap()["recent"]["decoded"], 1);
         assert_eq!(Store::query(&path, None, 100).unwrap().len(), 1);
     }
     #[tokio::test(flavor = "current_thread")]
