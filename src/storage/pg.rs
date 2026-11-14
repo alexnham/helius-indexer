@@ -7,8 +7,24 @@ pub(crate) const MIGRATIONS: &[(i32, &str)] = &[];
 
 /// Connection errors are reduced to a class: driver messages can echo the URL or credentials.
 pub(crate) fn connect(url: &str) -> Result<Client> {
-    // shortcut: no TLS, so only local databases work; add TLS before the runtime uses a hosted database (#35).
-    Client::connect(url, NoTls).map_err(|_| Error("storage_open_failed"))
+    let config: postgres::Config = url.parse().map_err(|_| Error("storage_open_failed"))?;
+    // shortcut: no TLS client yet, so only loopback and Unix-socket servers are accepted; add TLS before hosted use (#35).
+    if !loopback(&config) {
+        return Err(Error("storage_tls_required"));
+    }
+    config
+        .connect(NoTls)
+        .map_err(|_| Error("storage_open_failed"))
+}
+
+fn loopback(config: &postgres::Config) -> bool {
+    use postgres::config::Host;
+    let hosts = config.get_hosts().iter().all(|host| match host {
+        Host::Tcp(name) => matches!(name.as_str(), "localhost" | "127.0.0.1" | "::1"),
+        #[cfg(unix)]
+        Host::Unix(_) => true,
+    });
+    hosts && config.get_hostaddrs().iter().all(|ip| ip.is_loopback())
 }
 
 /// Brings the schema to the newest known version and returns it. Refuses a database
@@ -17,9 +33,10 @@ pub(crate) fn migrate(db: &mut Client, migrations: &[(i32, &str)]) -> Result<i32
     let mut tx = db
         .transaction()
         .map_err(|_| Error("storage_migration_failed"))?;
+    // The lock serializes migrators before the table exists; it is released at commit or rollback.
     tx.batch_execute(
-        "CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now());
-        LOCK TABLE schema_migrations IN EXCLUSIVE MODE;",
+        "SELECT pg_advisory_xact_lock(7311946001);
+        CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now());",
     )
     .map_err(|_| Error("storage_migration_failed"))?;
     let current: i32 = tx
@@ -142,6 +159,44 @@ mod tests {
             migrate(&mut db.client, &[V1]).unwrap_err().0,
             "storage_schema_newer_than_binary"
         );
+    }
+
+    #[test]
+    fn plaintext_connections_are_refused_off_loopback() {
+        for url in [
+            "postgres://u:p@roundhouse.proxy.rlwy.net:54778/railway",
+            "postgres://u:p@10.0.0.5/x",
+            "host=127.0.0.1,db.example.com user=u",
+            "host=localhost hostaddr=192.0.2.1 user=u",
+        ] {
+            let Err(error) = connect(url) else {
+                panic!("connected without TLS");
+            };
+            assert_eq!(error.0, "storage_tls_required", "{url}");
+        }
+    }
+
+    #[test]
+    fn concurrent_first_migrations_both_succeed() {
+        let db = TestDb::new();
+        let url = std::env::var("INDEXER_TEST_DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://indexer:indexer@127.0.0.1:55432/indexer".into());
+        let schema = db.schema.clone();
+        let workers: Vec<_> = (0..4)
+            .map(|_| {
+                let (url, schema) = (url.clone(), schema.clone());
+                std::thread::spawn(move || {
+                    let mut client = connect(&url).unwrap();
+                    client
+                        .batch_execute(&format!("SET search_path TO {schema}"))
+                        .unwrap();
+                    migrate(&mut client, &[V1, V2])
+                })
+            })
+            .collect();
+        for worker in workers {
+            assert_eq!(worker.join().unwrap().unwrap(), 2);
+        }
     }
 
     #[test]
