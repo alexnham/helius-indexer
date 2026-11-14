@@ -380,6 +380,34 @@ fn telemetry_distinguishes_unscheduled_age_from_an_observed_empty_backlog() {
         assert!(!line.contains(&mint()));
         assert!(!line.contains("slot="));
     }
+    // Strict text-format parsers require each metric family's samples to be contiguous.
+    let family = |line: &str| {
+        let name = line.split(['{', ' ']).next().unwrap();
+        ["_bucket", "_sum", "_count"]
+            .iter()
+            .find_map(|suffix| name.strip_suffix(suffix))
+            .unwrap_or(name)
+            .to_string()
+    };
+    let mut finished = std::collections::HashSet::new();
+    let mut current = String::new();
+    for line in text
+        .lines()
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+    {
+        let name = family(line);
+        if name != current {
+            assert!(finished.insert(current.clone()), "{current} is split");
+            assert!(!finished.contains(&name), "{name} is split");
+            current = name;
+        }
+    }
+    assert!(text.contains(
+        "indexer_stage_duration_seconds_count{operation=\"transfer_write\",mode=\"historical\"}"
+    ));
+    assert!(text.contains(
+        "indexer_stage_duration_seconds_count{operation=\"historical_range\",mode=\"historical\"} 1"
+    ));
 }
 
 #[test]

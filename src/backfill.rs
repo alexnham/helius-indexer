@@ -219,6 +219,8 @@ pub struct Metrics {
     pub decode_failures: u64,
     pub elapsed_seconds: f64,
     pub cancelled: bool,
+    /// Writes made by this run's store; transfers written exclude identical replays.
+    pub storage: crate::storage::WriteStats,
 }
 impl Metrics {
     pub fn prometheus(&self, coverage: &Coverage) -> String {
@@ -254,7 +256,13 @@ impl Metrics {
             }
             prior_pending = pending;
         }
-        output.push_str(&format!("indexer_missing_ranges{{mode=\"historical\"}} {missing_ranges}\nindexer_stage_duration_seconds_sum{{operation=\"historical_range\"}} {}\nindexer_stage_duration_seconds_count{{operation=\"historical_range\"}} 1\nindexer_stage_duration_seconds_bucket{{operation=\"historical_range\",le=\"+Inf\"}} 1\n",self.elapsed_seconds));
+        output.push_str(&format!(
+            "indexer_missing_ranges{{mode=\"historical\"}} {missing_ranges}\n"
+        ));
+        output.push_str(&self.storage.counter_lines("historical"));
+        // One metric family must be contiguous for strict text-format parsers.
+        output.push_str(&self.storage.duration_lines("historical"));
+        output.push_str(&format!("indexer_stage_duration_seconds_bucket{{operation=\"historical_range\",mode=\"historical\",le=\"+Inf\"}} 1\nindexer_stage_duration_seconds_sum{{operation=\"historical_range\",mode=\"historical\"}} {}\nindexer_stage_duration_seconds_count{{operation=\"historical_range\",mode=\"historical\"}} 1\n",self.elapsed_seconds));
         if self.archive_input {
             output = output.replace("source_kind=\"rpc\"", "source_kind=\"archive\"");
         }
@@ -606,6 +614,7 @@ impl History {
             }
         }
         metrics.source_diagnostics = source.diagnostics();
+        metrics.storage = store.stats();
         metrics.elapsed_seconds = started.elapsed().as_secs_f64();
         Ok((self.coverage(mint, start, end)?, metrics))
     }

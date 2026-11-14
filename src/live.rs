@@ -419,12 +419,13 @@ pub fn run_mint_admitted(
     }
     event(telemetry, "shutdown", status);
     let elapsed = started.elapsed().as_secs_f64();
-    let report = json!({"status":status,"received":count,"unresolved_attempts":failures,"input_protobuf_bytes":bytes,"elapsed_seconds":elapsed,"reconnect_attempts":reconnects,"inserted_transfers":inserted,"input_transactions_per_second":count as f64/elapsed,"decoded_write_successes":output_successes,"coverage_valid":false,"verified_boundary":null,"freshness_seconds":null,"coverage":Intake::report(database)?});
+    let report = json!({"status":status,"received":count,"unresolved_attempts":failures,"input_protobuf_bytes":bytes,"elapsed_seconds":elapsed,"reconnect_attempts":reconnects,"inserted_transfers":inserted,"input_transactions_per_second":count as f64/elapsed,"decoded_write_successes":output_successes,"coverage_valid":false,"verified_boundary":null,"freshness_seconds":null,"storage":intake.store.stats(),"coverage":Intake::report(database)?});
     diagnostic(
         telemetry,
         &json!({"event":"live_metrics","mode":"live","source_kind":"laserstream","indexer_transactions_total":count,"indexer_decode_failures_total":failures,"indexer_input_bytes_total":bytes,"indexer_reconnects_total":reconnects,"indexer_coverage_valid":0,"indexer_live_freshness_seconds":null,"indexer_live_slot_gap":null,
             "stage_metrics":[{"stage":"raw_write","success":count,"duration_seconds_sum":raw_seconds},
-                {"stage":"decode_write","success":output_successes,"unsupported":failures,"duration_seconds_sum":output_seconds}],
+                {"stage":"decode_write","success":output_successes,"unsupported":failures,"duration_seconds_sum":output_seconds},
+                {"stage":"transfer_write","storage":intake.store.stats()}],
             "elapsed_seconds":elapsed,"input_transactions_per_second":count as f64/elapsed}),
     );
     result?;
