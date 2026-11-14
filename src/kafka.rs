@@ -55,6 +55,8 @@ pub fn ensure_topic(brokers: &str, topic: &str, partitions: i32) -> Result<()> {
     let new = NewTopic::new(topic, partitions, TopicReplication::Fixed(1))
         .set("retention.ms", &retention)
         .set("retention.bytes", "-1")
+        // Compaction keyed by slot would keep one message per slot and silently drop the rest.
+        .set("cleanup.policy", "delete")
         .set("max.message.bytes", &max_bytes);
     let created =
         block_on(admin.create_topics([&new], &options))?.map_err(|_| Error("kafka_unavailable"))?;
@@ -72,6 +74,7 @@ pub fn ensure_topic(brokers: &str, topic: &str, partitions: i32) -> Result<()> {
         }
         std::thread::sleep(Duration::from_millis(250));
     }
+    // The class also covers compaction and byte caps: any policy that can drop raw input early.
     Err(Error("kafka_topic_retention_too_short"))
 }
 
@@ -90,10 +93,15 @@ fn retention_ok(
             .get(name)
             .and_then(|e| e.value.as_deref()?.parse().ok())
     };
+    let delete_only = resource
+        .get("cleanup.policy")
+        .and_then(|e| e.value.as_deref())
+        == Some("delete");
     // -1 retention.ms means forever, which also satisfies the policy.
     Ok(
         value("retention.ms").is_some_and(|ms| ms == -1 || ms >= RETENTION_MS)
-            && value("retention.bytes") == Some(-1),
+            && value("retention.bytes") == Some(-1)
+            && delete_only,
     )
 }
 
@@ -155,6 +163,7 @@ pub(crate) mod tests {
         let get = |name: &str| resource.get(name).and_then(|e| e.value.clone()).unwrap();
         assert_eq!(get("retention.ms"), RETENTION_MS.to_string());
         assert_eq!(get("retention.bytes"), "-1");
+        assert_eq!(get("cleanup.policy"), "delete");
     }
 
     #[test]
@@ -163,6 +172,24 @@ pub(crate) mod tests {
         let admin: AdminClient<DefaultClientContext> = config(&test_brokers()).create().unwrap();
         let mut alter = rdkafka::admin::AlterConfig::new(ResourceSpecifier::Topic(&topic.0));
         alter = alter.set("retention.ms", "86400000");
+        block_on(admin.alter_configs([&alter], &AdminOptions::new()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            ensure_topic(&test_brokers(), &topic.0, 1).unwrap_err().0,
+            "kafka_topic_retention_too_short"
+        );
+    }
+
+    #[test]
+    fn a_compacted_topic_is_refused() {
+        let topic = TestTopic::new(1);
+        let admin: AdminClient<DefaultClientContext> = config(&test_brokers()).create().unwrap();
+        let retention = RETENTION_MS.to_string();
+        let alter = rdkafka::admin::AlterConfig::new(ResourceSpecifier::Topic(&topic.0))
+            .set("retention.ms", &retention)
+            .set("retention.bytes", "-1")
+            .set("cleanup.policy", "compact");
         block_on(admin.alter_configs([&alter], &AdminOptions::new()))
             .unwrap()
             .unwrap();
