@@ -1053,13 +1053,17 @@ mod consumer_tests {
         );
     }
 
-    /// Opt-in: drain time for 2,400 inputs over 6 partitions with 1, 2 and 4 consumers,
-    /// against the local broker and the database named by INDEXER_TEST_DATABASE_URL.
+    /// Opt-in: drain time for INDEXER_MEASURE_INPUTS inputs (default 2,400) over 6
+    /// partitions with 1, 2 and 4 consumers, against the local broker and the database
+    /// named by INDEXER_TEST_DATABASE_URL (a hosted one needs its TLS settings too).
     #[test]
     #[ignore = "opt-in throughput measurement"]
     fn measure_consumer_group_throughput() {
-        const INPUTS: u16 = 2_400;
-        let updates: Vec<_> = (0..INPUTS)
+        let inputs: u16 = std::env::var("INDEXER_MEASURE_INPUTS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2_400);
+        let updates: Vec<_> = (0..inputs)
             .map(|i| {
                 let mut tx = signed(1, 2_000 + u64::from(i));
                 let mut signature = vec![(i % 251) as u8 + 1; 64];
@@ -1084,7 +1088,7 @@ mod consumer_tests {
                 })
                 .collect();
             let drained = loop {
-                if stored_positions(&test) >= i64::from(INPUTS) {
+                if stored_positions(&test) >= i64::from(inputs) {
                     break started.elapsed().as_secs_f64();
                 }
                 assert!(started.elapsed() < Duration::from_secs(60), "not drained");
@@ -1093,9 +1097,12 @@ mod consumer_tests {
             for worker in workers {
                 worker.join().unwrap();
             }
-            assert_eq!(Store::query(&test.0, None, 1000).unwrap().len(), 1000);
-            results.push(serde_json::json!({"consumers":consumers,"inputs":INPUTS,
-                "drain_seconds":drained,"transactions_per_second":f64::from(INPUTS)/drained}));
+            assert_eq!(
+                Store::query(&test.0, None, 1000).unwrap().len(),
+                usize::from(inputs).min(1000)
+            );
+            results.push(serde_json::json!({"consumers":consumers,"inputs":inputs,
+                "drain_seconds":drained,"transactions_per_second":f64::from(inputs)/drained}));
         }
         println!("{}", serde_json::Value::Array(results));
     }
