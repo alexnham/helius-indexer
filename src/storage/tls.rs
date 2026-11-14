@@ -12,13 +12,7 @@ use rustls::{
 use sha2::{Digest, Sha256};
 use std::{path::Path, sync::Arc};
 
-/// Reads the operator's TLS settings. Error classes never include paths, pins or URLs.
-pub(crate) fn from_env() -> Result<ClientConfig> {
-    let pin = std::env::var("INDEXER_DB_TLS_SHA256").ok();
-    let root = std::env::var_os("INDEXER_DB_TLS_ROOT");
-    client_config(pin.as_deref(), root.as_deref().map(Path::new))
-}
-
+/// Error classes never include paths, pins or URLs.
 pub(crate) fn client_config(pin: Option<&str>, root: Option<&Path>) -> Result<ClientConfig> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let verifier = verifier(pin, root, &provider)?;

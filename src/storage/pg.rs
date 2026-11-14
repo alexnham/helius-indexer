@@ -8,6 +8,16 @@ pub(crate) const MIGRATIONS: &[(i32, &str)] = &[(1, include_str!("migrations/000
 /// Connection errors are reduced to a class: driver messages can echo the URL or credentials.
 /// Loopback and Unix sockets may be plaintext; every other host requires authenticated TLS.
 pub(crate) fn connect(url: &str) -> Result<Client> {
+    let pin = std::env::var("INDEXER_DB_TLS_SHA256").ok();
+    let root = std::env::var_os("INDEXER_DB_TLS_ROOT");
+    connect_with(
+        url,
+        pin.as_deref(),
+        root.as_deref().map(std::path::Path::new),
+    )
+}
+
+fn connect_with(url: &str, pin: Option<&str>, root: Option<&std::path::Path>) -> Result<Client> {
     use postgres::config::SslMode;
     let mut config: postgres::Config = url.parse().map_err(|_| Error("storage_open_failed"))?;
     if loopback(&config) && config.get_ssl_mode() != SslMode::Require {
@@ -22,10 +32,10 @@ pub(crate) fn connect(url: &str) -> Result<Client> {
     config.ssl_mode(SslMode::Require);
     // A pin authenticates only the certificate; binding SCRAM to this TLS channel also
     // proves the server holds the password verifier, defeating a relaying intermediary.
-    if std::env::var_os("INDEXER_DB_TLS_SHA256").is_some() {
+    if pin.is_some() {
         config.channel_binding(postgres::config::ChannelBinding::Require);
     }
-    let tls = tokio_postgres_rustls::MakeRustlsConnect::new(super::tls::from_env()?);
+    let tls = tokio_postgres_rustls::MakeRustlsConnect::new(super::tls::client_config(pin, root)?);
     config.connect(tls).map_err(|error| {
         Error(if tls_failure(&error) {
             "storage_tls_failed"
@@ -369,18 +379,66 @@ mod tests {
         }
     }
 
-    #[test]
-    fn untrusted_or_unpinned_servers_fail_tls_without_a_plaintext_fallback() {
-        // A local plain server on a non-loopback address would accept plaintext; TLS is
-        // demanded instead, and the server's refusal surfaces as a TLS or open failure.
-        let url = TestDatabase::url().replace("127.0.0.1", "localhost") + "?sslmode=require";
-        let Err(error) = connect(&url) else {
-            panic!("connected without verified TLS");
+    /// Accepts PostgreSQL's TLS upgrade, completes the handshake with `cert`, then closes
+    /// before authentication: enough to observe what the client accepts, fully offline.
+    fn tls_upgrade_server(cert: &rcgen::CertifiedKey<rcgen::KeyPair>) -> u16 {
+        use std::{
+            io::{Read, Write},
+            sync::Arc,
         };
-        assert!(
-            matches!(error.0, "storage_tls_failed" | "storage_open_failed"),
-            "{}",
-            error.0
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let key =
+            rustls::pki_types::PrivateKeyDer::try_from(cert.signing_key.serialize_der()).unwrap();
+        let config = Arc::new(
+            rustls::ServerConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert.cert.der().clone()], key)
+            .unwrap(),
+        );
+        std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut ssl_request = [0; 8];
+            socket.read_exact(&mut ssl_request).unwrap();
+            socket.write_all(b"S").unwrap();
+            let connection = rustls::ServerConnection::new(config).unwrap();
+            // Reading drives the handshake; it ends when the client aborts or sends startup.
+            let _ = rustls::StreamOwned::new(connection, socket).read(&mut [0; 1]);
+        });
+        port
+    }
+
+    #[test]
+    fn pins_and_chains_are_checked_during_a_real_tls_handshake() {
+        use sha2::Digest;
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let pin: String = sha2::Sha256::digest(cert.cert.der())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let url = |port: u16| format!("postgres://u:p@127.0.0.1:{port}/x?sslmode=require");
+        let refused = |url: String, pin: Option<&str>| match connect_with(&url, pin, None) {
+            Ok(_) => panic!("the fake server cannot authenticate"),
+            Err(error) => error.0,
+        };
+        let wrong = "00".repeat(32);
+        assert_eq!(
+            refused(url(tls_upgrade_server(&cert)), Some(&wrong)),
+            "storage_tls_failed"
+        );
+        // The correct pin completes the handshake; only the missing authentication fails.
+        assert_eq!(
+            refused(url(tls_upgrade_server(&cert)), Some(&pin)),
+            "storage_open_failed"
+        );
+        // Without a pin, an untrusted self-signed chain fails verify-full in the handshake.
+        assert_eq!(
+            refused(url(tls_upgrade_server(&cert)), None),
+            "storage_tls_failed"
         );
     }
 
