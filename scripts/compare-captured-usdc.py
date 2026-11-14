@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """Offline cross-check of classic SPL USDC edges against retained RPC blocks.
 
-Usage: python3 scripts/compare-captured-usdc.py RAW_INPUT_DB INDEX_DB
-Reads at most 16 retained blocks / 64 MiB and 100,000 stored USDC rows.
+Usage: DATABASE_URL=... python3 scripts/compare-captured-usdc.py SESSION [--sample]
+Reads the session through the read-only `comparison-input` CLI command (binary from
+INDEXER_BINARY, default `helius-indexer`): at most 16 retained blocks with --sample
+(33 observations otherwise), 64 MiB, and 100,000 stored USDC rows.
 The independent parser excludes transactions with runtime failure evidence.
 It does not certify Token-2022 transfers or full-chain/provider completeness.
 """
 import json
-from pathlib import Path
-import sqlite3
+import os
+import subprocess
 import sys
 
 ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -34,20 +36,19 @@ def runtime_failure(line):
         return False
 
 
-def readonly(path):
-    return sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True)
+def export(session, sample):
+    # DATABASE_URL is inherited by the child and never printed.
+    args = [os.environ.get("INDEXER_BINARY", "helius-indexer"), "comparison-input", session, MINT]
+    result = subprocess.run(args + (["--sample"] if sample else []), stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL, timeout=120, check=True)
+    return json.loads(result.stdout)
 
 
-def compare(source, destination):
+def compare(exported):
     blocks = {}
-    size = 0
-    for count, (slot, raw) in enumerate(source.execute(
-        "SELECT slot,response FROM historical_inputs ORDER BY slot,attempt LIMIT 33"
-    ), start=1):
+    for count, observation in enumerate(exported["blocks"], start=1):
         assert count <= 32, "too many retained block observations"
-        size += len(raw)
-        assert size <= 64 * 1024 * 1024, "retained input exceeds validation bound"
-        blocks[slot] = json.loads(raw)["result"]
+        blocks[observation["slot"]] = observation["response"]["result"]
         assert len(blocks) <= 16, "too many retained blocks"
     assert blocks, "no retained blocks"
     expected = {}
@@ -93,11 +94,8 @@ def compare(source, destination):
                         str(int.from_bytes(data[1:9], "little")), keys[src], keys[dst]
                     )
     actual = {}
-    for row, in destination.execute(
-        "SELECT record_json FROM transfers WHERE mint=? AND slot BETWEEN ? AND ? LIMIT 100001",
-        (MINT, min(blocks), max(blocks)),
-    ):
-        row = json.loads(row)
+    for row in exported["transfers"]:
+        assert row["mint"] == MINT, "export returned another mint"
         assert row["slot"] in blocks, "stored slot lacks retained comparison block"
         actual[row["transfer_id"]] = (
             row["amount_raw"], row["source_token_account"], row["destination_token_account"]
@@ -112,7 +110,6 @@ def compare(source, destination):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 3:
+    if len(sys.argv) not in (2, 3) or (len(sys.argv) == 3 and sys.argv[2] != "--sample"):
         sys.exit(__doc__)
-    with readonly(sys.argv[1]) as source, readonly(sys.argv[2]) as destination:
-        sys.exit(compare(source, destination))
+    sys.exit(compare(export(sys.argv[1], sample=len(sys.argv) == 3)))

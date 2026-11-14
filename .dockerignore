@@ -1,0 +1,20 @@
+# Allowlist: credentials, host builds, local databases and Git metadata never enter the context.
+**
+!Cargo.toml
+!Cargo.lock
+!src/
+!src/**
+!scripts/
+!scripts/local-test.py
+!scripts/indexer-runtime.py
+!scripts/compare-captured-usdc.py
+!scripts/local-console/
+!scripts/local-console/**
+!tests/
+!tests/fixtures/
+!tests/fixtures/**
+
+**/.env
+**/.env.*
+**/*.sqlite*
+**/__pycache__/

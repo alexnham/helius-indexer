@@ -109,6 +109,19 @@ Treat archive publication lag, Jetstreamer interfaces, and compatibility with re
 
 Target operation by one engineer. Prefer managed services where their cost is justified, and avoid separate services or databases without demonstrated need.
 
+### Selected direction (2026-11-13)
+
+The owner chose to build for horizontal scale ahead of measured need, superseding the "demonstrated need" rule above for these choices:
+
+- **PostgreSQL** for transfers, checkpoints, coverage, and range leases, replacing SQLite entirely. Ordinary tests use a local PostgreSQL container (offline: no provider calls); hosted databases are for opt-in checks only. Existing SQLite sessions are test data and are reset rather than migrated. Partition transfers for retention and add rollups for aggregates.
+- **Kafka** as the durable raw intake log with a parallel consumer group. Consumers commit offsets only after the PostgreSQL write is durable; Kafka retention must satisfy the raw-retention requirements until object storage holds replay inputs.
+- **Compressed object storage** for long-term raw retention, added after the above.
+- **ClickHouse** deferred until query volume or all-mint row counts require it.
+
+Locally these run in Docker; production uses managed equivalents through configuration. Supporting load figures: [USDC load measurement](docs/validation/2026-11-13-usdc-load.md). Each step still needs the crash, duplicate, and coverage checks in this proposal.
+
+Unresolved: matched transactions currently persist transfers of every mint they contain (about 40% were USDC in the measured sample). Decide whether to filter to configured mints at write time or keep related-mint transfers.
+
 ## Rust package organization
 
 Start with one Rust package. Modules express responsibilities; extract crates only when independent builds or concrete reuse justify them. Separate commands or binaries can run workers independently without introducing a crate per worker.
@@ -239,3 +252,38 @@ readiness, and the live tail remains unknown. Recovery requires matching block/
 transaction/known metadata, an exact observed log prefix plus consistent suffix,
 and unchanged strict decoding of complete evidence. See
 [RPC evidence recovery](docs/rpc-evidence-recovery.md) for trust limits and tests.
+
+Docker Compose now packages the captured-data console for local beta testing,
+using one non-root image and a dedicated SQLite/session volume. This selects
+local packaging only; it does not select production queues, databases, deployment
+infrastructure or enable ingestion. Health reports availability separately from
+unknown chain coverage. See [Docker operation](docs/docker.md).
+
+The opt-in local Docker runtime may exercise a configurable mint, independent
+recent live start and bounded RPC historical range through the shared decoder,
+storage and live-priority admission gate. Defaults are 60 seconds and 50 finalized
+slots; each invocation remains limited to 300 seconds/128 historical slots. It
+exposes source failures and scoped coverage alongside newest-first inspection.
+This does not establish a rolling 30-day API or authorize a full-window backfill.
+The runtime now continues live intake in resumable cycles and keeps only the newest
+1,000 transfers (configurable), pruning older inputs and coverage to `unknown`.
+This count-based cap is a local-testing retention choice only; the 30-day query
+window and 37-day raw retention above remain the production requirement.
+
+## Corrected backfill implementation direction (2026-11-13)
+
+The normal backfill path follows the original brief: Old Faithful through the
+maintained Jetstreamer adapter for older available history, and LaserStream
+historical replay for recent history and outage recovery, transitioning to live
+intake. Bounded RPC commands remain verification/fallback tools, not the normal
+recent-history source. Measure archive availability and actual replay availability;
+expose an uncovered interval rather than assuming their windows overlap.
+
+Durable historical jobs must retain their requested scope and processing state
+across restarts and live cycles. Preserve live priority. Keep processing receipts
+separate from verified coverage and from data still retained after the approved
+local 1,000-transfer cap. Filtered replay receipt or a later observed slot alone
+must not advance verified slot coverage. The current first-cycle RPC Docker
+implementation does not satisfy this target. Follow the staged
+[corrected backfill plan](docs/backfill-replan.md); a full-window run and paid
+infrastructure remain separately authorized actions.

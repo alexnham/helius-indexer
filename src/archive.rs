@@ -1,4 +1,5 @@
 //! Bounded Old Faithful source. Public-network use is opt-in; caches replay offline.
+use crate::storage::Database;
 mod decode;
 use crate::coordinator::evidence;
 mod transport;
@@ -28,7 +29,7 @@ fn range(mint: &str, start: u64, end: u64) -> Result<()> {
     Ok(())
 }
 pub fn run(
-    path: &Path,
+    database: &Database,
     cache: &Path,
     mint: &str,
     start: u64,
@@ -40,7 +41,7 @@ pub fn run(
     let began = Instant::now();
     let cancel = std::env::var_os("BACKFILL_CANCEL_FILE");
     let mut source = ArchiveSource::new(cache, network, Limits::default())?;
-    let mut history = History::open(path)?;
+    let mut history = History::open(database)?;
     let run_id = history.run_id().to_owned();
     telemetry.set_context("backfill", "archive", "historical");
     telemetry.run_id = run_id.clone();
@@ -55,7 +56,7 @@ pub fn run(
 
 /// Verifies block anchors and ordered transaction identities before reconciling both observations.
 pub fn overlap(
-    path: &Path,
+    database: &Database,
     cache: &Path,
     mint: &str,
     start: u64,
@@ -70,7 +71,7 @@ pub fn overlap(
     let endpoint = std::env::var("SOLANA_RPC_URL")
         .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".into());
     let mut rpc = RpcSource::bounded(endpoint, began + Duration::from_secs(120))?;
-    let mut history = History::open(path)?;
+    let mut history = History::open(database)?;
     let mut verified = 0;
     let mut recovered = 0;
     let mut observations = Vec::new();
@@ -98,13 +99,13 @@ pub fn overlap(
         observations.push(json!({"slot":slot,"outcome":outcome}));
     }
     Ok(
-        json!({"run_id":telemetry.run_id,"overlap_verified":verified==end-start+1,"boundary_ready":verified+recovered==end-start+1,"verified_slots":verified,"corroborated_slots":recovered,"observations":observations,"start":start,"end":end,"jetstreamer_revision":JETSTREAMER_REVISION,"archive":archive.stats,"rpc_response_body_bytes":rpc_bytes,"rpc_transport":rpc.diagnostics(),"coverage":history.coverage(mint,start,end)?,"summary":crate::storage::Store::summary(path,mint)?,"live_coverage":"unknown"}),
+        json!({"run_id":telemetry.run_id,"overlap_verified":verified==end-start+1,"boundary_ready":verified+recovered==end-start+1,"verified_slots":verified,"corroborated_slots":recovered,"observations":observations,"start":start,"end":end,"jetstreamer_revision":JETSTREAMER_REVISION,"archive":archive.stats,"rpc_response_body_bytes":rpc_bytes,"rpc_transport":rpc.diagnostics(),"coverage":history.coverage(mint,start,end)?,"summary":crate::storage::Store::summary(database,mint)?,"live_coverage":"unknown"}),
     )
 }
 
 /// Bounded recovery from both original normalized observations, without network access.
 pub fn replay_overlap(
-    path: &Path,
+    database: &Database,
     mint: &str,
     start: u64,
     end: u64,
@@ -112,7 +113,7 @@ pub fn replay_overlap(
 ) -> Result<Value> {
     range(mint, start, end)?;
     telemetry.set_context("archive_bridge", "retained_pair", "recovery");
-    let mut history = History::open(path)?;
+    let mut history = History::open(database)?;
     let began = Instant::now();
     let cancel = std::env::var_os("BACKFILL_CANCEL_FILE");
     let cancelled = || {
@@ -141,12 +142,12 @@ pub fn replay_overlap(
         None,
     );
     Ok(
-        json!({"run_id":telemetry.run_id,"overlap_verified":verified==end-start+1,"boundary_ready":ready,"verified_slots":verified,"corroborated_slots":recovered,"observations":observations,"coverage":history.coverage(mint,start,end)?,"summary":crate::storage::Store::summary(path,mint)?,"network_requests":0,"live_coverage":"unknown"}),
+        json!({"run_id":telemetry.run_id,"overlap_verified":verified==end-start+1,"boundary_ready":ready,"verified_slots":verified,"corroborated_slots":recovered,"observations":observations,"coverage":history.coverage(mint,start,end)?,"summary":crate::storage::Store::summary(database,mint)?,"network_requests":0,"live_coverage":"unknown"}),
     )
 }
 
 pub fn live(
-    path: &Path,
+    database: &Database,
     cache: &Path,
     start: u64,
     end: u64,
@@ -163,7 +164,7 @@ pub fn live(
             ..Limits::default()
         },
     )?;
-    crate::coordinator::run_with_source(path, start, end, seconds, telemetry, source)
+    crate::coordinator::run_with_source(database, start, end, seconds, telemetry, source)
 }
 
 pub(crate) struct Observation {
