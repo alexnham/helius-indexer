@@ -1,13 +1,18 @@
 //! Bounded LaserStream intake. Filtered transaction delivery never proves slot coverage.
-use crate::{Error, Result, decoder, storage::Store};
+use crate::{
+    Error, Result, decoder,
+    storage::{
+        Store,
+        live::{LiveLog, now},
+    },
+};
 use futures_util::StreamExt;
 use laserstream_core_proto::geyser::*;
 use prost::Message;
-use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use std::{
     path::Path,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 use tonic::{
     Request,
@@ -97,34 +102,23 @@ pub fn normalize(update: &SubscribeUpdateTransaction) -> Result<Vec<u8>> {
 }
 
 pub struct Intake {
-    db: Connection,
+    log: LiveLog,
     store: Store,
 }
 impl Intake {
     pub fn open(path: &Path) -> Result<Self> {
         let store = Store::open(path)?;
-        let db = Connection::open(path).map_err(|_| Error("storage_open_failed"))?;
-        db.busy_timeout(Duration::from_secs(5))
-            .map_err(|_| Error("storage_configuration_failed"))?;
-        db.execute_batch("PRAGMA synchronous=FULL;
-            CREATE TABLE IF NOT EXISTS live_raw(id INTEGER PRIMARY KEY, slot INTEGER NOT NULL, protobuf BLOB NOT NULL, proto_schema TEXT NOT NULL DEFAULT 'laserstream-core-proto/14.0.0', status TEXT NOT NULL, received_at INTEGER NOT NULL);
-            CREATE TABLE IF NOT EXISTS live_retry_cursor(singleton INTEGER PRIMARY KEY CHECK(singleton=1),last_id INTEGER NOT NULL);
-            CREATE TABLE IF NOT EXISTS live_runs(id INTEGER PRIMARY KEY, from_slot INTEGER NOT NULL, mint TEXT NOT NULL, decoder TEXT NOT NULL, status TEXT NOT NULL, reference_slot INTEGER, reference_at INTEGER, replay_first INTEGER, replay_at INTEGER);")
-            .map_err(|_|Error("storage_configuration_failed"))?;
-        Ok(Self { db, store })
+        Ok(Self {
+            log: LiveLog::open(path)?,
+            store,
+        })
     }
     /// The wire payload commits before normalization/decoding; a crash leaves retryable pending input.
     pub fn retain(&self, update: &SubscribeUpdateTransaction) -> Result<i64> {
         if update.encoded_len() > decoder::MAX_CAPTURE_BYTES || update.slot > i64::MAX as u64 {
             return Err(Error("live_input_limit"));
         }
-        self.db
-            .execute(
-                "INSERT INTO live_raw(slot,protobuf,status,received_at) VALUES(?1,?2,'pending',?3)",
-                params![update.slot as i64, update.encode_to_vec(), now()],
-            )
-            .map_err(|_| Error("storage_write_failed"))?;
-        Ok(self.db.last_insert_rowid())
+        self.log.retain(update.slot as i64, &update.encode_to_vec())
     }
     pub fn process(&mut self, id: i64, update: &SubscribeUpdateTransaction) -> Result<usize> {
         let result = (|| {
@@ -137,49 +131,20 @@ impl Intake {
             Ok(count)
         })();
         let status = result.as_ref().map_or_else(|e: &Error| e.0, |_| "decoded");
-        self.db
-            .execute(
-                "UPDATE live_raw SET status=?1 WHERE id=?2",
-                params![status, id],
-            )
-            .map_err(|_| Error("storage_write_failed"))?;
+        self.log.set_status(id, status)?;
         result
     }
     pub fn retry(&mut self) -> Result<Value> {
-        let cursor: i64 = self
-            .db
-            .query_row(
-                "SELECT COALESCE(MAX(last_id),0) FROM live_retry_cursor",
-                [],
-                |r| r.get(0),
-            )
-            .map_err(|_| Error("storage_read_failed"))?;
+        let cursor = self.log.retry_cursor()?;
         let mut telemetry = crate::telemetry::Telemetry::default();
         telemetry.set_context("live", "laserstream", "recovery");
         telemetry.emit("retry_batch_started", "retry", "retry", None);
-        let pending: Vec<i64> = {
-            let mut s = self
-                .db
-                .prepare("SELECT id FROM live_raw WHERE status!='decoded' ORDER BY (id<=?1),id LIMIT 100")
-                .map_err(|_| Error("storage_read_failed"))?;
-            s.query_map([cursor], |r| r.get(0))
-                .map_err(|_| Error("storage_read_failed"))?
-                .collect::<std::result::Result<_, _>>()
-                .map_err(|_| Error("storage_read_failed"))?
-        };
+        let pending = self.log.pending_after(cursor, 100)?;
         let mut success = 0;
         for id in &pending {
             // Fairness only: a crash can delay this row until wraparound, never acknowledge it.
-            self.db.execute("INSERT INTO live_retry_cursor VALUES(1,?1) ON CONFLICT(singleton) DO UPDATE SET last_id=excluded.last_id", [id])
-                .map_err(|_| Error("storage_write_failed"))?;
-            let (raw, schema): (Vec<u8>, String) = self
-                .db
-                .query_row(
-                    "SELECT protobuf,proto_schema FROM live_raw WHERE id=?1 AND length(protobuf)<=16777216",
-                    [id],
-                    |r| Ok((r.get(0)?,r.get(1)?)),
-                )
-                .map_err(|_| Error("storage_read_failed"))?;
+            self.log.advance_retry_cursor(*id)?;
+            let (raw, schema) = self.log.raw(*id)?;
             if schema != PROTO_SCHEMA {
                 return Err(Error("unsupported_stored_proto_schema"));
             }
@@ -205,95 +170,31 @@ impl Intake {
         )
     }
     pub fn report(path: &Path) -> Result<Value> {
-        if !path.exists() {
-            return Err(Error("storage_open_failed"));
-        }
-        let db = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .map_err(|_| Error("storage_open_failed"))?;
-        let exists: bool = db
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='live_runs')",
-                [],
-                |r| r.get(0),
-            )
-            .map_err(|_| Error("storage_read_failed"))?;
-        if !exists {
+        // Raw inputs by arrival time show flow during a cycle; attempts, not unique transfers.
+        let Some(snapshot) = LiveLog::snapshot(path, now() - RECENT_SECONDS)? else {
             return Ok(json!({"state":"uninitialized","verified_boundary":null}));
-        }
-        let mut stmt=db.prepare("SELECT id,from_slot,status,reference_slot,reference_at,replay_first,replay_at,mint,decoder FROM live_runs ORDER BY id DESC LIMIT 100").map_err(|_|Error("storage_read_failed"))?;
-        let rows=stmt.query_map([],|r| {
-            let from: i64=r.get(1)?;
-            let reference: Option<i64>=r.get(3)?;
-            let reference_at: Option<i64>=r.get(4)?;
-            let first: Option<i64>=r.get(5)?;
-            let replay_at: Option<i64>=r.get(6)?;
-            Ok(json!({"run":r.get::<_,i64>(0)?,"from_slot":from,"state":r.get::<_,String>(2)?,
-                "mint":r.get::<_,String>(7)?,"decoder_version":r.get::<_,String>(8)?,
+        };
+        let runs: Vec<Value> = snapshot.runs.iter().map(|run| {
+            let (from, reference, reference_at, first, replay_at) = (run.from_slot, run.reference_slot, run.reference_at, run.replay_first, run.replay_at);
+            json!({"run":run.id,"from_slot":from,"state":run.state,
+                "mint":run.mint,"decoder_version":run.decoder,
                 "reference_slot":reference,"reference_at":reference_at,
                 "reference_age_seconds":reference_at.and_then(age),
                 "replay_first":first,"replay_at":replay_at,"replay_info_age_seconds":replay_at.and_then(age),
                 "replay_margin_slots":first.map(|n|from-n),
                 "clock_skew":reference_at.is_some_and(|n|n>now())||replay_at.is_some_and(|n|n>now()),
                 "unresolved_interval":{"from_slot":from,"through_slot":reference.filter(|n|*n>=from),"kind":"unverified"},
-                "verified_boundary":null,"coverage":"unknown"}))
-        }).map_err(|_|Error("storage_read_failed"))?;
-        let runs = rows
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|_| Error("storage_read_failed"))?;
-        let has_cursor: bool = db
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='live_retry_cursor')",
-                [],
-                |r| r.get(0),
-            )
-            .map_err(|_| Error("storage_read_failed"))?;
-        let retry_cursor: Option<i64> = if has_cursor {
-            db.query_row("SELECT MAX(last_id) FROM live_retry_cursor", [], |r| {
-                r.get(0)
-            })
-            .map_err(|_| Error("storage_read_failed"))?
-        } else {
-            None
-        };
-        let pending: i64 = db
-            .query_row(
-                "SELECT COUNT(*) FROM live_raw WHERE status!='decoded'",
-                [],
-                |r| r.get(0),
-            )
-            .map_err(|_| Error("storage_read_failed"))?;
-        let oldest: Option<i64> = db
-            .query_row(
-                "SELECT MIN(received_at) FROM live_raw WHERE status!='decoded'",
-                [],
-                |r| r.get(0),
-            )
-            .map_err(|_| Error("storage_read_failed"))?;
-        let last_received_slot: Option<i64> = db
-            .query_row("SELECT MAX(slot) FROM live_raw", [], |r| r.get(0))
-            .map_err(|_| Error("storage_read_failed"))?;
-        // Raw inputs by arrival time show flow during a cycle; attempts, not unique transfers.
-        let (received, decoded): (i64, i64) = db
-            .query_row(
-                "SELECT COUNT(*), COALESCE(SUM(status='decoded'),0) FROM live_raw WHERE received_at>=?1",
-                [now() - RECENT_SECONDS],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .map_err(|_| Error("storage_read_failed"))?;
+                "verified_boundary":null,"coverage":"unknown"})
+        }).collect();
+        let pending = snapshot.pending;
+        let (received, decoded) = snapshot.recent;
         Ok(
-            json!({"recent":{"window_seconds":RECENT_SECONDS,"received":received,"decoded":decoded,"pending":received-decoded},"last_received_slot":last_received_slot,"retry_cursor":retry_cursor,"retry_batch_limit":100,"oldest_unresolved_age_seconds":if pending==0{Some(0)}else{oldest.and_then(age)},"state":if runs.is_empty(){"uninitialized"}else{"partial"},"mint":runs.first().and_then(|r|r.get("mint")),"decoder_version":decoder::DECODER_VERSION,"verified_boundary":null,"coverage":"unknown","unresolved_items":pending,"runs":runs,"limit":100,"reason":"filtered_finalized_stream_has_no_validated_completion_evidence"}),
+            json!({"recent":{"window_seconds":RECENT_SECONDS,"received":received,"decoded":decoded,"pending":received-decoded},"last_received_slot":snapshot.last_received_slot,"retry_cursor":snapshot.retry_cursor,"retry_batch_limit":100,"oldest_unresolved_age_seconds":if pending==0{Some(0)}else{snapshot.oldest_pending_at.and_then(age)},"state":if runs.is_empty(){"uninitialized"}else{"partial"},"mint":runs.first().and_then(|r|r.get("mint")),"decoder_version":decoder::DECODER_VERSION,"verified_boundary":null,"coverage":"unknown","unresolved_items":pending,"runs":runs,"limit":100,"reason":"filtered_finalized_stream_has_no_validated_completion_evidence"}),
         )
     }
 }
 fn age(observed: i64) -> Option<i64> {
     now().checked_sub(observed).filter(|n| *n >= 0)
-}
-fn now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-        .min(i64::MAX as u64) as i64
 }
 
 /// Only this explicitly opted-in command opens a provider connection.
@@ -368,13 +269,8 @@ pub fn run_mint_admitted(
     let run = {
         let _permit = gate.live()?;
         intake
-            .db
-            .execute(
-                "INSERT INTO live_runs(from_slot,mint,decoder,status) VALUES(?1,?2,?3,'running')",
-                params![from as i64, mint, decoder::DECODER_VERSION],
-            )
-            .map_err(|_| Error("storage_write_failed"))?;
-        intake.db.last_insert_rowid()
+            .log
+            .start_run(from as i64, mint, decoder::DECODER_VERSION)?
     };
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -389,76 +285,141 @@ pub fn run_mint_admitted(
     let mut output_seconds = 0.0;
     let mut output_successes = 0usize;
     let mut inserted = 0usize;
-    let result=runtime.block_on(async {
-        tokio::time::timeout(Duration::from_secs(seconds),async {
+    let result = runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(seconds), async {
             for attempt in 0..=2 {
-                reconnects=attempt;
-                event(telemetry,"connection_attempt",if attempt==0{"startup"}else{"retry"});
-                let channel=Endpoint::from_static("https://laserstream-mainnet-ewr.helius-rpc.com")
-                    .connect_timeout(Duration::from_secs(5)).timeout(Duration::from_secs(10))
-                    .initial_stream_window_size(65536).initial_connection_window_size(65536)
-                    .http2_adaptive_window(false).buffer_size(1)
-                    .tls_config(ClientTlsConfig::new().with_native_roots()).map_err(|_|Error("tls_failed"))?
-                    .connect().await.map_err(|_|Error("provider_unavailable"))?;
-                let auth=token.clone();
-                let mut client=geyser_client::GeyserClient::with_interceptor(channel,move |mut req: Request<()>| {
-                    req.metadata_mut().insert("x-token",auth.clone()); Ok(req)
-                }).max_decoding_message_size(decoder::MAX_CAPTURE_BYTES).max_encoding_message_size(65536);
-                let replay=client.subscribe_replay_info(SubscribeReplayInfoRequest{}).await.map_err(|_|Error("replay_info_unavailable"))?.into_inner().first_available.ok_or(Error("replay_info_unavailable"))?;
-                let reference=client.get_slot(GetSlotRequest{commitment:Some(CommitmentLevel::Finalized as i32)}).await.map_err(|_|Error("reference_unavailable"))?.into_inner().slot;
-                check_replay(from,replay)?;
-                if reference>i64::MAX as u64 || replay>i64::MAX as u64 {return Err(Error("unsupported_slot"));}
-                intake.db.execute("UPDATE live_runs SET reference_slot=?1,reference_at=?2,replay_first=?3,replay_at=?2 WHERE id=?4",params![reference as i64,now(),replay as i64,run]).map_err(|_|Error("storage_write_failed"))?;
-                let (sender,receiver)=tokio::sync::mpsc::channel(1);
-                sender.send(request_mint(from,mint)).await.map_err(|_|Error("subscription_failed"))?;
-                let mut stream=client.subscribe(tokio_stream::wrappers::ReceiverStream::new(receiver)).await.map_err(|_|Error("subscription_failed"))?.into_inner();
+                reconnects = attempt;
+                event(
+                    telemetry,
+                    "connection_attempt",
+                    if attempt == 0 { "startup" } else { "retry" },
+                );
+                let channel =
+                    Endpoint::from_static("https://laserstream-mainnet-ewr.helius-rpc.com")
+                        .connect_timeout(Duration::from_secs(5))
+                        .timeout(Duration::from_secs(10))
+                        .initial_stream_window_size(65536)
+                        .initial_connection_window_size(65536)
+                        .http2_adaptive_window(false)
+                        .buffer_size(1)
+                        .tls_config(ClientTlsConfig::new().with_native_roots())
+                        .map_err(|_| Error("tls_failed"))?
+                        .connect()
+                        .await
+                        .map_err(|_| Error("provider_unavailable"))?;
+                let auth = token.clone();
+                let mut client = geyser_client::GeyserClient::with_interceptor(
+                    channel,
+                    move |mut req: Request<()>| {
+                        req.metadata_mut().insert("x-token", auth.clone());
+                        Ok(req)
+                    },
+                )
+                .max_decoding_message_size(decoder::MAX_CAPTURE_BYTES)
+                .max_encoding_message_size(65536);
+                let replay = client
+                    .subscribe_replay_info(SubscribeReplayInfoRequest {})
+                    .await
+                    .map_err(|_| Error("replay_info_unavailable"))?
+                    .into_inner()
+                    .first_available
+                    .ok_or(Error("replay_info_unavailable"))?;
+                let reference = client
+                    .get_slot(GetSlotRequest {
+                        commitment: Some(CommitmentLevel::Finalized as i32),
+                    })
+                    .await
+                    .map_err(|_| Error("reference_unavailable"))?
+                    .into_inner()
+                    .slot;
+                check_replay(from, replay)?;
+                if reference > i64::MAX as u64 || replay > i64::MAX as u64 {
+                    return Err(Error("unsupported_slot"));
+                }
+                intake
+                    .log
+                    .record_reference(run, reference as i64, replay as i64)?;
+                let (sender, receiver) = tokio::sync::mpsc::channel(1);
+                sender
+                    .send(request_mint(from, mint))
+                    .await
+                    .map_err(|_| Error("subscription_failed"))?;
+                let mut stream = client
+                    .subscribe(tokio_stream::wrappers::ReceiverStream::new(receiver))
+                    .await
+                    .map_err(|_| Error("subscription_failed"))?
+                    .into_inner();
                 loop {
-                    if started.elapsed()>=Duration::from_secs(seconds) {return Ok("time_limit");}
-                    let update=match next_update(&mut stream,Duration::from_secs(10)).await {
-                        Ok(Some(u))=>u,
-                        Ok(None)=>{event(telemetry,"connection_ended","provider_unavailable");break;},
-                        Err(e)=>{event(telemetry,"connection_failed",e.0);break;}
-                    };
-                    if matches!(update.update_oneof,Some(subscribe_update::UpdateOneof::Ping(_))) {
-                        sender.send(SubscribeRequest{ping:Some(SubscribeRequestPing{id:1}),..Default::default()}).await.map_err(|_|Error("subscription_failed"))?;
+                    if started.elapsed() >= Duration::from_secs(seconds) {
+                        return Ok("time_limit");
                     }
-                    if let Some(subscribe_update::UpdateOneof::Transaction(tx))=update.update_oneof {
-                        if tx.slot<from {return Err(Error("unexpected_slot"));}
-                        telemetry.slot=Some(tx.slot);
-                        bytes=bytes.saturating_add(tx.encoded_len());
-                        let _permit=gate.live()?;
-                        let operation=Instant::now();
-                        let id=intake.retain(&tx)?;
-                        raw_seconds+=operation.elapsed().as_secs_f64();
-                        count+=1;
-                        let operation=Instant::now();
-                        let processed=intake.process(id,&tx);
-                        output_seconds+=operation.elapsed().as_secs_f64();
+                    let update = match next_update(&mut stream, Duration::from_secs(10)).await {
+                        Ok(Some(u)) => u,
+                        Ok(None) => {
+                            event(telemetry, "connection_ended", "provider_unavailable");
+                            break;
+                        }
+                        Err(e) => {
+                            event(telemetry, "connection_failed", e.0);
+                            break;
+                        }
+                    };
+                    if matches!(
+                        update.update_oneof,
+                        Some(subscribe_update::UpdateOneof::Ping(_))
+                    ) {
+                        sender
+                            .send(SubscribeRequest {
+                                ping: Some(SubscribeRequestPing { id: 1 }),
+                                ..Default::default()
+                            })
+                            .await
+                            .map_err(|_| Error("subscription_failed"))?;
+                    }
+                    if let Some(subscribe_update::UpdateOneof::Transaction(tx)) =
+                        update.update_oneof
+                    {
+                        if tx.slot < from {
+                            return Err(Error("unexpected_slot"));
+                        }
+                        telemetry.slot = Some(tx.slot);
+                        bytes = bytes.saturating_add(tx.encoded_len());
+                        let _permit = gate.live()?;
+                        let operation = Instant::now();
+                        let id = intake.retain(&tx)?;
+                        raw_seconds += operation.elapsed().as_secs_f64();
+                        count += 1;
+                        let operation = Instant::now();
+                        let processed = intake.process(id, &tx);
+                        output_seconds += operation.elapsed().as_secs_f64();
                         match processed {
-                            Ok(n)=>{output_successes+=1;inserted+=n;},
-                            Err(e)=>{
-                                event(telemetry,"decode_or_write_failed",e.0);
-                                if e.0.starts_with("storage_"){return Err(e);}
-                                failures+=1;
+                            Ok(n) => {
+                                output_successes += 1;
+                                inserted += n;
+                            }
+                            Err(e) => {
+                                event(telemetry, "decode_or_write_failed", e.0);
+                                if e.0.starts_with("storage_") {
+                                    return Err(e);
+                                }
+                                failures += 1;
                             }
                         }
-                        if count>=MAX_MESSAGES{return Ok("message_limit");}
+                        if count >= MAX_MESSAGES {
+                            return Ok("message_limit");
+                        }
                     }
                 }
             }
             Err(Error("provider_unavailable"))
-        }).await.unwrap_or(Ok("time_limit"))
+        })
+        .await
+        .unwrap_or(Ok("time_limit"))
     });
     let status = result.as_ref().map_or_else(|e| e.0, |s| *s);
     {
         let _permit = gate.live()?;
-        intake
-            .db
-            .execute(
-                "UPDATE live_runs SET status=?1 WHERE id=?2",
-                params![status, run],
-            )
-            .map_err(|_| Error("storage_write_failed"))?;
+        intake.log.finish_run(run, status)?;
     }
     event(telemetry, "shutdown", status);
     let elapsed = started.elapsed().as_secs_f64();
@@ -521,6 +482,7 @@ fn check_replay(from: u64, first: u64) -> Result<()> {
 mod tests {
     use super::*;
     use laserstream_core_proto::solana::storage::confirmed_block as wire;
+    use rusqlite::Connection;
     fn update() -> SubscribeUpdateTransaction {
         let mut data = vec![12];
         data.extend(42u64.to_le_bytes());
@@ -568,7 +530,8 @@ mod tests {
         let id = intake.retain(&tx).unwrap();
         if phase == "after_retry_cursor" {
             intake
-                .db
+                .log
+                .sql()
                 .execute("INSERT INTO live_retry_cursor VALUES(1,?1)", [id])
                 .unwrap();
             std::process::exit(77);
@@ -676,7 +639,8 @@ mod tests {
         }
         intake.retain(&update()).unwrap();
         intake
-            .db
+            .log
+            .sql()
             .execute("UPDATE live_raw SET received_at=1", [])
             .unwrap();
         assert_eq!(intake.retry().unwrap()["decoded"], 0);
@@ -687,7 +651,8 @@ mod tests {
         assert_eq!(Intake::report(&path).unwrap()["unresolved_items"], 100);
         assert_eq!(
             intake
-                .db
+                .log
+                .sql()
                 .query_row("SELECT MIN(received_at) FROM live_raw", [], |r| r
                     .get::<_, i64>(0))
                 .unwrap(),
@@ -804,7 +769,8 @@ mod tests {
         assert!(intake.process(id, &broken).is_err());
         assert_eq!(Intake::report(&path).unwrap()["unresolved_items"], 1);
         let wire: Vec<u8> = intake
-            .db
+            .log
+            .sql()
             .query_row(
                 "SELECT protobuf FROM live_raw WHERE id=?1 AND length(protobuf)<=16777216",
                 [id],
@@ -816,7 +782,8 @@ mod tests {
             broken
         );
         intake
-            .db
+            .log
+            .sql()
             .execute(
                 "UPDATE live_raw SET proto_schema='future-schema' WHERE id=?1",
                 [id],
@@ -833,7 +800,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("live.sqlite");
         let intake = Intake::open(&path).unwrap();
-        intake.db.execute("INSERT INTO live_runs(from_slot,mint,decoder,status) VALUES(123,?1,'previous-decoder','time_limit')",[USDC]).unwrap();
+        intake.log.sql().execute("INSERT INTO live_runs(from_slot,mint,decoder,status) VALUES(123,?1,'previous-decoder','time_limit')",[USDC]).unwrap();
         let report = Intake::report(&path).unwrap();
         assert_eq!(report["runs"][0]["decoder_version"], "previous-decoder");
         assert_eq!(report["runs"][0]["mint"], USDC);
@@ -844,7 +811,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("live.sqlite");
         let mut intake = Intake::open(&path).unwrap();
-        intake.db.execute_batch("CREATE TRIGGER fail_transfers BEFORE INSERT ON transfers BEGIN SELECT RAISE(ABORT,'injected'); END;").unwrap();
+        intake.log.sql().execute_batch("CREATE TRIGGER fail_transfers BEFORE INSERT ON transfers BEGIN SELECT RAISE(ABORT,'injected'); END;").unwrap();
         let tx = update();
         let id = intake.retain(&tx).unwrap();
         assert!(intake.process(id, &tx).is_err());
@@ -856,7 +823,8 @@ mod tests {
             (Some(1), Some(1))
         );
         intake
-            .db
+            .log
+            .sql()
             .execute_batch("DROP TRIGGER fail_transfers;")
             .unwrap();
         assert_eq!(intake.retry().unwrap()["decoded"], 1);

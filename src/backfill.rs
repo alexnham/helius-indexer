@@ -1,6 +1,8 @@
 //! Bounded finalized block ingestion. Coverage is a separate durable acknowledgment.
-use crate::{Error, Result, decoder, storage::Store};
-use rusqlite::{Connection, OptionalExtension, params};
+use crate::{
+    Error, Result, decoder,
+    storage::{Store, history::HistoryLog},
+};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
@@ -251,7 +253,7 @@ impl Metrics {
 }
 
 pub struct History {
-    db: Connection,
+    db: HistoryLog,
     path: PathBuf,
     telemetry: crate::telemetry::Telemetry,
     revision_repair: bool,
@@ -263,13 +265,6 @@ fn now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
-}
-fn write_error(_: rusqlite::Error) -> Error {
-    Error("history_write_failed")
-}
-
-fn read_error(_: rusqlite::Error) -> Error {
-    Error("history_read_failed")
 }
 pub(crate) fn scope(mint: &str, start: u64, end: u64) -> Result<()> {
     if start > end || end > i64::MAX as u64 || end - start >= MAX_SLOTS {
@@ -288,29 +283,7 @@ impl History {
     pub fn open(path: &Path) -> Result<Self> {
         // Initialize the shared transaction store before adding compatible, independent tables.
         Store::open(path)?;
-        let db = Connection::open(path).map_err(|_| Error("history_open_failed"))?;
-        db.busy_timeout(Duration::from_secs(5))
-            .map_err(write_error)?;
-        db.execute_batch(
-            "PRAGMA synchronous=FULL;
-            CREATE TABLE IF NOT EXISTS historical_slots (
-                mint TEXT NOT NULL, decoder TEXT NOT NULL, slot INTEGER NOT NULL,
-                status TEXT NOT NULL, error_class TEXT, first_pending INTEGER NOT NULL,
-                attempts INTEGER NOT NULL DEFAULT 0, block_time INTEGER,
-                PRIMARY KEY(mint,decoder,slot));
-            CREATE TABLE IF NOT EXISTS historical_inputs (
-                mint TEXT NOT NULL, decoder TEXT NOT NULL, slot INTEGER NOT NULL,
-                attempt INTEGER NOT NULL, source_kind TEXT NOT NULL, received_at INTEGER NOT NULL,
-                response BLOB NOT NULL, PRIMARY KEY(mint,decoder,slot,attempt));
-            CREATE TABLE IF NOT EXISTS historical_source_slots (
-                mint TEXT NOT NULL,decoder TEXT NOT NULL,slot INTEGER NOT NULL,source_kind TEXT NOT NULL,status TEXT NOT NULL,
-                PRIMARY KEY(mint,decoder,slot,source_kind));
-            CREATE TABLE IF NOT EXISTS historical_block_identity (
-                slot INTEGER PRIMARY KEY,blockhash TEXT NOT NULL,parent_slot INTEGER NOT NULL,previous_blockhash TEXT NOT NULL,
-                transaction_ids_hash BLOB NOT NULL,block_time INTEGER);
-            CREATE TABLE IF NOT EXISTS bridge_overlap_proofs(mint TEXT NOT NULL,decoder TEXT NOT NULL,slot INTEGER NOT NULL,verified_attempt INTEGER NOT NULL,PRIMARY KEY(mint,decoder,slot));",
-        )
-        .map_err(write_error)?;
+        let db = HistoryLog::open(path)?;
         let mut telemetry = crate::telemetry::Telemetry::default();
         telemetry.set_context("backfill", "rpc", "historical");
         Ok(Self {
@@ -332,20 +305,17 @@ impl History {
     pub(crate) fn reverify(&mut self, mint: &str, start: u64, end: u64) -> Result<()> {
         scope(mint, start, end)?;
         let _permit = self.gate.historical()?;
-        self.db.execute("UPDATE historical_slots SET status='unknown',error_class='source_overlap_reverification' WHERE mint=?1 AND decoder=?2 AND slot BETWEEN ?3 AND ?4",params![mint,decoder::DECODER_VERSION,start as i64,end as i64]).map_err(write_error)?;
-        Ok(())
+        self.db.require_reverification(mint, start, end)
     }
     /// Reuse verified finalized parent links across adjacent source batches.
     #[cfg(feature = "archive")]
     pub(crate) fn verify_parent_gaps(&self, mint: &str, start: u64, end: u64) -> Result<()> {
         scope(mint, start, end)?;
         for skipped in start..=end {
-            let proven:bool=self.db.query_row("SELECT EXISTS(SELECT 1 FROM historical_slots h JOIN historical_block_identity b USING(slot) WHERE h.mint=?1 AND h.decoder=?2 AND h.status='complete' AND h.slot>?3 AND b.parent_slot<?3)",params![mint,decoder::DECODER_VERSION,skipped as i64],|r|r.get(0)).map_err(read_error)?;
-            if !proven {
+            if !self.db.parent_link_spans(mint, skipped)? {
                 continue;
             }
-            let observed:bool=self.db.query_row("SELECT EXISTS(SELECT 1 FROM historical_inputs WHERE slot=?1 AND CASE WHEN json_valid(CAST(response AS TEXT)) THEN json_type(CAST(response AS TEXT),'$.result')='object' ELSE 0 END)",[skipped as i64],|r|r.get(0)).map_err(read_error)?;
-            if !observed {
+            if !self.db.produced_block_observed(skipped)? {
                 self.status(mint, skipped, "skipped", None, None)?;
             }
         }
@@ -354,13 +324,12 @@ impl History {
     #[cfg(feature = "archive")]
     pub(crate) fn acknowledge_bridge_overlap(&self, mint: &str, slot: u64) -> Result<()> {
         let _permit = self.gate.historical()?;
-        self.db.execute("INSERT INTO bridge_overlap_proofs SELECT mint,decoder,slot,attempts FROM historical_slots WHERE mint=?1 AND decoder=?2 AND slot=?3 AND status='complete' ON CONFLICT(mint,decoder,slot) DO UPDATE SET verified_attempt=excluded.verified_attempt",params![mint,decoder::DECODER_VERSION,slot as i64]).map_err(write_error)?;
-        Ok(())
+        self.db.acknowledge_bridge_overlap(mint, slot)
     }
     #[cfg(feature = "archive")]
     pub(crate) fn retained_input(&self, mint: &str, slot: u64, source: &str) -> Result<Vec<u8>> {
         scope(mint, slot, slot)?;
-        let raw:Option<Option<Vec<u8>>>=self.db.query_row("SELECT CASE WHEN length(response)<=67108864 THEN response END FROM historical_inputs WHERE mint=?1 AND slot=?2 AND source_kind=?3 ORDER BY received_at DESC,attempt DESC,decoder DESC LIMIT 1",params![mint,slot as i64,source],|r|r.get(0)).optional().map_err(read_error)?;
+        let raw = self.db.bounded_input(mint, slot, source)?;
         raw.ok_or(Error("retained_block_unavailable"))?
             .ok_or(Error("block_too_large"))
     }
@@ -378,7 +347,7 @@ impl History {
         let mut oldest = None;
         let mut age_unknown = false;
         for slot in start..=end {
-            let record=self.db.query_row("SELECT status,error_class,attempts,block_time,first_pending FROM historical_slots WHERE mint=?1 AND decoder=?2 AND slot=?3",params![mint,decoder::DECODER_VERSION,slot as i64],|r| Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,u64::try_from(r.get::<_,i64>(2)?).map_err(|_|rusqlite::Error::InvalidQuery)?,r.get::<_,Option<i64>>(3)?,u64::try_from(r.get::<_,i64>(4)?).map_err(|_|rusqlite::Error::InvalidQuery)?))).optional().map_err(read_error)?;
+            let record = self.db.slot(mint, slot)?;
             let scheduled = record.is_some();
             let (status, error_class, attempts, block_time, first) =
                 record.unwrap_or(("unknown".into(), None, 0, None, now()));
@@ -431,11 +400,8 @@ impl History {
         time: Option<i64>,
     ) -> Result<()> {
         let _permit = self.gate.historical()?;
-        let transaction = self.db.unchecked_transaction().map_err(write_error)?;
-        transaction.execute("UPDATE historical_slots SET status=?1,error_class=?2,block_time=?3 WHERE mint=?4 AND decoder=?5 AND slot=?6",params![status,error,time,mint,decoder::DECODER_VERSION,slot as i64]).map_err(write_error)?;
-        transaction.execute("INSERT INTO historical_source_slots VALUES(?1,?2,?3,?4,?5) ON CONFLICT(mint,decoder,slot,source_kind) DO UPDATE SET status=excluded.status",params![mint,decoder::DECODER_VERSION,slot as i64,self.active_source,status]).map_err(write_error)?;
-        transaction.commit().map_err(write_error)?;
-        Ok(())
+        self.db
+            .set_status(mint, slot, self.active_source, status, error, time)
     }
     /// Single worker, no queue. Cancellation checked between slots and transaction writes.
     /// A request already in flight is bounded by the source's request deadline.
@@ -451,7 +417,7 @@ impl History {
         self.active_source = source.provenance();
         for slot in start..=end {
             let _permit = self.gate.historical()?;
-            self.db.execute("INSERT OR IGNORE INTO historical_slots(mint,decoder,slot,status,first_pending) VALUES (?1,?2,?3,'unknown',?4)",params![mint,decoder::DECODER_VERSION,slot as i64,now() as i64]).map_err(write_error)?;
+            self.db.schedule(mint, slot, now())?;
         }
         let started = Instant::now();
         let mut metrics = Metrics {
@@ -478,7 +444,7 @@ impl History {
                 break;
             }
             let current = self.coverage(mint, slot, slot)?.slots.remove(0);
-            let source_done:bool=self.db.query_row("SELECT EXISTS(SELECT 1 FROM historical_source_slots WHERE mint=?1 AND decoder=?2 AND slot=?3 AND source_kind=?4 AND status IN ('complete','skipped'))",params![mint,decoder::DECODER_VERSION,slot as i64,self.active_source],|r|r.get(0)).map_err(read_error)?;
+            let source_done = self.db.source_done(mint, slot, self.active_source)?;
             if current.status == "skipped" || (current.status == "complete" && source_done) {
                 continue;
             }
@@ -496,7 +462,7 @@ impl History {
             }
             {
                 let _permit = self.gate.historical()?;
-                self.db.execute("UPDATE historical_slots SET attempts=attempts+1 WHERE mint=?1 AND decoder=?2 AND slot=?3",params![mint,decoder::DECODER_VERSION,slot as i64]).map_err(write_error)?;
+                self.db.add_attempt(mint, slot)?;
             }
             let cached: Option<Vec<u8>> = if self.revision_repair
                 || current.error_class.is_none()
@@ -510,7 +476,7 @@ impl History {
                     .as_deref()
                     .is_some_and(|e| e.starts_with("storage_"))
             {
-                self.db.query_row("SELECT response FROM historical_inputs WHERE mint=?1 AND slot=?2 AND source_kind=?3 ORDER BY received_at DESC,attempt DESC LIMIT 1",params![mint,slot as i64,source.provenance()],|r|r.get(0)).optional().map_err(read_error)?
+                self.db.latest_input(mint, slot, source.provenance())?
             } else {
                 None
             };
@@ -550,20 +516,14 @@ impl History {
             // Raw input acknowledgment precedes decoding. Every failed attempt remains reproducible.
             {
                 let _permit = self.gate.historical()?;
-                self.db
-                    .execute(
-                        "INSERT INTO historical_inputs VALUES (?1,?2,?3,?4,?5,?6,?7)",
-                        params![
-                            mint,
-                            decoder::DECODER_VERSION,
-                            slot as i64,
-                            (current.attempts + 1) as i64,
-                            source.provenance(),
-                            now() as i64,
-                            raw
-                        ],
-                    )
-                    .map_err(write_error)?;
+                self.db.retain_input(
+                    mint,
+                    slot,
+                    current.attempts + 1,
+                    source.provenance(),
+                    now(),
+                    &raw,
+                )?;
             }
             let failures_before = metrics.decode_failures;
             let outcome = process_block(
@@ -583,8 +543,7 @@ impl History {
                     // A finalized child links directly to its parent; intermediate slots are skipped.
                     // Never overwrite observed produced data with skip evidence.
                     for skipped in start.max(parent.saturating_add(1))..slot {
-                        let observed: bool=self.db.query_row("SELECT EXISTS(SELECT 1 FROM historical_inputs WHERE slot=?1 AND CASE WHEN json_valid(CAST(response AS TEXT)) THEN json_type(CAST(response AS TEXT),'$.result')='object' ELSE 0 END)",[skipped as i64],|r|r.get(0)).map_err(read_error)?;
-                        if !observed {
+                        if !self.db.produced_block_observed(skipped)? {
                             self.status(mint, skipped, "skipped", None, None)?;
                         }
                     }

@@ -1,8 +1,20 @@
 //! Transaction-scoped replacement; scheduling and range diagnostics live in crate::repair.
 use super::Store;
 use crate::{Error, Result, decoder};
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde_json::Value;
+use std::path::Path;
+
+/// Retained-capture repair progress for one slot range and the current decoder revision.
+pub(crate) struct RepairCounts {
+    pub total: i64,
+    pub remaining_other_revision: i64,
+    pub corrected: i64,
+    pub unresolved: i64,
+    pub first_unresolved_at: Option<i64>,
+    /// Most frequent unresolved error classes, at most 16.
+    pub failure_classes: Vec<(String, i64)>,
+}
 
 pub(crate) struct Correction {
     pub slot: u64,
@@ -191,5 +203,79 @@ impl Store {
             old_rows,
             new_rows,
         })
+    }
+}
+
+impl Store {
+    /// Read-only and consistent: all counts come from one snapshot.
+    pub(crate) fn repair_counts(path: &Path, start: u64, end: u64) -> Result<RepairCounts> {
+        let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|_| Error("storage_open_failed"))?;
+        let _snapshot = db
+            .unchecked_transaction()
+            .map_err(|_| Error("storage_read_failed"))?;
+        let exists: bool = db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='decoder_repairs')",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|_| Error("storage_read_failed"))?;
+        let (total, remaining_other_revision): (i64,i64) = db.query_row("SELECT COUNT(*),COALESCE(SUM(decoder_version!=?3),0) FROM captures WHERE json_extract(result_json,'$.slot') BETWEEN ?1 AND ?2",
+            params![start as i64,end as i64,decoder::DECODER_VERSION],|r|Ok((r.get(0)?,r.get(1)?))).map_err(|_|Error("storage_read_failed"))?;
+        let (corrected, unresolved, first_unresolved_at): (i64, i64, Option<i64>) = if exists {
+            db.query_row("SELECT COALESCE(SUM(status='complete'),0),COALESCE(SUM(status='unresolved'),0),MIN(CASE WHEN status='unresolved' THEN first_pending END) FROM decoder_repairs WHERE slot BETWEEN ?1 AND ?2 AND target_decoder=?3",
+                params![start as i64,end as i64,decoder::DECODER_VERSION],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(|_|Error("storage_read_failed"))?
+        } else {
+            (0, 0, None)
+        };
+        let mut failure_classes = Vec::new();
+        if exists {
+            let mut statement=db.prepare("SELECT error_class,COUNT(*) FROM decoder_repairs WHERE target_decoder=?3 AND slot BETWEEN ?1 AND ?2 AND status='unresolved' GROUP BY error_class ORDER BY COUNT(*) DESC,error_class LIMIT 16")
+                .map_err(|_|Error("storage_read_failed"))?;
+            let classes = statement
+                .query_map(
+                    params![start as i64, end as i64, decoder::DECODER_VERSION],
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+                )
+                .map_err(|_| Error("storage_read_failed"))?;
+            for class in classes {
+                failure_classes.push(class.map_err(|_| Error("storage_read_failed"))?);
+            }
+        }
+        Ok(RepairCounts {
+            total,
+            remaining_other_revision,
+            corrected,
+            unresolved,
+            first_unresolved_at,
+            failure_classes,
+        })
+    }
+
+    /// Captures in range that are on another revision or unresolved, fewest prior attempts first.
+    pub(crate) fn repair_candidates(
+        path: &Path,
+        start: u64,
+        end: u64,
+        limit: usize,
+    ) -> Result<Vec<String>> {
+        let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|_| Error("storage_open_failed"))?;
+        let mut statement = db.prepare("SELECT c.signature FROM captures c LEFT JOIN decoder_repairs r ON r.signature=c.signature AND r.target_decoder=?3 WHERE (c.decoder_version!=?3 OR r.status='unresolved') AND json_extract(c.result_json,'$.slot') BETWEEN ?1 AND ?2 ORDER BY COALESCE(r.attempts,0),c.signature LIMIT ?4")
+            .map_err(|_|Error("storage_read_failed"))?;
+        statement
+            .query_map(
+                params![
+                    start as i64,
+                    end as i64,
+                    decoder::DECODER_VERSION,
+                    limit as i64
+                ],
+                |r| r.get(0),
+            )
+            .map_err(|_| Error("storage_read_failed"))?
+            .collect::<std::result::Result<_, _>>()
+            .map_err(|_| Error("storage_read_failed"))
     }
 }

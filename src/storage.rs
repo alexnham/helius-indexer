@@ -1,3 +1,7 @@
+#[cfg(feature = "archive")]
+pub(crate) mod bridge;
+pub(crate) mod history;
+pub(crate) mod live;
 pub(crate) mod repair;
 use crate::{
     Error, Result,

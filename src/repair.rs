@@ -3,7 +3,6 @@ use crate::{
     Error, Result, backfill::MAX_SLOTS, decoder::DECODER_VERSION, storage::Store,
     telemetry::Telemetry,
 };
-use rusqlite::{Connection, OpenFlags, params};
 use serde_json::{Value, json};
 use std::path::Path;
 
@@ -17,40 +16,19 @@ fn scope(start: u64, end: u64) -> Result<()> {
 /// The completion flag concerns retained captures only; historical blocks must be reverified.
 pub fn status(path: &Path, start: u64, end: u64) -> Result<Value> {
     scope(start, end)?;
-    let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .map_err(|_| Error("storage_open_failed"))?;
-    let _snapshot = db
-        .unchecked_transaction()
-        .map_err(|_| Error("storage_read_failed"))?;
-    let exists: bool = db
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='decoder_repairs')",
-            [],
-            |r| r.get(0),
-        )
-        .map_err(|_| Error("storage_read_failed"))?;
-    let (total, remaining): (i64,i64) = db.query_row("SELECT COUNT(*),COALESCE(SUM(decoder_version!=?3),0) FROM captures WHERE json_extract(result_json,'$.slot') BETWEEN ?1 AND ?2",
-        params![start as i64,end as i64,DECODER_VERSION],|r|Ok((r.get(0)?,r.get(1)?))).map_err(|_|Error("storage_read_failed"))?;
-    let (corrected, unresolved, oldest): (i64, i64, Option<i64>) = if exists {
-        db.query_row("SELECT COALESCE(SUM(status='complete'),0),COALESCE(SUM(status='unresolved'),0),MIN(CASE WHEN status='unresolved' THEN first_pending END) FROM decoder_repairs WHERE slot BETWEEN ?1 AND ?2 AND target_decoder=?3",
-            params![start as i64,end as i64,DECODER_VERSION],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(|_|Error("storage_read_failed"))?
-    } else {
-        (0, 0, None)
-    };
-    let mut failure_classes = Vec::new();
-    if exists {
-        let mut statement=db.prepare("SELECT error_class,COUNT(*) FROM decoder_repairs WHERE target_decoder=?3 AND slot BETWEEN ?1 AND ?2 AND status='unresolved' GROUP BY error_class ORDER BY COUNT(*) DESC,error_class LIMIT 16")
-            .map_err(|_|Error("storage_read_failed"))?;
-        let classes = statement
-            .query_map(params![start as i64, end as i64, DECODER_VERSION], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
-            })
-            .map_err(|_| Error("storage_read_failed"))?;
-        for class in classes {
-            let (class, count) = class.map_err(|_| Error("storage_read_failed"))?;
-            failure_classes.push(json!({"error_class":class,"count":count}));
-        }
-    }
+    let counts = Store::repair_counts(path, start, end)?;
+    let (total, remaining, corrected, unresolved, oldest) = (
+        counts.total,
+        counts.remaining_other_revision,
+        counts.corrected,
+        counts.unresolved,
+        counts.first_unresolved_at,
+    );
+    let failure_classes: Vec<Value> = counts
+        .failure_classes
+        .iter()
+        .map(|(class, count)| json!({"error_class":class,"count":count}))
+        .collect();
     let age = if unresolved == 0 {
         Some(0)
     } else {
@@ -80,19 +58,7 @@ pub fn run(
     scope(start, end)?;
     telemetry.set_context("decoder_repair", "retained_capture", "repair");
     let mut store = Store::open(path)?;
-    let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .map_err(|_| Error("storage_open_failed"))?;
-    let selected: Vec<String> = {
-        let mut statement = db.prepare("SELECT c.signature FROM captures c LEFT JOIN decoder_repairs r ON r.signature=c.signature AND r.target_decoder=?3 WHERE (c.decoder_version!=?3 OR r.status='unresolved') AND json_extract(c.result_json,'$.slot') BETWEEN ?1 AND ?2 ORDER BY COALESCE(r.attempts,0),c.signature LIMIT 100")
-            .map_err(|_|Error("storage_read_failed"))?;
-        statement
-            .query_map(params![start as i64, end as i64, DECODER_VERSION], |r| {
-                r.get(0)
-            })
-            .map_err(|_| Error("storage_read_failed"))?
-            .collect::<std::result::Result<_, _>>()
-            .map_err(|_| Error("storage_read_failed"))?
-    };
+    let selected = Store::repair_candidates(path, start, end, 100)?;
     let (mut attempted, mut corrected, mut unresolved, mut replaced_rows, mut written_rows) =
         (0, 0, 0, 0, 0);
     let mut stopped = false;
