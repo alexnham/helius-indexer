@@ -400,8 +400,26 @@ mod tests {
             .with_single_cert(vec![cert.cert.der().clone()], key)
             .unwrap(),
         );
+        listener.set_nonblocking(true).unwrap();
         std::thread::spawn(move || {
-            let (mut socket, _) = listener.accept().unwrap();
+            // Bounded waits: a client regression fails the test instead of hanging it.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut socket = loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(_) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(std::time::Duration::from_millis(10))
+                    }
+                    Err(_) => return,
+                }
+            };
+            socket.set_nonblocking(false).unwrap();
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            socket
+                .set_write_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
             let mut ssl_request = [0; 8];
             socket.read_exact(&mut ssl_request).unwrap();
             socket.write_all(b"S").unwrap();
