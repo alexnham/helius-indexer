@@ -1,9 +1,11 @@
-# Replay jobs: PostgreSQL implementation in progress
+# Bounded LaserStream replay jobs
 
 Issue #30 uses the [verified replay source contract](research/2026-11-13-laserstream-replay-contract.md).
-The current branch implements storage primitives only; the provider worker,
-offline retry runner, CLI/API and runtime scheduling are not connected yet.
-This does not replace the current runtime's bounded RPC validation backfill.
+The native commands and provider-backed runtime now use the same bounded
+LaserStream intake, shared decoder and PostgreSQL storage. The runtime starts
+live intake before historical work, then schedules one replay worker independently
+within the same process and write-admission gate. Recent backfill no longer uses
+getBlock scans. Old Faithful routing remains issue #31.
 
 ## Durable boundaries
 
@@ -28,8 +30,9 @@ future distributed range-leasing implementation from issue #37.
 Raw wire input and its pending receipt commit together. Decoding/output occurs
 afterward through the existing intake contract; only its durable acknowledgment
 can mark a receipt decoded. A crash between those boundaries leaves retryable
-work. Duplicate signatures with changed input hashes fail closed. Unresolved raw
-input may be refetched if pruning removed it; decoded receipts survive pruning.
+work. Transport metadata changes deduplicate using normalized evidence; changed
+execution evidence goes through the shared reconciler and conflicts fail closed.
+Unresolved raw input may be refetched if pruning removed it; decoded receipts survive pruning.
 
 Status uses one repeatable-read snapshot and distinguishes unique receipts,
 decoded/unresolved receipts and raw inputs still retained. None proves output
@@ -38,24 +41,61 @@ an observation only: verified coverage and boundary remain unknown.
 
 ## Compatibility and recovery
 
-Migration 0002 is additive and preserves existing input/output tables. Back up the
-session using PostgreSQL tooling before upgrading. Earlier binaries reject schema
-version 2; rolling back requires restoring the pre-upgrade backup into a separate
-session and using its matching binary. Do not manually decrement the migration
+Migrations 0002 and 0003 are additive and preserve existing input/output tables.
+Version 3 upgrades existing prototype jobs without resetting scope, receipts or
+charged budgets. Raw rows referenced by replay receipts are classified as replay;
+missing historical attempt/hash/acknowledgment provenance stays null. Back up the
+session using PostgreSQL tooling before upgrading. Earlier binaries reject newer
+schema versions (the current version is 3); rolling back requires restoring the
+pre-upgrade backup into a separate session and using its matching binary. Do not manually decrement the migration
 version or delete receipts to make an older binary open an upgraded session.
 The new tables currently have no deletion/TTL policy; job receipt retention will
 be decided with the completed replay/archive runtime.
 
-## Remaining before issue #30 is complete
+## Commands and inspection
 
-Wire the bounded provider stream to these primitives; record replay availability
-and its age before every subscription; implement fair offline retries and failure
-inspection; prove crash recovery around raw/output/receipt commits with real process
-exits; integrate independent live-priority admission, cancellation and console
-status; exercise replay expiry/provider outages, out-of-order input and pruning;
-ship events/metrics and bounded opt-in validation. No live check has been started
-for this storage work. The ordinary tests use real local PostgreSQL without provider
-connections.
+All commands require `DATABASE_URL`; SESSION is a PostgreSQL schema name.
+
+```sh
+helius-indexer replay-create SESSION recent MINT START END
+helius-indexer replay-status SESSION recent
+helius-indexer replay-retry SESSION recent
+# Explicit provider opt-in and HELIUS_API_KEY are required for these two commands:
+INDEXER_LIVE_OPT_IN=1 helius-indexer replay SESSION recent 60
+INDEXER_LIVE_OPT_IN=1 helius-indexer replay-monitor SESSION recent LIVE_FROM 60
+# Explicitly replenish an exhausted allowance; never done automatically:
+helius-indexer replay-grant SESSION recent
+```
+
+The first test range is 50 slots. Creation accepts at most the existing 128-slot
+range bound; mint and integer validation apply before opening the session. Restart
+reuses the same job, inclusive range and revision. Offline retries rotate through
+at most 100 pending receipts in a ten-second admission window, loading only one
+bounded wire payload at a time. Missing raw input reports `replay_input_needs_refetch`.
+All provider attempts recheck actual replay availability and record the observation
+(and absence versus zero) before subscribing. A later-slot observation terminates
+an attempt, not the job's unknown coverage. Unused reserved time remains charged.
+
+`replay-monitor` reports the live and historical workers separately. History starts
+after live initialization, without waiting for a live cycle to finish. Historical
+expiry, failure or exhausted budgets do not end the live worker. Gate waits are
+bounded; the runtime supervisor kills/reaps a timed-out native subprocess. An
+in-flight database operation can require cleanup beyond the network intake window.
+
+Status includes frozen scope/revision, attempt history (last 20), availability
+age/margin, failure classes (at most 16), pending age, processing and retained-raw
+counts, queryable transfer count in scope, and remaining budgets. Retained transfer
+count does not prove complete slots. Live raw-input counters exclude replay input.
+The console's `/api/status` exposes this report and `/api/transfers` queries actual
+retained output.
+
+## Scope still pending
+
+Automatic archive routing, independently verified replay range coverage, full
+30-day retention, Kafka, distributed leases and production benchmarking remain
+separate work. Budget exhaustion requires an explicit grant; current replay
+contract cannot infer which quiet filtered slots were empty. Repeated inclusive
+replay can cost provider traffic even when storage deduplicates it.
 
 ## Offline evidence (2026-11-13)
 
@@ -67,5 +107,8 @@ regressions and default Clippy passed again. Tests inject a receipt-write failur
 prove raw/receipt atomicity while the received-work charge survives, reject
 conflicting scope/input, retain processing receipts after raw deletion, preserve
 allowances across connection death/restart and test upgrade compatibility.
-Real provider behavior, process-exit boundaries and complete runtime integration
-remain pending; these checks do not close issue #30.
+These were prototype checks; the current native/runtime slice and additional
+recovery/upgrade regressions are recorded in the
+[2026-11-14 validation](validation/2026-11-14-replay-jobs.md). Its bounded provider
+check preserved scope and budgets across restart, but exhausted its allowance
+before finishing the requested range. Coverage remains unknown.

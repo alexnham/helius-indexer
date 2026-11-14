@@ -75,7 +75,7 @@ impl LiveLog {
             .0
             .borrow_mut()
             .query(
-                "SELECT id FROM live_raw WHERE status<>'decoded' ORDER BY (id<=$1),id LIMIT $2",
+                "SELECT id FROM live_raw WHERE ingestion_mode='live' AND status<>'decoded' ORDER BY (id<=$1),id LIMIT $2",
                 &[&cursor, &(limit as i64)],
             )
             .map_err(read_failed)?
@@ -162,18 +162,21 @@ impl LiveLog {
             .get(0);
         let row = tx
             .query_one(
-                "SELECT COUNT(*),MIN(received_at) FROM live_raw WHERE status<>'decoded'",
+                "SELECT COUNT(*),MIN(received_at) FROM live_raw WHERE ingestion_mode='live' AND status<>'decoded'",
                 &[],
             )
             .map_err(read_failed)?;
         let (pending, oldest_pending_at) = (row.get(0), row.get(1));
         let last_received_slot: Option<i64> = tx
-            .query_one("SELECT MAX(slot) FROM live_raw", &[])
+            .query_one(
+                "SELECT MAX(slot) FROM live_raw WHERE ingestion_mode='live'",
+                &[],
+            )
             .map_err(read_failed)?
             .get(0);
         let row = tx
             .query_one(
-                "SELECT COUNT(*), COUNT(*) FILTER (WHERE status='decoded') FROM live_raw WHERE received_at>=$1",
+                "SELECT COUNT(*), COUNT(*) FILTER (WHERE status='decoded') FROM live_raw WHERE ingestion_mode='live' AND received_at>=$1",
                 &[&since],
             )
             .map_err(read_failed)?;

@@ -13,6 +13,7 @@ use laserstream_core_proto::geyser::SubscribeUpdateTransaction;
 use prost::Message;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use std::time::{Duration, Instant};
 
 pub fn create(database: &Database, id: &str, mint: &str, start: u64, end: u64) -> Result<Value> {
     valid_id(id)?;
@@ -45,8 +46,17 @@ impl ReplayRun {
             .as_ref()
             .ok_or(Error("missing_transaction"))?
             .signature;
-        self.reservation
-            .retain(update.slot, signature, &update.encode_to_vec())
+        // Transport-only fields (for example bank_id) may vary across deliveries.
+        // Changed normalized evidence goes through the shared reconciler, never a raw-byte shortcut.
+        let normalized = live::normalize(update)
+            .ok()
+            .map(|bytes| Sha256::digest(bytes).to_vec());
+        self.reservation.retain_evidence(
+            update.slot,
+            signature,
+            &update.encode_to_vec(),
+            normalized.as_deref(),
+        )
     }
 }
 
@@ -69,11 +79,22 @@ pub fn run_admitted(
     if !(1..=60).contains(&seconds) {
         return Err(Error("invalid_replay_bounds"));
     }
-    let scope = JobLog::open(database)?.scope(id)?;
+    let mut log = JobLog::open(database)?;
+    let scope = log.scope(id)?;
+    let available = log.status(id)?;
+    if available["state"] == "budget_exhausted" {
+        return Err(Error("replay_budget_exhausted"));
+    }
+    let seconds = seconds.min(
+        available["budget"]["seconds_remaining"]
+            .as_u64()
+            .ok_or(Error("stored_record_invalid"))?,
+    );
     live::validate_options(scope.start, seconds)?;
     telemetry.set_context("replay", "laserstream", "historical");
+    let deadline = Instant::now() + Duration::from_secs(seconds);
     let mut replay = {
-        let _permit = gate.historical()?;
+        let _permit = gate.historical_until(deadline)?;
         ReplayRun {
             scope,
             reservation: JobLog::reserve(database, id, seconds)?,
@@ -91,9 +112,10 @@ pub fn run_admitted(
         },
     };
     {
-        let _permit = gate.historical()?;
+        let _permit = gate.historical_until(deadline + Duration::from_secs(5))?;
         replay.reservation.finish(terminal)?;
     }
+    telemetry.set_context("replay", "laserstream", "historical");
     telemetry.emit(
         "replay_attempt_finished",
         "replay",
@@ -104,10 +126,55 @@ pub fn run_admitted(
     result.map(|attempt| json!({"attempt":attempt,"job":report}))
 }
 
+/// Independent bounded workers share live-priority admission in one process.
+pub fn monitor(
+    database: &Database,
+    id: &str,
+    live_from: u64,
+    seconds: u64,
+    telemetry: &mut Telemetry,
+) -> Result<Value> {
+    valid_id(id)?;
+    if !(1..=300).contains(&seconds) {
+        return Err(Error("invalid_replay_bounds"));
+    }
+    let scope = JobLog::open(database)?.scope(id)?;
+    crate::backfill::scope(&scope.mint, live_from, live_from)?;
+    live::validate_options(live_from, seconds)?;
+    let mut result = crate::coordinator::run_with_mint_job(
+        database,
+        live_from,
+        seconds,
+        &scope.mint,
+        telemetry,
+        |gate| {
+            let mut context = Telemetry::default();
+            retry_admitted(database, id, &mut context, &gate)?;
+            run_admitted(database, id, seconds.min(60), &mut context, &gate)
+        },
+    )?;
+    result["job"] = status(database, id)?;
+    result["coverage"] = json!("unknown");
+    Ok(result)
+}
+
 /// Retry at most 100 retained unresolved inputs without a provider connection.
 pub fn retry(database: &Database, id: &str, telemetry: &mut Telemetry) -> Result<Value> {
+    retry_admitted(database, id, telemetry, &WriteGate::default())
+}
+
+fn retry_admitted(
+    database: &Database,
+    id: &str,
+    telemetry: &mut Telemetry,
+    gate: &WriteGate,
+) -> Result<Value> {
     valid_id(id)?;
-    let mut log = JobLog::open(database)?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut log = {
+        let _permit = gate.historical_until(deadline)?;
+        JobLog::open(database)?
+    };
     let scope = log.scope(id)?;
     let pending = log.pending(id)?;
     let mut intake = Intake::open(database)?;
@@ -115,6 +182,7 @@ pub fn retry(database: &Database, id: &str, telemetry: &mut Telemetry) -> Result
     telemetry.emit("replay_retry_started", "retry", "startup", None);
     let mut decoded = 0;
     for item in &pending {
+        let _permit = gate.historical_until(deadline)?;
         log.retry_cursor(id, &item.signature)?;
         let retained = log.raw(item.raw_id)?;
         let result = match retained

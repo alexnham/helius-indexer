@@ -15,7 +15,7 @@ use std::{
     time::Instant,
 };
 
-const USAGE: &str = "usage: DATABASE_URL=postgres://... helius-indexer COMMAND, where SESSION is a schema name (^[a-z][a-z0-9_]*$), not a file path: replay-create SESSION JOB MINT START END | replay-status/replay-retry/replay-grant SESSION JOB | replay SESSION JOB SECONDS | health SESSION | migrate SESSION | comparison-input SESSION MINT [--sample] | monitor SESSION MINT LIVE_FROM START END SECONDS | query-recent SESSION [MINT] | ingest SESSION CAPTURE [--metrics FILE] | query SESSION [MINT] | backfill SESSION MINT START END [--metrics FILE] | coverage SESSION MINT START END | live SESSION FROM_SLOT SECONDS [MINT] | prune SESSION KEEP | live-status SESSION | live-retry SESSION | summary SESSION MINT | overlap SESSION START END SECONDS | repair SESSION START END | repair-status SESSION START END | repair-history-archive SESSION MINT START END | repair-history SESSION MINT START END | [feature archive] archive/archive-replay/archive-overlap SESSION CACHE MINT START END | bridge-plan SESSION CACHE MINT START | bridge SESSION CACHE MINT START | bridge-status SESSION MINT START | bridge-live SESSION CACHE START SECONDS | archive-overlap-replay SESSION MINT START END | archive-tip CACHE | archive-live SESSION CACHE START END SECONDS";
+const USAGE: &str = "usage: DATABASE_URL=postgres://... helius-indexer COMMAND, where SESSION is a schema name (^[a-z][a-z0-9_]*$), not a file path: replay-create SESSION JOB MINT START END | replay-status/replay-retry/replay-grant SESSION JOB | replay SESSION JOB SECONDS | replay-monitor SESSION JOB LIVE_FROM SECONDS | health SESSION | migrate SESSION | comparison-input SESSION MINT [--sample] | monitor SESSION MINT LIVE_FROM START END SECONDS | query-recent SESSION [MINT] | ingest SESSION CAPTURE [--metrics FILE] | query SESSION [MINT] | backfill SESSION MINT START END [--metrics FILE] | coverage SESSION MINT START END | live SESSION FROM_SLOT SECONDS [MINT] | prune SESSION KEEP | live-status SESSION | live-retry SESSION | summary SESSION MINT | overlap SESSION START END SECONDS | repair SESSION START END | repair-status SESSION START END | repair-history-archive SESSION MINT START END | repair-history SESSION MINT START END | [feature archive] archive/archive-replay/archive-overlap SESSION CACHE MINT START END | bridge-plan SESSION CACHE MINT START | bridge SESSION CACHE MINT START | bridge-status SESSION MINT START | bridge-live SESSION CACHE START SECONDS | archive-overlap-replay SESSION MINT START END | archive-tip CACHE | archive-live SESSION CACHE START END SECONDS";
 
 fn ingest(db: &str, input: &str, telemetry: &mut Telemetry) -> Result<serde_json::Value> {
     let started = Instant::now();
@@ -88,6 +88,17 @@ fn run(args: &[String], telemetry: &mut Telemetry) -> Result<serde_json::Value> 
         }
         [command, session, id] if command == "replay-retry" => {
             helius_indexer::replay::retry(&Database::from_env(session)?, id, telemetry)
+        }
+        [command, session, id, from, seconds] if command == "replay-monitor" => {
+            helius_indexer::replay::monitor(
+                &Database::from_env(session)?,
+                id,
+                from.parse().map_err(|_| Error("invalid_replay_bounds"))?,
+                seconds
+                    .parse()
+                    .map_err(|_| Error("invalid_replay_bounds"))?,
+                telemetry,
+            )
         }
         [command, session, id, seconds] if command == "replay" => helius_indexer::replay::run(
             &Database::from_env(session)?,

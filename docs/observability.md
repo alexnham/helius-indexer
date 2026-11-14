@@ -296,13 +296,26 @@ closed. Summary rows stream through checked u128 accumulation instead of loading
 a mint's history into a client-side vector. Existing bounded error classes and
 credential redaction apply.
 
-## Replay job storage (implementation in progress)
+## Replay jobs and source separation
 
-The job store reports frozen range/revision, charged allowance and separate unique,
-decoded/unresolved and retained-raw receipt counts. Status is a repeatable-read
-snapshot; coverage and verified boundary remain unknown. Restart never resets
-consumed counters. Persistence errors use bounded storage classes; invalid scope,
-job ownership and exhausted budgets have separate replay classes. No provider
-worker or metrics exporter is connected to these new primitives yet; events and
-applicable gauges are required with the runner before issue #30 can be complete.
-See [replay jobs](replay-jobs.md) for current boundaries and pending checks.
+The replay job report includes frozen range/revision, consumed allowance and
+unique/decoded/unresolved/retained-raw counts in a repeatable-read snapshot.
+Attempt history includes availability observation time/age and margin, terminal
+classes and later-slot observations. Failures and pending age remain visible
+after restart. Queryable transfers in scope are separate from processing receipts;
+coverage and verified boundary remain unknown.
+
+The paired worker shares live-priority admission, bounds historical waiting and
+starts history after live initialization rather than after its cycle. Raw-input
+`ingestion_mode` keeps replay out of live arrival/freshness and resume counters.
+The shared intake emits connection/retry/end/failure events and stage duration,
+transaction/input-byte/write diagnostics with mode `historical` for replay.
+`replay_attempt_finished`, retry and explicit budget-grant events use the replay
+component with bounded failure classes. Retrying retained input makes no provider
+request. Telemetry writes remain best-effort and cannot undo durable input/output.
+No mint/slot/signature metric labels are added.
+
+The console shows remaining budgets, processing versus raw retention and unknown
+coverage, alongside live reports and actual query output. Current JSON snapshots
+are inspection telemetry, not a production continuous exporter or alert system.
+See [replay jobs](replay-jobs.md) for bounds and operating commands.

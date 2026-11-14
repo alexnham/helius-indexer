@@ -282,9 +282,10 @@ fn run_intake(
     mut replay: Option<&mut crate::replay::ReplayRun>,
 ) -> Result<Value> {
     let historical = replay.is_some();
+    let deadline = Instant::now() + Duration::from_secs(seconds);
     let admit = || {
         if historical {
-            gate.historical()
+            gate.historical_until(deadline)
         } else {
             gate.live()
         }
@@ -315,6 +316,9 @@ fn run_intake(
                 .start_run(from as i64, mint, decoder::DECODER_VERSION)?,
         )
     };
+    if !historical {
+        gate.live_started()?;
+    }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -330,188 +334,210 @@ fn run_intake(
     let mut output_seconds = 0.0;
     let mut output_successes = 0usize;
     let mut inserted = 0usize;
-    let result = runtime.block_on(async {
-        tokio::time::timeout(Duration::from_secs(seconds), async {
-            for attempt in 0..=2 {
-                reconnects = attempt;
-                event(
-                    telemetry,
-                    "connection_attempt",
-                    if attempt == 0 { "startup" } else { "retry" },
-                );
-                if let Some(job) = replay.as_mut() {
-                    let _permit = admit()?;
-                    job.reservation.connection()?;
-                }
-                let channel =
-                    Endpoint::from_static("https://laserstream-mainnet-ewr.helius-rpc.com")
-                        .connect_timeout(Duration::from_secs(5))
-                        .timeout(Duration::from_secs(10))
-                        .initial_stream_window_size(65536)
-                        .initial_connection_window_size(65536)
-                        .http2_adaptive_window(false)
-                        .buffer_size(1)
-                        .tls_config(ClientTlsConfig::new().with_native_roots())
-                        .map_err(|_| Error("tls_failed"))?
-                        .connect()
-                        .await
-                        .map_err(|_| Error("provider_unavailable"))?;
-                let auth = token.clone();
-                let mut client = geyser_client::GeyserClient::with_interceptor(
-                    channel,
-                    move |mut req: Request<()>| {
-                        req.metadata_mut().insert("x-token", auth.clone());
-                        Ok(req)
-                    },
-                )
-                .max_decoding_message_size(decoder::MAX_CAPTURE_BYTES)
-                .max_encoding_message_size(65536);
-                let first_available = client
+    let result = (|| {
+        for attempt in 0..=2 {
+            if Instant::now() >= deadline {
+                return Ok("time_limit");
+            }
+            reconnects = attempt;
+            event(
+                telemetry,
+                "connection_attempt",
+                if attempt == 0 { "startup" } else { "retry" },
+            );
+            if let Some(job) = replay.as_mut() {
+                let _permit = admit()?;
+                job.reservation.connection()?;
+            }
+            let channel = network(&runtime, deadline, async {
+                Endpoint::from_static("https://laserstream-mainnet-ewr.helius-rpc.com")
+                    .connect_timeout(Duration::from_secs(5))
+                    .timeout(Duration::from_secs(10))
+                    .initial_stream_window_size(65536)
+                    .initial_connection_window_size(65536)
+                    .http2_adaptive_window(false)
+                    .buffer_size(1)
+                    .tls_config(ClientTlsConfig::new().with_native_roots())
+                    .map_err(|_| Error("tls_failed"))?
+                    .connect()
+                    .await
+                    .map_err(|_| Error("provider_unavailable"))
+            })?;
+            let auth = token.clone();
+            let mut client = geyser_client::GeyserClient::with_interceptor(
+                channel,
+                move |mut req: Request<()>| {
+                    req.metadata_mut().insert("x-token", auth.clone());
+                    Ok(req)
+                },
+            )
+            .max_decoding_message_size(decoder::MAX_CAPTURE_BYTES)
+            .max_encoding_message_size(65536);
+            let first_available = network(&runtime, deadline, async {
+                Ok(client
                     .subscribe_replay_info(SubscribeReplayInfoRequest {})
                     .await
                     .map_err(|_| Error("replay_info_unavailable"))?
                     .into_inner()
-                    .first_available;
-                let reference = client
+                    .first_available)
+            })?;
+            let reference = network(&runtime, deadline, async {
+                Ok(client
                     .get_slot(GetSlotRequest {
                         commitment: Some(CommitmentLevel::Finalized as i32),
                     })
                     .await
                     .map_err(|_| Error("reference_unavailable"))?
                     .into_inner()
-                    .slot;
-                {
-                    let _permit = admit()?;
-                    if let Some(job) = replay.as_mut() {
-                        job.reservation
-                            .availability(&job.scope, first_available, reference)?;
-                    } else {
-                        let first = first_available.ok_or(Error("replay_info_unavailable"))?;
-                        check_replay(from, first)?;
-                        if reference > i64::MAX as u64 || first > i64::MAX as u64 {
-                            return Err(Error("unsupported_slot"));
-                        }
-                        intake.log.record_reference(
-                            run.ok_or(Error("live_run_missing"))?,
-                            reference as i64,
-                            first as i64,
-                        )?;
+                    .slot)
+            })?;
+            {
+                let _permit = admit()?;
+                if let Some(job) = replay.as_mut() {
+                    job.reservation
+                        .availability(&job.scope, first_available, reference)?;
+                } else {
+                    let first = first_available.ok_or(Error("replay_info_unavailable"))?;
+                    check_replay(from, first)?;
+                    if reference > i64::MAX as u64 || first > i64::MAX as u64 {
+                        return Err(Error("unsupported_slot"));
                     }
+                    intake.log.record_reference(
+                        run.ok_or(Error("live_run_missing"))?,
+                        reference as i64,
+                        first as i64,
+                    )?;
                 }
-                let (sender, receiver) = tokio::sync::mpsc::channel(1);
+            }
+            let (sender, receiver) = tokio::sync::mpsc::channel(1);
+            network(&runtime, deadline, async {
                 sender
                     .send(request_mint(from, mint))
                     .await
-                    .map_err(|_| Error("subscription_failed"))?;
-                let mut stream = client
+                    .map_err(|_| Error("subscription_failed"))
+            })?;
+            let mut stream = network(&runtime, deadline, async {
+                Ok(client
                     .subscribe(tokio_stream::wrappers::ReceiverStream::new(receiver))
                     .await
                     .map_err(|_| Error("subscription_failed"))?
-                    .into_inner();
-                loop {
-                    if started.elapsed() >= Duration::from_secs(seconds) {
-                        return Ok("time_limit");
+                    .into_inner())
+            })?;
+            loop {
+                if Instant::now() >= deadline {
+                    return Ok("time_limit");
+                }
+                if count >= MAX_MESSAGES {
+                    return Ok("message_limit");
+                }
+                if std::env::var_os("BACKFILL_CANCEL_FILE")
+                    .is_some_and(|p| std::path::Path::new(&p).exists())
+                    && historical
+                {
+                    return Ok("cancelled");
+                }
+                if let Some(job) = replay.as_mut() {
+                    let _permit = admit()?;
+                    job.reservation.allowance()?;
+                }
+                let update = match network(
+                    &runtime,
+                    deadline,
+                    next_update(&mut stream, Duration::from_secs(10)),
+                ) {
+                    Ok(Some(u)) => u,
+                    Ok(None) => {
+                        event(telemetry, "connection_ended", "provider_unavailable");
+                        break;
                     }
-                    if count >= MAX_MESSAGES {
-                        return Ok("message_limit");
+                    Err(Error("stream_inactive")) => {
+                        telemetry.emit("stream_idle", "intake", "waiting", None);
+                        continue;
                     }
-                    if std::env::var_os("BACKFILL_CANCEL_FILE")
-                        .is_some_and(|p| std::path::Path::new(&p).exists())
-                        && historical
-                    {
-                        return Ok("cancelled");
+                    Err(Error("intake_time_limit")) => return Ok("time_limit"),
+                    Err(e) => {
+                        event(telemetry, "connection_failed", e.0);
+                        break;
                     }
-                    if let Some(job) = replay.as_mut() {
-                        let _permit = admit()?;
-                        job.reservation.allowance()?;
-                    }
-                    let update = match next_update(&mut stream, Duration::from_secs(10)).await {
-                        Ok(Some(u)) => u,
-                        Ok(None) => {
-                            event(telemetry, "connection_ended", "provider_unavailable");
-                            break;
-                        }
-                        Err(e) => {
-                            event(telemetry, "connection_failed", e.0);
-                            break;
-                        }
-                    };
-                    if matches!(
-                        update.update_oneof,
-                        Some(subscribe_update::UpdateOneof::Ping(_))
-                    ) {
+                };
+                if matches!(
+                    update.update_oneof,
+                    Some(subscribe_update::UpdateOneof::Ping(_))
+                ) {
+                    network(&runtime, deadline, async {
                         sender
                             .send(SubscribeRequest {
                                 ping: Some(SubscribeRequestPing { id: 1 }),
                                 ..Default::default()
                             })
                             .await
-                            .map_err(|_| Error("subscription_failed"))?;
+                            .map_err(|_| Error("subscription_failed"))
+                    })?;
+                }
+                if let Some(subscribe_update::UpdateOneof::Transaction(tx)) = update.update_oneof {
+                    if tx.slot < from && !historical {
+                        return Err(Error("unexpected_slot"));
                     }
-                    if let Some(subscribe_update::UpdateOneof::Transaction(tx)) =
-                        update.update_oneof
-                    {
-                        if tx.slot < from && !historical {
-                            return Err(Error("unexpected_slot"));
-                        }
-                        telemetry.slot = Some(tx.slot);
-                        bytes = bytes.saturating_add(tx.encoded_len());
-                        let _permit = admit()?;
-                        let operation = Instant::now();
-                        count += 1;
-                        let id = if let Some(job) = replay.as_mut() {
-                            match job.input(&tx)? {
-                                crate::storage::replay::Retained::PastEnd => {
-                                    return Ok("end_observed");
-                                }
-                                crate::storage::replay::Retained::BeforeStart => continue,
-                                crate::storage::replay::Retained::AlreadyDecoded => {
-                                    duplicate_receipts += 1;
-                                    continue;
-                                }
-                                crate::storage::replay::Retained::Pending(id) => id,
+                    telemetry.slot = Some(tx.slot);
+                    bytes = bytes.saturating_add(tx.encoded_len());
+                    let _permit = admit()?;
+                    let operation = Instant::now();
+                    count += 1;
+                    let id = if let Some(job) = replay.as_mut() {
+                        match job.input(&tx)? {
+                            crate::storage::replay::Retained::PastEnd => {
+                                return Ok("end_observed");
                             }
-                        } else {
-                            intake.retain(&tx)?
-                        };
-                        raw_writes += 1;
-                        raw_seconds += operation.elapsed().as_secs_f64();
-                        let operation = Instant::now();
-                        let processed = intake.process(id, &tx);
-                        if let Some(job) = replay.as_mut() {
-                            job.reservation.acknowledge(id, &processed)?;
-                        }
-                        output_seconds += operation.elapsed().as_secs_f64();
-                        match processed {
-                            Ok(n) => {
-                                output_successes += 1;
-                                inserted += n;
+                            crate::storage::replay::Retained::BeforeStart => continue,
+                            crate::storage::replay::Retained::AlreadyDecoded => {
+                                duplicate_receipts += 1;
+                                continue;
                             }
-                            Err(e) => {
-                                event(telemetry, "decode_or_write_failed", e.0);
-                                if e.0.starts_with("storage_") {
-                                    return Err(e);
-                                }
-                                failures += 1;
+                            crate::storage::replay::Retained::Pending(id) => id,
+                        }
+                    } else {
+                        intake.retain(&tx)?
+                    };
+                    raw_writes += 1;
+                    raw_seconds += operation.elapsed().as_secs_f64();
+                    let operation = Instant::now();
+                    let processed = intake.process(id, &tx);
+                    if let Some(job) = replay.as_mut() {
+                        job.reservation.acknowledge(id, &processed)?;
+                    }
+                    output_seconds += operation.elapsed().as_secs_f64();
+                    match processed {
+                        Ok(n) => {
+                            output_successes += 1;
+                            inserted += n;
+                        }
+                        Err(e) => {
+                            event(telemetry, "decode_or_write_failed", e.0);
+                            if e.0.starts_with("storage_") {
+                                return Err(e);
                             }
+                            failures += 1;
                         }
-                        if count >= MAX_MESSAGES {
-                            return Ok("message_limit");
-                        }
+                    }
+                    if count >= MAX_MESSAGES {
+                        return Ok("message_limit");
                     }
                 }
             }
-            Err(Error("provider_unavailable"))
-        })
-        .await
-        .unwrap_or(Ok("time_limit"))
-    });
-    let status = result.as_ref().map_or_else(|e| e.0, |s| *s);
-    {
-        let _permit = admit()?;
-        if let Some(run) = run {
-            intake.log.finish_run(run, status)?;
         }
+        Err(Error("provider_unavailable"))
+    })();
+    let result = match result {
+        Err(Error("intake_time_limit")) => Ok("time_limit"),
+        Err(Error("historical_admission_timeout")) if Instant::now() >= deadline => {
+            Ok("time_limit")
+        }
+        other => other,
+    };
+    let status = result.as_ref().map_or_else(|e| e.0, |s| *s);
+    if let Some(run) = run {
+        let _permit = gate.live()?;
+        intake.log.finish_run(run, status)?;
     }
     event(telemetry, "shutdown", status);
     let elapsed = started.elapsed().as_secs_f64();
@@ -531,6 +557,24 @@ fn run_intake(
     result?;
     Ok(report)
 }
+/// Drive only network futures here. Synchronous PostgreSQL operations run after
+/// block_on returns, outside Tokio's enter guard (the postgres client owns a runtime).
+fn network<T>(
+    runtime: &tokio::runtime::Runtime,
+    deadline: Instant,
+    future: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(Error("intake_time_limit"));
+    }
+    runtime.block_on(async {
+        tokio::time::timeout(remaining, future)
+            .await
+            .map_err(|_| Error("intake_time_limit"))?
+    })
+}
+
 fn diagnostic(telemetry: &crate::telemetry::Telemetry, metrics: &Value) {
     let mut event = telemetry.event("live_metrics", "metrics", "success", None);
     event["metrics"] = metrics.clone();
@@ -580,6 +624,34 @@ pub(crate) mod tests {
     use super::*;
     use crate::storage::pg::TestDatabase;
     use laserstream_core_proto::solana::storage::confirmed_block as wire;
+    #[test]
+    fn async_receive_returns_before_synchronous_postgres_write_and_deadline_is_bounded() {
+        let db = TestDatabase::new();
+        let mut intake = Intake::open(&db.0).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let tx = network(&runtime, Instant::now() + Duration::from_secs(1), async {
+            tokio::task::yield_now().await;
+            Ok(update())
+        })
+        .unwrap();
+        assert!(tokio::runtime::Handle::try_current().is_err());
+        let raw = intake.retain(&tx).unwrap();
+        assert_eq!(intake.process(raw, &tx).unwrap(), 1);
+        assert_eq!(Store::query(&db.0, Some(USDC), 100).unwrap().len(), 1);
+        assert_eq!(
+            network(
+                &runtime,
+                Instant::now() + Duration::from_millis(20),
+                std::future::pending::<Result<()>>()
+            )
+            .unwrap_err()
+            .0,
+            "intake_time_limit"
+        );
+    }
     pub(crate) fn update() -> SubscribeUpdateTransaction {
         let mut data = vec![12];
         data.extend(42u64.to_le_bytes());

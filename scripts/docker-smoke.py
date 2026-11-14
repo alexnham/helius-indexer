@@ -8,6 +8,7 @@ import uuid
 from urllib.request import urlopen
 
 ROOT = Path(__file__).resolve().parent.parent
+IMAGE = os.environ.get("INDEXER_CONSOLE_IMAGE", "helius-indexer-console:local")
 PROJECT = "indexer-smoke-" + uuid.uuid4().hex[:12]
 PORT = os.environ.get("INDEXER_CONSOLE_PORT", "8765")
 
@@ -51,6 +52,10 @@ def main():
         compose("up", "-d", "--no-build", "--wait", "--wait-timeout", "90")
         health = get("/healthz")
         assert health == {"status": "ready", "mode": "captured data", "coverage": "unknown"}
+        replay = json.loads(compose("exec", "-T", "console", "/app/data/session/helius-indexer",
+                                    "replay-create", "console", "recent", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "100", "149"))
+        assert replay["coverage"] == "unknown" and replay["verified_boundary"] is None
+        assert replay["budget"]["seconds_remaining"] == 60
         initial = get("/api/transfers")
         assert len(initial["transfers"]) == 303 and initial["coverage"] == "unknown"
         compose("exec", "-T", "console", "python3", "-c", "from pathlib import Path; Path('/app/data/session/persistence-check').write_text('survives')")
@@ -63,13 +68,18 @@ def main():
         compose("up", "-d", "--no-build", "--wait", "--wait-timeout", "90")
         assert snapshot() == before, "Restart replaced the session receipt or binary"
         assert get("/api/transfers") == initial, "Restart changed transfer output"
+        restarted = json.loads(compose("exec", "-T", "console", "/app/data/session/helius-indexer",
+                                       "replay-status", "console", "recent"))
+        for field in ["job", "mint", "start", "end", "decoder_version", "created_at", "budget", "receipts", "coverage", "verified_boundary"]:
+            assert restarted[field] == replay[field], "Restart changed replay state: " + field
         print("Docker smoke passed: non-root, no runtime Cargo, health, graceful stop, persistent session and identical queries")
+        print("Replay job restart passed: frozen scope, unchanged allowance and unknown coverage")
         # No network at all: the database is reached only through the shared Unix socket.
         subprocess.run(["docker", "run", "--rm", "--network", "none",
                         "-v", f"{PROJECT}_postgres-socket:/var/run/postgresql",
                         "-e", "DATABASE_URL=host=/var/run/postgresql user=indexer dbname=indexer",
                         "-e", "INDEXER_DB_SESSION=smoke_offline",
-                        "helius-indexer-console:local", "--seed-only"],
+                        IMAGE, "--seed-only"],
                        check=True, timeout=120, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         print("Network-disabled seed/replay passed")
     finally:
