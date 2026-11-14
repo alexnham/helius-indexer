@@ -1,0 +1,409 @@
+//! Frozen replay scope and durable allowance reservations. No provider calls here.
+use super::{Database, live::now, read_failed, write_failed};
+use crate::{Error, Result, decoder::DECODER_VERSION};
+use postgres::Client;
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+
+pub const SECONDS_PER_GRANT: i64 = 60;
+pub const MESSAGES_PER_GRANT: i64 = 10_000;
+pub const BYTES_PER_GRANT: i64 = 64 * 1024 * 1024;
+pub const CONNECTIONS_PER_GRANT: i64 = 3;
+
+fn valid_id(id: &str) -> Result<()> {
+    if id.is_empty()
+        || id.len() > 64
+        || !id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return Err(Error("invalid_replay_job_id"));
+    }
+    Ok(())
+}
+
+pub struct JobLog(Client);
+
+impl JobLog {
+    pub fn open(database: &Database) -> Result<Self> {
+        Ok(Self(database.connect()?))
+    }
+
+    /// Idempotent creation never moves the original requested range or decoder.
+    pub fn create(&mut self, id: &str, mint: &str, start: u64, end: u64) -> Result<()> {
+        valid_id(id)?;
+        crate::backfill::scope(mint, start, end)?;
+        let mut tx = self.0.transaction().map_err(write_failed)?;
+        tx.execute("INSERT INTO replay_jobs(id,mint,start_slot,end_slot,decoder,created_at) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(id) DO NOTHING",
+            &[&id,&mint,&(start as i64),&(end as i64),&DECODER_VERSION,&now()]).map_err(write_failed)?;
+        let r = tx
+            .query_one(
+                "SELECT mint,start_slot,end_slot,decoder FROM replay_jobs WHERE id=$1",
+                &[&id],
+            )
+            .map_err(read_failed)?;
+        if r.get::<_, String>(0) != mint
+            || r.get::<_, i64>(1) != start as i64
+            || r.get::<_, i64>(2) != end as i64
+        {
+            return Err(Error("replay_scope_conflict"));
+        }
+        if r.get::<_, String>(3) != DECODER_VERSION {
+            return Err(Error("replay_decoder_mismatch"));
+        }
+        tx.commit().map_err(write_failed)
+    }
+
+    pub fn status(&mut self, id: &str) -> Result<Value> {
+        valid_id(id)?;
+        let mut tx = self
+            .0
+            .build_transaction()
+            .read_only(true)
+            .isolation_level(postgres::IsolationLevel::RepeatableRead)
+            .start()
+            .map_err(read_failed)?;
+        let r = tx.query_opt("SELECT mint,start_slot,end_slot,decoder,created_at,grants,seconds_charged,connections_used,messages_used,bytes_used FROM replay_jobs WHERE id=$1", &[&id]).map_err(read_failed)?.ok_or(Error("replay_job_missing"))?;
+        let receipts=tx.query_one("SELECT COUNT(*),COUNT(*) FILTER (WHERE r.status='decoded'),COUNT(*) FILTER (WHERE r.status<>'decoded'),COUNT(l.id) FROM replay_receipts r LEFT JOIN live_raw l ON l.id=r.raw_id WHERE r.job=$1", &[&id]).map_err(read_failed)?;
+        tx.commit().map_err(read_failed)?;
+        let (grants, seconds, connections, messages, bytes): (i64, i64, i64, i64, i64) =
+            (r.get(5), r.get(6), r.get(7), r.get(8), r.get(9));
+        Ok(
+            json!({"job":id,"mint":r.get::<_,String>(0),"start":r.get::<_,i64>(1),"end":r.get::<_,i64>(2),"decoder_version":r.get::<_,String>(3),"created_at":r.get::<_,i64>(4),
+            "coverage":"unknown","verified_boundary":null,"pending_interval":{"start":r.get::<_,i64>(1),"end":r.get::<_,i64>(2),"kind":"unverified"},
+            "receipts":{"unique_inputs":receipts.get::<_,i64>(0),"decoded":receipts.get::<_,i64>(1),"unresolved":receipts.get::<_,i64>(2),"raw_still_retained":receipts.get::<_,i64>(3)},
+            "budget":{"grants":grants,"seconds_charged":seconds,"seconds_remaining":grants*SECONDS_PER_GRANT-seconds,"connections_used":connections,"connections_remaining":grants*CONNECTIONS_PER_GRANT-connections,"messages_used":messages,"messages_remaining":grants*MESSAGES_PER_GRANT-messages,"bytes_used":bytes,"bytes_remaining":grants*BYTES_PER_GRANT-bytes}}),
+        )
+    }
+
+    /// Explicit refill; ordinary restart never replenishes a consumed allowance.
+    pub fn grant(&mut self, id: &str) -> Result<()> {
+        valid_id(id)?;
+        let n = self
+            .0
+            .execute(
+                "UPDATE replay_jobs SET grants=grants+1 WHERE id=$1 AND grants<64 AND decoder=$2",
+                &[&id, &DECODER_VERSION],
+            )
+            .map_err(write_failed)?;
+        if n != 1 {
+            return Err(Error("replay_grant_rejected"));
+        }
+        Ok(())
+    }
+
+    /// Reserve time before opening a provider connection. Crashes retain the whole
+    /// charge. The connection holding the advisory lock owns the attempt.
+    pub fn reserve(database: &Database, id: &str, seconds: u64) -> Result<Reservation> {
+        valid_id(id)?;
+        if !(1..=SECONDS_PER_GRANT as u64).contains(&seconds) {
+            return Err(Error("invalid_replay_bounds"));
+        }
+        let mut client = database.connect()?;
+        let locked: bool = client.query_one("SELECT pg_try_advisory_lock(hashtextextended(current_schema() || ':replay:' || $1,0))", &[&id]).map_err(write_failed)?.get(0);
+        if !locked {
+            return Err(Error("replay_job_busy"));
+        }
+        let mut tx = client.transaction().map_err(write_failed)?;
+        let n = tx.execute("UPDATE replay_jobs SET seconds_charged=seconds_charged+$2 WHERE id=$1 AND decoder=$3 AND seconds_charged+$2<=grants*60 AND connections_used<grants*3 AND messages_used<grants*10000 AND bytes_used<grants*67108864", &[&id,&(seconds as i64),&DECODER_VERSION]).map_err(write_failed)?;
+        if n != 1 {
+            return Err(Error("replay_budget_or_scope_rejected"));
+        }
+        tx.execute(
+            "UPDATE replay_attempts SET status='interrupted' WHERE job=$1 AND status='running'",
+            &[&id],
+        )
+        .map_err(write_failed)?;
+        let attempt: i64 = tx.query_one("INSERT INTO replay_attempts(job,started_at,reserved_seconds,status) VALUES($1,$2,$3,'running') RETURNING id", &[&id,&now(),&(seconds as i64)]).map_err(write_failed)?.get(0);
+        tx.commit().map_err(write_failed)?;
+        Ok(Reservation {
+            client,
+            job: id.into(),
+            attempt,
+        })
+    }
+}
+
+pub struct Reservation {
+    client: Client,
+    job: String,
+    pub attempt: i64,
+}
+
+pub enum Retained {
+    BeforeStart,
+    PastEnd,
+    AlreadyDecoded,
+    Pending(i64),
+}
+
+impl Reservation {
+    /// The ingestion boundary supplies validated wire metadata. Raw bytes and a
+    /// pending receipt commit together before the shared decoder is invoked.
+    pub fn retain(&mut self, slot: u64, signature: &[u8], protobuf: &[u8]) -> Result<Retained> {
+        if slot > i64::MAX as u64
+            || signature.len() != 64
+            || protobuf.len() > crate::decoder::MAX_CAPTURE_BYTES
+        {
+            return Err(Error("invalid_replay_input"));
+        }
+        let hash = Sha256::digest(protobuf).to_vec();
+        // Charge received work even if raw persistence fails immediately afterwards.
+        let row=self.client.query_opt("UPDATE replay_jobs SET messages_used=messages_used+1,bytes_used=bytes_used+$2 WHERE id=$1 AND messages_used<grants*10000 AND bytes_used+$2<=grants*67108864 RETURNING start_slot,end_slot", &[&self.job,&(protobuf.len() as i64)]).map_err(write_failed)?.ok_or(Error("replay_budget_exhausted"))?;
+        let (start, end): (i64, i64) = (row.get(0), row.get(1));
+        let slot = slot as i64;
+        let mut tx = self.client.transaction().map_err(write_failed)?;
+        if slot < start {
+            tx.commit().map_err(write_failed)?;
+            return Ok(Retained::BeforeStart);
+        }
+        if slot > end {
+            tx.execute(
+                "UPDATE replay_attempts SET end_observed=TRUE WHERE id=$1",
+                &[&self.attempt],
+            )
+            .map_err(write_failed)?;
+            tx.commit().map_err(write_failed)?;
+            return Ok(Retained::PastEnd);
+        }
+        let existing=tx.query_opt("SELECT input_hash,raw_id,status FROM replay_receipts WHERE job=$1 AND signature=$2", &[&self.job,&signature]).map_err(read_failed)?;
+        if let Some(row) = existing.as_ref() {
+            if row.get::<_, Vec<u8>>(0) != hash {
+                return Err(Error("replay_input_conflict"));
+            }
+            if row.get::<_, String>(2) == "decoded" {
+                tx.commit().map_err(write_failed)?;
+                return Ok(Retained::AlreadyDecoded);
+            }
+            let raw_id: i64 = row.get(1);
+            if tx
+                .query_opt("SELECT protobuf FROM live_raw WHERE id=$1 AND octet_length(protobuf)<=16777216", &[&raw_id])
+                .map_err(read_failed)?
+                .is_some_and(|r| Sha256::digest(r.get::<_,Vec<u8>>(0)).to_vec()==hash)
+            {
+                tx.commit().map_err(write_failed)?;
+                return Ok(Retained::Pending(raw_id));
+            }
+        }
+        let raw_id:i64=tx.query_one("INSERT INTO live_raw(slot,protobuf,status,received_at) VALUES($1,$2,'pending',$3) RETURNING id", &[&slot,&protobuf,&now()]).map_err(write_failed)?.get(0);
+        tx.execute("INSERT INTO replay_receipts(job,signature,input_hash,slot,raw_id,status,first_received) VALUES($1,$2,$3,$4,$5,'pending',$6) ON CONFLICT(job,signature) DO UPDATE SET raw_id=excluded.raw_id,status='pending'", &[&self.job,&signature,&hash,&slot,&raw_id,&now()]).map_err(write_failed)?;
+        tx.commit().map_err(write_failed)?;
+        Ok(Retained::Pending(raw_id))
+    }
+
+    /// Called only after the shared storage output acknowledgment. A crash before
+    /// this write leaves a pending receipt and deterministic retryable input.
+    pub fn acknowledge(&mut self, raw_id: i64, result: &Result<usize>) -> Result<()> {
+        let status = result.as_ref().map_or_else(|e| e.0, |_| "decoded");
+        let n = self
+            .client
+            .execute(
+                "UPDATE replay_receipts SET status=$1 WHERE job=$2 AND raw_id=$3",
+                &[&status, &self.job, &raw_id],
+            )
+            .map_err(write_failed)?;
+        if n != 1 {
+            return Err(Error("replay_receipt_missing"));
+        }
+        Ok(())
+    }
+
+    /// Charge every connection, including failed attempts, before network I/O.
+    pub fn connection(&mut self) -> Result<()> {
+        let n = self.client.execute("UPDATE replay_jobs SET connections_used=connections_used+1 WHERE id=$1 AND connections_used<grants*3", &[&self.job]).map_err(write_failed)?;
+        if n != 1 {
+            return Err(Error("replay_budget_exhausted"));
+        }
+        Ok(())
+    }
+
+    /// All terminal outcomes release ownership by consuming this reservation.
+    /// Unused time remains charged conservatively; no crash-dependent refunds.
+    pub fn finish(mut self, status: &'static str) -> Result<()> {
+        self.client
+            .execute(
+                "UPDATE replay_attempts SET status=$1 WHERE id=$2 AND status='running'",
+                &[&status, &self.attempt],
+            )
+            .map_err(write_failed)?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{live::USDC, storage::pg::TestDatabase};
+
+    #[test]
+    fn persisted_message_byte_and_connection_limits_fail_closed() {
+        let db = TestDatabase::new();
+        let mut log = JobLog::open(&db.0).unwrap();
+        log.create("limited", USDC, 100, 149).unwrap();
+        let mut attempt = JobLog::reserve(&db.0, "limited", 60).unwrap();
+        for _ in 0..3 {
+            attempt.connection().unwrap();
+        }
+        assert_eq!(
+            attempt.connection().unwrap_err().0,
+            "replay_budget_exhausted"
+        );
+        db.0.test_client()
+            .execute(
+                "UPDATE replay_jobs SET messages_used=9999,bytes_used=67108860 WHERE id='limited'",
+                &[],
+            )
+            .unwrap();
+        assert!(matches!(
+            attempt.retain(100, &[1; 64], b"wire").unwrap(),
+            Retained::Pending(_)
+        ));
+        assert!(matches!(
+            attempt.retain(100, &[1; 64], b"wire"),
+            Err(Error("replay_budget_exhausted"))
+        ));
+        let status = log.status("limited").unwrap();
+        assert_eq!(status["budget"]["messages_remaining"], 0);
+        assert_eq!(status["budget"]["bytes_remaining"], 0);
+        assert_eq!(status["receipts"]["unique_inputs"], 1);
+    }
+
+    #[test]
+    fn raw_and_receipt_are_atomic_and_receipts_survive_pruning() {
+        let db = TestDatabase::new();
+        let mut log = JobLog::open(&db.0).unwrap();
+        log.create("fifty", USDC, 100, 149).unwrap();
+        let mut attempt = JobLog::reserve(&db.0, "fifty", 60).unwrap();
+        db.0.test_client().batch_execute("CREATE FUNCTION fail_receipt() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RAISE EXCEPTION 'injected'; END$$; CREATE TRIGGER fail_receipt BEFORE INSERT ON replay_receipts FOR EACH ROW EXECUTE FUNCTION fail_receipt();").unwrap();
+        assert!(attempt.retain(100, &[1; 64], b"wire").is_err());
+        let mut sql = db.0.test_client();
+        assert_eq!(
+            sql.query_one("SELECT COUNT(*) FROM live_raw", &[])
+                .unwrap()
+                .get::<_, i64>(0),
+            0
+        );
+        assert_eq!(log.status("fifty").unwrap()["budget"]["messages_used"], 1);
+        sql.batch_execute("DROP TRIGGER fail_receipt ON replay_receipts")
+            .unwrap();
+        let Retained::Pending(raw) = attempt.retain(100, &[1; 64], b"wire").unwrap() else {
+            panic!("pending input missing")
+        };
+        assert!(
+            matches!(attempt.retain(100,&[1;64],b"wire").unwrap(),Retained::Pending(id) if id==raw)
+        );
+        attempt.acknowledge(raw, &Ok(1)).unwrap();
+        sql.execute("DELETE FROM live_raw", &[]).unwrap();
+        assert!(matches!(
+            attempt.retain(100, &[1; 64], b"wire").unwrap(),
+            Retained::AlreadyDecoded
+        ));
+        assert!(matches!(
+            attempt.retain(100, &[1; 64], b"changed"),
+            Err(Error("replay_input_conflict"))
+        ));
+        assert!(matches!(
+            attempt.retain(150, &[2; 64], b"later").unwrap(),
+            Retained::PastEnd
+        ));
+        assert_eq!(
+            sql.query_one("SELECT COUNT(*) FROM replay_receipts", &[])
+                .unwrap()
+                .get::<_, i64>(0),
+            1
+        );
+        assert_eq!(log.status("fifty").unwrap()["coverage"], "unknown");
+        let receipts = log.status("fifty").unwrap()["receipts"].clone();
+        assert_eq!(receipts["decoded"], 1);
+        assert_eq!(receipts["raw_still_retained"], 0);
+    }
+
+    #[test]
+    fn migration_preserves_existing_inputs_and_old_binary_refuses_new_schema() {
+        let db = TestDatabase::new();
+        let mut sql = db.sql();
+        super::super::pg::migrate(&mut sql, &super::super::pg::MIGRATIONS[..1]).unwrap();
+        sql.execute(
+            "INSERT INTO live_raw(slot,protobuf,status,received_at) VALUES(100,$1,'pending',1)",
+            &[&b"retained".as_slice()],
+        )
+        .unwrap();
+        super::super::pg::migrate(&mut sql, super::super::pg::MIGRATIONS).unwrap();
+        assert_eq!(
+            sql.query_one("SELECT protobuf FROM live_raw", &[])
+                .unwrap()
+                .get::<_, Vec<u8>>(0),
+            b"retained"
+        );
+        assert_eq!(
+            super::super::pg::migrate(&mut sql, &super::super::pg::MIGRATIONS[..1])
+                .unwrap_err()
+                .0,
+            "storage_schema_newer_than_binary"
+        );
+    }
+
+    #[test]
+    fn frozen_scope_and_consumed_budget_survive_restart() {
+        let db = TestDatabase::new();
+        let mut log = JobLog::open(&db.0).unwrap();
+        log.create("fifty", USDC, 100, 149).unwrap();
+        let before = log.status("fifty").unwrap();
+        log.create("fifty", USDC, 100, 149).unwrap();
+        assert_eq!(before, log.status("fifty").unwrap());
+        assert_eq!(
+            log.create("fifty", USDC, 101, 150).unwrap_err().0,
+            "replay_scope_conflict"
+        );
+        let mut reserved = JobLog::reserve(&db.0, "fifty", 60).unwrap();
+        reserved.connection().unwrap();
+        assert!(matches!(
+            JobLog::reserve(&db.0, "fifty", 1),
+            Err(Error("replay_job_busy"))
+        ));
+        drop(reserved); // Process/connection death cannot refund allowance.
+        assert!(matches!(
+            JobLog::reserve(&db.0, "fifty", 1),
+            Err(Error("replay_budget_or_scope_rejected"))
+        ));
+        drop(log);
+        let mut restarted = JobLog::open(&db.0).unwrap();
+        assert_eq!(
+            restarted.status("fifty").unwrap()["budget"]["seconds_remaining"],
+            0
+        );
+        restarted.grant("fifty").unwrap();
+        JobLog::reserve(&db.0, "fifty", 60)
+            .unwrap()
+            .finish("time_limit")
+            .unwrap();
+        let status = restarted.status("fifty").unwrap();
+        assert_eq!(status["start"], 100);
+        assert_eq!(status["end"], 149);
+        assert_eq!(status["coverage"], "unknown");
+        let rows =
+            db.0.test_client()
+                .query("SELECT status FROM replay_attempts ORDER BY id", &[])
+                .unwrap();
+        assert_eq!(rows[0].get::<_, String>(0), "interrupted");
+        assert_eq!(rows[1].get::<_, String>(0), "time_limit");
+    }
+
+    #[test]
+    fn invalid_scope_and_decoder_revision_cannot_consume_work() {
+        let db = TestDatabase::new();
+        let mut log = JobLog::open(&db.0).unwrap();
+        assert!(log.create("bad/id", USDC, 100, 149).is_err());
+        assert!(log.create("bad", USDC, 149, 100).is_err());
+        log.create("good", USDC, 100, 149).unwrap();
+        db.0.test_client()
+            .execute(
+                "UPDATE replay_jobs SET decoder='superseded' WHERE id='good'",
+                &[],
+            )
+            .unwrap();
+        assert!(JobLog::reserve(&db.0, "good", 60).is_err());
+        assert_eq!(log.status("good").unwrap()["budget"]["seconds_charged"], 0);
+        assert!(log.grant("good").is_err());
+    }
+}

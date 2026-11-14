@@ -3,7 +3,10 @@ use crate::{Error, Result};
 use postgres::{Client, NoTls};
 
 /// Applied in order; never edit a released entry, append a new version instead.
-pub(crate) const MIGRATIONS: &[(i32, &str)] = &[(1, include_str!("migrations/0001_initial.sql"))];
+pub(crate) const MIGRATIONS: &[(i32, &str)] = &[
+    (1, include_str!("migrations/0001_initial.sql")),
+    (2, include_str!("migrations/0002_replay_jobs.sql")),
+];
 
 /// Connection errors are reduced to a class: driver messages can echo the URL or credentials.
 /// Loopback and Unix sockets may be plaintext; every other host requires authenticated TLS.

@@ -295,3 +295,14 @@ including absent parent/child anchors. Conflicting concurrent observations fail
 closed. Summary rows stream through checked u128 accumulation instead of loading
 a mint's history into a client-side vector. Existing bounded error classes and
 credential redaction apply.
+
+## Replay job storage (implementation in progress)
+
+The job store reports frozen range/revision, charged allowance and separate unique,
+decoded/unresolved and retained-raw receipt counts. Status is a repeatable-read
+snapshot; coverage and verified boundary remain unknown. Restart never resets
+consumed counters. Persistence errors use bounded storage classes; invalid scope,
+job ownership and exhausted budgets have separate replay classes. No provider
+worker or metrics exporter is connected to these new primitives yet; events and
+applicable gauges are required with the runner before issue #30 can be complete.
+See [replay jobs](replay-jobs.md) for current boundaries and pending checks.
