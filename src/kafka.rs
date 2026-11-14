@@ -739,7 +739,8 @@ pub(crate) mod tests {
 
 /// Slots to replay before the stored cursor on resume. The stream delivers transactions
 /// slightly out of slot order, so a transaction for an earlier slot may still be on its way.
-/// Provisional and unmeasured: how far LaserStream reorders has not been recorded yet.
+/// Provisional: one 60-second, 194-slot finalized USDC sample showed no out-of-order
+/// arrivals (docs/validation/2026-11-14-kafka-consumer-throughput.md); one sample is not a bound.
 /// shortcut: a fixed margin; replace with per-slot completion tracking when it exists (#36).
 pub const REORDER_MARGIN_SLOTS: u64 = 150;
 

@@ -254,6 +254,22 @@ fn age(observed: i64) -> Option<i64> {
     now().checked_sub(observed).filter(|n| *n >= 0)
 }
 
+/// The stream runs async, but storage is the synchronous PostgreSQL client, which drives
+/// its own runtime. A multi-threaded runtime lets `blocking` step out of the async context
+/// for each storage call; a current-thread runtime would panic on the first one.
+fn live_runtime() -> Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .map_err(|_| Error("runtime_failed"))
+}
+
+/// Runs synchronous storage work from inside the live stream's async loop.
+fn blocking<T>(work: impl FnOnce() -> T) -> T {
+    tokio::task::block_in_place(work)
+}
+
 /// Only this explicitly opted-in command opens a provider connection.
 pub fn validate_options(from: u64, seconds: u64) -> Result<()> {
     if !(1..=300).contains(&seconds) || from > i64::MAX as u64 {
@@ -329,10 +345,7 @@ pub fn run_mint_admitted(
             .log
             .start_run(from as i64, mint, decoder::DECODER_VERSION)?
     };
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|_| Error("runtime_failed"))?;
+    let runtime = live_runtime()?;
     let started = Instant::now();
     let mut count = 0usize;
     let mut failures = 0usize;
@@ -473,9 +486,11 @@ pub fn run_mint_admitted(
                     if reference > i64::MAX as u64 || replay > i64::MAX as u64 {
                         return Err(Error("unsupported_slot"));
                     }
-                    intake
-                        .log
-                        .record_reference(run, reference as i64, replay as i64)?;
+                    blocking(|| {
+                        intake
+                            .log
+                            .record_reference(run, reference as i64, replay as i64)
+                    })?;
                     let (sender, receiver) = tokio::sync::mpsc::channel(1);
                     sender
                         .send(request_mint(from, mint))
@@ -488,7 +503,7 @@ pub fn run_mint_admitted(
                         .into_inner();
                     loop {
                         if started.elapsed() >= Duration::from_secs(seconds) {
-                            flush(&mut intake, &mut buffer, telemetry)?;
+                            blocking(|| flush(&mut intake, &mut buffer, telemetry))?;
                             return Ok("time_limit");
                         }
                         let wait = buffered_since.map_or(Duration::from_secs(10), |since| {
@@ -497,18 +512,18 @@ pub fn run_mint_admitted(
                         let update = match next_update(&mut stream, wait).await {
                             Ok(Some(u)) => u,
                             Err(e) if e.0 == "stream_inactive" && !buffer.is_empty() => {
-                                flush(&mut intake, &mut buffer, telemetry)?;
+                                blocking(|| flush(&mut intake, &mut buffer, telemetry))?;
                                 (buffered_bytes, buffered_since) = (0, None);
                                 continue;
                             }
                             Ok(None) => {
-                                flush(&mut intake, &mut buffer, telemetry)?;
+                                blocking(|| flush(&mut intake, &mut buffer, telemetry))?;
                                 (buffered_bytes, buffered_since) = (0, None);
                                 event(telemetry, "connection_ended", "provider_unavailable");
                                 break;
                             }
                             Err(e) => {
-                                flush(&mut intake, &mut buffer, telemetry)?;
+                                blocking(|| flush(&mut intake, &mut buffer, telemetry))?;
                                 (buffered_bytes, buffered_since) = (0, None);
                                 event(telemetry, "connection_failed", e.0);
                                 break;
@@ -542,7 +557,7 @@ pub fn run_mint_admitted(
                             accepted += 1;
                             let last = accepted >= MAX_MESSAGES;
                             if full || last {
-                                flush(&mut intake, &mut buffer, telemetry)?;
+                                blocking(|| flush(&mut intake, &mut buffer, telemetry))?;
                                 (buffered_bytes, buffered_since) = (0, None);
                             }
                             if last {
@@ -1115,6 +1130,22 @@ pub(crate) mod tests {
         write_diagnostic(Broken, &json!({"coverage_valid":0,"freshness":null}));
         assert!(age(now() + 100).is_none());
     }
+    #[test]
+    fn storage_works_inside_the_live_stream_runtime() {
+        // Regression: every live run panicked on its first storage call inside the stream.
+        let test = TestDatabase::new();
+        let runtime = live_runtime().unwrap();
+        let reported = runtime.block_on(async {
+            blocking(|| {
+                let intake = Intake::open(&test.0)?;
+                let run = intake.log.start_run(1, USDC, decoder::DECODER_VERSION)?;
+                intake.log.record_reference(run, 2, 1)?;
+                Intake::report(&test.0)
+            })
+        });
+        assert_eq!(reported.unwrap()["runs"][0]["reference_slot"], 2);
+    }
+
     #[test]
     fn bounds_checked_before_environment_or_network() {
         assert_eq!(
