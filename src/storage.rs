@@ -19,10 +19,46 @@ use std::collections::{BTreeMap, HashSet};
 /// Transfers are range-partitioned by slot; one partition spans one epoch of slots.
 const PARTITION_SLOTS: i64 = 432_000;
 
+/// Storage write outcomes for one Store, for stage metrics. A write is one `persist`
+/// transaction; failures are storage errors only, never decode or reconcile outcomes.
+#[derive(Clone, Copy, Debug, Default, serde::Serialize)]
+pub struct WriteStats {
+    pub writes: u64,
+    pub failed_writes: u64,
+    pub transfers_written: u64,
+    pub seconds: f64,
+    /// Cumulative counts of writes at or under 0.001, 0.01, 0.1, 1 and 10 seconds.
+    pub buckets: [u64; 5],
+    pub partitions_created: u64,
+}
+
+pub const WRITE_BUCKETS: [f64; 5] = [0.001, 0.01, 0.1, 1.0, 10.0];
+
+impl WriteStats {
+    /// Prometheus lines for this store's writes; labels are bounded by `mode`.
+    pub fn prometheus(&self, mode: &str) -> String {
+        let mut out = String::new();
+        for (bound, count) in WRITE_BUCKETS.iter().zip(self.buckets) {
+            out.push_str(&format!(
+                "indexer_stage_duration_seconds_bucket{{operation=\"transfer_write\",mode=\"{mode}\",le=\"{bound}\"}} {count}\n"
+            ));
+        }
+        out.push_str(&format!(
+            "indexer_stage_duration_seconds_bucket{{operation=\"transfer_write\",mode=\"{mode}\",le=\"+Inf\"}} {writes}\nindexer_stage_duration_seconds_sum{{operation=\"transfer_write\",mode=\"{mode}\"}} {}\nindexer_stage_duration_seconds_count{{operation=\"transfer_write\",mode=\"{mode}\"}} {writes}\nindexer_storage_write_failures_total{{mode=\"{mode}\"}} {}\nindexer_storage_transfers_written_total{{mode=\"{mode}\"}} {}\n",
+            self.seconds,
+            self.failed_writes,
+            self.transfers_written,
+            writes = self.writes,
+        ));
+        out
+    }
+}
+
 pub struct Store {
     db: Client,
     /// Partitions this connection has confirmed; partitions are never dropped.
     partitions: HashSet<i64>,
+    stats: WriteStats,
 }
 
 fn write_failed(_: postgres::Error) -> Error {
@@ -38,6 +74,7 @@ impl Store {
         Ok(Self {
             db: db.connect()?,
             partitions: HashSet::new(),
+            stats: WriteStats::default(),
         })
     }
 
@@ -72,6 +109,7 @@ impl Store {
             .map_err(write_failed)?;
             tx.commit().map_err(|_| Error("storage_commit_failed"))?;
             self.partitions.insert(index);
+            self.stats.partitions_created += 1;
         }
         Ok(())
     }
@@ -81,6 +119,33 @@ impl Store {
     /// READ COMMITTED: a first observation inserts optimistically without reading; a repeat
     /// waits on the existing capture's row lock, so concurrent duplicates reconcile in turn.
     pub fn persist(
+        &mut self,
+        capture: &Capture,
+        raw: &[u8],
+        decoded: &Result<Vec<Transfer>>,
+    ) -> Result<usize> {
+        let started = std::time::Instant::now();
+        let result = self.persist_once(capture, raw, decoded);
+        let seconds = started.elapsed().as_secs_f64();
+        let stats = &mut self.stats;
+        stats.writes += 1;
+        stats.seconds += seconds;
+        for (count, bound) in stats.buckets.iter_mut().zip(WRITE_BUCKETS) {
+            *count += u64::from(seconds <= bound);
+        }
+        match &result {
+            Ok(inserted) => stats.transfers_written += *inserted as u64,
+            Err(error) if error.0.starts_with("storage_") => stats.failed_writes += 1,
+            Err(_) => {}
+        }
+        result
+    }
+
+    pub fn stats(&self) -> WriteStats {
+        self.stats
+    }
+
+    fn persist_once(
         &mut self,
         capture: &Capture,
         raw: &[u8],

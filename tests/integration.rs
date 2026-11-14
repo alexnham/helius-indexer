@@ -1106,3 +1106,42 @@ fn comparison_export_is_bounded_to_retained_blocks_and_one_mint() {
             .is_empty()
     );
 }
+
+#[test]
+fn write_stats_count_writes_transfers_failures_and_latency_buckets() {
+    let db = TestDatabase::new();
+    let db = &db.0;
+    let raw = serde_json::to_vec(&capture()).unwrap();
+    let parsed = decoder::parse_capture(&raw).unwrap();
+    let decoded = decoder::decode(&parsed);
+    let mut store = Store::open(db).unwrap();
+    assert_eq!(store.persist(&parsed, &raw, &decoded).unwrap(), 1);
+    assert_eq!(store.persist(&parsed, &raw, &decoded).unwrap(), 0);
+    let stats = store.stats();
+    assert_eq!(
+        (stats.writes, stats.transfers_written, stats.failed_writes),
+        (2, 1, 0)
+    );
+    assert_eq!(stats.partitions_created, 1);
+    assert_eq!(stats.buckets[4], 2, "every write is under the 10 s bound");
+    assert!(stats.buckets.windows(2).all(|pair| pair[0] <= pair[1]));
+    db.test_client()
+        .batch_execute("CREATE FUNCTION fail() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RAISE EXCEPTION 'injected'; END$$; CREATE TRIGGER fail_inputs BEFORE INSERT ON capture_inputs FOR EACH ROW EXECUTE FUNCTION fail();")
+        .unwrap();
+    let mut other = capture();
+    other["source"] = json!("helius-laserstream");
+    let raw = serde_json::to_vec(&other).unwrap();
+    let parsed = decoder::parse_capture(&raw).unwrap();
+    assert!(
+        store
+            .persist(&parsed, &raw, &decoder::decode(&parsed))
+            .is_err()
+    );
+    let stats = store.stats();
+    assert_eq!((stats.writes, stats.failed_writes), (3, 1));
+    let text = stats.prometheus("historical");
+    assert!(text.contains(
+        "indexer_stage_duration_seconds_count{operation=\"transfer_write\",mode=\"historical\"} 3"
+    ));
+    assert!(text.contains("indexer_storage_write_failures_total{mode=\"historical\"} 1"));
+}

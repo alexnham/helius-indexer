@@ -219,6 +219,8 @@ pub struct Metrics {
     pub decode_failures: u64,
     pub elapsed_seconds: f64,
     pub cancelled: bool,
+    /// Writes made by this run's store; transfers written exclude identical replays.
+    pub storage: crate::storage::WriteStats,
 }
 impl Metrics {
     pub fn prometheus(&self, coverage: &Coverage) -> String {
@@ -245,6 +247,7 @@ impl Metrics {
             "indexer_historical_cached_blocks_total {}\n",
             self.cached_blocks
         ));
+        output.push_str(&self.storage.prometheus("historical"));
         let mut prior_pending = false;
         let mut missing_ranges = 0;
         for slot in &coverage.slots {
@@ -606,6 +609,7 @@ impl History {
             }
         }
         metrics.source_diagnostics = source.diagnostics();
+        metrics.storage = store.stats();
         metrics.elapsed_seconds = started.elapsed().as_secs_f64();
         Ok((self.coverage(mint, start, end)?, metrics))
     }
