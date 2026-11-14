@@ -202,8 +202,8 @@ original durable plan measurement and is not reset by retries or cursor movement
 Completed plans report zero pending age. Batch reports retain stage attempt
 metrics, source diagnostics and the unique persisted storage summary separately.
 Archive diagnostics count transport bytes; historical input metrics count retained
-normalized bytes. RPC transport diagnostics are currently unavailable, rather than
-reported as zero. `bridge_batch_finished` includes run, mint/range/tip and pending
+normalized bytes. RPC source diagnostics now count consumed response-body bytes
+and request/read/oversize failures; unavailable source diagnostics stay null. `bridge_batch_finished` includes run, mint/range/tip and pending
 scope in the diagnostic event, with no new high-cardinality metric labels.
 Tests distinguish interrupted proof acknowledgment, a failed source, scheduler
 rotation and durable completion. See [source-boundary operation](source-boundary.md).
@@ -238,6 +238,24 @@ URLs never become diagnostic/metric labels. Frozen-plan status distinguishes
 unknown. SQLite crash/restart tests verify the proof boundary and no duplicate
 query output. See [evidence recovery](rpc-evidence-recovery.md).
 
+
+## RPC response-body accounting
+
+`RpcSource` diagnostics report `requests`, `request_failures`, `read_failures`,
+`oversized_responses` and `response_body_bytes_read`. They cover genesis checks,
+finalized reference/time responses and full block responses. Counts advance at
+the reader boundary before parsing or propagating a partial-read failure; the
+one-byte size-limit sentinel is included. A deadline rejected before sending
+counts no request. HTTP/connection failures count as request failures; bodies not
+read by the client are not included. This measures consumed response-body bytes,
+not request/header/TLS bytes, packets on the wire or provider-billed usage.
+
+Historical and bridge reports receive the snapshot through the existing source
+interface. Archive overlap/tip reports additionally expose `rpc_transport`; their
+older successful-block byte field remains narrower. Retained-input replay makes
+no RPC request. No endpoint, credential, raw payload or unbounded error string is
+included. Offline tests cover successful and oversized reads, bytes retained on
+read failure and diagnostic redaction. No live-provider check is required.
 
 ## Container console health
 

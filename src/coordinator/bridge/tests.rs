@@ -263,6 +263,7 @@ fn expired_rpc_budget_fails_before_any_network_request() {
     let mut source =
         RpcSource::bounded("https://api.mainnet-beta.solana.com".into(), Instant::now()).unwrap();
     assert_eq!(source.block(12).unwrap_err().0, "rpc_time_limit");
+    assert_eq!(source.diagnostics()["requests"], 0);
 }
 #[test]
 fn conflicting_overlap_cannot_acknowledge_either_source_as_a_verified_boundary() {

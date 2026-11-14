@@ -306,6 +306,11 @@ RPC log truncation from complete matching archive evidence. Both originals remai
 retained; native RPC stays incomplete and reports expose corroborated readiness.
 See [RPC evidence recovery](docs/rpc-evidence-recovery.md) for limits and rollback.
 
+RPC source reports now include consumed response-body bytes and request/read/
+oversize failures, separately from normalized input and stored transfer counts.
+These measurements include small reference/genesis responses and partial reads;
+they are not provider-billed or full wire bytes. See [telemetry](docs/observability.md#rpc-response-body-accounting).
+
 For **real provider-backed live intake and configurable backfill**, use the
 [opt-in runtime console](docs/runtime-testing.md):
 `docker compose --profile live up --build -d runtime`, then open
