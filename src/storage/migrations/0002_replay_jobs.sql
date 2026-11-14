@@ -11,7 +11,8 @@ CREATE TABLE replay_jobs (
     seconds_charged BIGINT NOT NULL DEFAULT 0 CHECK (seconds_charged >= 0),
     connections_used BIGINT NOT NULL DEFAULT 0 CHECK (connections_used >= 0),
     messages_used BIGINT NOT NULL DEFAULT 0 CHECK (messages_used >= 0),
-    bytes_used BIGINT NOT NULL DEFAULT 0 CHECK (bytes_used >= 0)
+    bytes_used BIGINT NOT NULL DEFAULT 0 CHECK (bytes_used >= 0),
+    retry_cursor BYTEA
 );
 CREATE TABLE replay_attempts (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,

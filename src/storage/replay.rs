@@ -10,7 +10,7 @@ pub const MESSAGES_PER_GRANT: i64 = 10_000;
 pub const BYTES_PER_GRANT: i64 = 64 * 1024 * 1024;
 pub const CONNECTIONS_PER_GRANT: i64 = 3;
 
-fn valid_id(id: &str) -> Result<()> {
+pub(crate) fn valid_id(id: &str) -> Result<()> {
     if id.is_empty()
         || id.len() > 64
         || !id
@@ -24,7 +24,87 @@ fn valid_id(id: &str) -> Result<()> {
 
 pub struct JobLog(Client);
 
+pub struct Scope {
+    pub mint: String,
+    pub start: u64,
+    pub end: u64,
+}
+
+pub struct Pending {
+    pub signature: Vec<u8>,
+    pub hash: Vec<u8>,
+    pub raw_id: i64,
+}
+
 impl JobLog {
+    pub fn scope(&mut self, id: &str) -> Result<Scope> {
+        valid_id(id)?;
+        let row = self
+            .0
+            .query_opt(
+                "SELECT mint,start_slot,end_slot,decoder FROM replay_jobs WHERE id=$1",
+                &[&id],
+            )
+            .map_err(read_failed)?
+            .ok_or(Error("replay_job_missing"))?;
+        if row.get::<_, String>(3) != DECODER_VERSION {
+            return Err(Error("replay_decoder_mismatch"));
+        }
+        Ok(Scope {
+            mint: row.get(0),
+            start: row.get::<_, i64>(1) as u64,
+            end: row.get::<_, i64>(2) as u64,
+        })
+    }
+
+    /// Holds job ownership until this log connection closes. Pending input is
+    /// bounded and rotated by a durable fairness cursor, never a progress cursor.
+    pub fn pending(&mut self, id: &str) -> Result<Vec<Pending>> {
+        self.scope(id)?;
+        let locked:bool=self.0.query_one("SELECT pg_try_advisory_lock(hashtextextended(current_schema() || ':replay:' || $1,0))", &[&id]).map_err(write_failed)?.get(0);
+        if !locked {
+            return Err(Error("replay_job_busy"));
+        }
+        let rows=self.0.query("SELECT r.signature,r.input_hash,r.raw_id FROM replay_receipts r WHERE r.job=$1 AND r.status<>'decoded' ORDER BY (r.signature<=COALESCE((SELECT retry_cursor FROM replay_jobs WHERE id=$1),'\\x'::bytea)),r.signature LIMIT 100", &[&id]).map_err(read_failed)?;
+        Ok(rows
+            .into_iter()
+            .map(|r| Pending {
+                signature: r.get(0),
+                hash: r.get(1),
+                raw_id: r.get(2),
+            })
+            .collect())
+    }
+
+    pub fn raw(&mut self, raw_id: i64) -> Result<Option<(Vec<u8>, String)>> {
+        Ok(self.0.query_opt("SELECT protobuf,proto_schema FROM live_raw WHERE id=$1 AND octet_length(protobuf)<=16777216", &[&raw_id]).map_err(read_failed)?.map(|r|(r.get(0),r.get(1))))
+    }
+
+    pub fn retry_cursor(&mut self, id: &str, signature: &[u8]) -> Result<()> {
+        self.0
+            .execute(
+                "UPDATE replay_jobs SET retry_cursor=$1 WHERE id=$2",
+                &[&signature, &id],
+            )
+            .map_err(write_failed)?;
+        Ok(())
+    }
+
+    pub fn retry_acknowledge(
+        &mut self,
+        id: &str,
+        raw_id: i64,
+        result: &Result<usize>,
+    ) -> Result<()> {
+        let status = result.as_ref().map_or_else(|e| e.0, |_| "decoded");
+        self.0
+            .execute(
+                "UPDATE replay_receipts SET status=$1 WHERE job=$2 AND raw_id=$3",
+                &[&status, &id, &raw_id],
+            )
+            .map_err(write_failed)?;
+        Ok(())
+    }
     pub fn open(database: &Database) -> Result<Self> {
         Ok(Self(database.connect()?))
     }
@@ -65,12 +145,16 @@ impl JobLog {
             .map_err(read_failed)?;
         let r = tx.query_opt("SELECT mint,start_slot,end_slot,decoder,created_at,grants,seconds_charged,connections_used,messages_used,bytes_used FROM replay_jobs WHERE id=$1", &[&id]).map_err(read_failed)?.ok_or(Error("replay_job_missing"))?;
         let receipts=tx.query_one("SELECT COUNT(*),COUNT(*) FILTER (WHERE r.status='decoded'),COUNT(*) FILTER (WHERE r.status<>'decoded'),COUNT(l.id) FROM replay_receipts r LEFT JOIN live_raw l ON l.id=r.raw_id WHERE r.job=$1", &[&id]).map_err(read_failed)?;
+        let attempts:Vec<Value>=tx.query("SELECT id,started_at,reserved_seconds,status,first_available,reference_slot,observed_at,end_observed FROM replay_attempts WHERE job=$1 ORDER BY id DESC LIMIT 20", &[&id]).map_err(read_failed)?.into_iter().map(|a|{
+            let first:Option<i64>=a.get(4);let observed:Option<i64>=a.get(6);
+            json!({"attempt":a.get::<_,i64>(0),"started_at":a.get::<_,i64>(1),"reserved_seconds":a.get::<_,i64>(2),"status":a.get::<_,String>(3),"first_available":first,"reference_slot":a.get::<_,Option<i64>>(5),"observed_at":observed,"availability_age_seconds":observed.and_then(|t|now().checked_sub(t)).filter(|n|*n>=0),"replay_margin_slots":first.map(|n|r.get::<_,i64>(1)-n),"end_observed":a.get::<_,bool>(7)})
+        }).collect();
         tx.commit().map_err(read_failed)?;
         let (grants, seconds, connections, messages, bytes): (i64, i64, i64, i64, i64) =
             (r.get(5), r.get(6), r.get(7), r.get(8), r.get(9));
         Ok(
             json!({"job":id,"mint":r.get::<_,String>(0),"start":r.get::<_,i64>(1),"end":r.get::<_,i64>(2),"decoder_version":r.get::<_,String>(3),"created_at":r.get::<_,i64>(4),
-            "coverage":"unknown","verified_boundary":null,"pending_interval":{"start":r.get::<_,i64>(1),"end":r.get::<_,i64>(2),"kind":"unverified"},
+            "coverage":"unknown","verified_boundary":null,"resume_from":r.get::<_,i64>(1),"pending_interval":{"start":r.get::<_,i64>(1),"end":r.get::<_,i64>(2),"kind":"unverified"},"attempts":attempts,"reason":"filtered_replay_has_no_validated_slot_completion_evidence",
             "receipts":{"unique_inputs":receipts.get::<_,i64>(0),"decoded":receipts.get::<_,i64>(1),"unresolved":receipts.get::<_,i64>(2),"raw_still_retained":receipts.get::<_,i64>(3)},
             "budget":{"grants":grants,"seconds_charged":seconds,"seconds_remaining":grants*SECONDS_PER_GRANT-seconds,"connections_used":connections,"connections_remaining":grants*CONNECTIONS_PER_GRANT-connections,"messages_used":messages,"messages_remaining":grants*MESSAGES_PER_GRANT-messages,"bytes_used":bytes,"bytes_remaining":grants*BYTES_PER_GRANT-bytes}}),
         )
@@ -138,6 +222,33 @@ pub enum Retained {
 }
 
 impl Reservation {
+    pub fn availability(
+        &mut self,
+        scope: &Scope,
+        first: Option<u64>,
+        reference: u64,
+    ) -> Result<()> {
+        if first.is_some_and(|n| n > i64::MAX as u64) || reference > i64::MAX as u64 {
+            return Err(Error("unsupported_slot"));
+        }
+        self.client.execute("UPDATE replay_attempts SET first_available=$1,reference_slot=$2,observed_at=$3 WHERE id=$4", &[&first.map(|n|n as i64),&(reference as i64),&now(),&self.attempt]).map_err(write_failed)?;
+        let first = first.ok_or(Error("replay_info_unavailable"))?;
+        if scope.start < first {
+            return Err(Error("outside_replay_window"));
+        }
+        if scope.end > reference {
+            return Err(Error("replay_end_not_finalized"));
+        }
+        Ok(())
+    }
+
+    pub fn allowance(&mut self) -> Result<()> {
+        let allowed:bool=self.client.query_one("SELECT messages_used<grants*10000 AND bytes_used<grants*67108864 FROM replay_jobs WHERE id=$1", &[&self.job]).map_err(read_failed)?.get(0);
+        if !allowed {
+            return Err(Error("replay_budget_exhausted"));
+        }
+        Ok(())
+    }
     /// The ingestion boundary supplies validated wire metadata. Raw bytes and a
     /// pending receipt commit together before the shared decoder is invoked.
     pub fn retain(&mut self, slot: u64, signature: &[u8], protobuf: &[u8]) -> Result<Retained> {

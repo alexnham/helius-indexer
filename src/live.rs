@@ -250,8 +250,51 @@ pub fn run_mint_admitted(
     telemetry: &mut crate::telemetry::Telemetry,
     gate: &crate::coordinator::WriteGate,
 ) -> Result<Value> {
+    run_intake(database, from, seconds, mint, telemetry, gate, None)
+}
+
+pub(crate) fn run_replay(
+    database: &Database,
+    seconds: u64,
+    telemetry: &mut crate::telemetry::Telemetry,
+    gate: &crate::coordinator::WriteGate,
+    replay: &mut crate::replay::ReplayRun,
+) -> Result<Value> {
+    let mint = replay.scope.mint.clone();
+    run_intake(
+        database,
+        replay.scope.start,
+        seconds,
+        &mint,
+        telemetry,
+        gate,
+        Some(replay),
+    )
+}
+
+fn run_intake(
+    database: &Database,
+    from: u64,
+    seconds: u64,
+    mint: &str,
+    telemetry: &mut crate::telemetry::Telemetry,
+    gate: &crate::coordinator::WriteGate,
+    mut replay: Option<&mut crate::replay::ReplayRun>,
+) -> Result<Value> {
+    let historical = replay.is_some();
+    let admit = || {
+        if historical {
+            gate.historical()
+        } else {
+            gate.live()
+        }
+    };
     crate::backfill::scope(mint, from, from)?;
-    telemetry.set_context("live_ingestion", "laserstream", "live");
+    telemetry.set_context(
+        "live_ingestion",
+        "laserstream",
+        if historical { "historical" } else { "live" },
+    );
     validate_options(from, seconds)?;
     let api_key = std::env::var("HELIUS_API_KEY").map_err(|_| Error("missing_live_credentials"))?;
     // Fixed canonical mainnet endpoint prevents credential-bearing URLs entering diagnostics/config.
@@ -259,14 +302,18 @@ pub fn run_mint_admitted(
         .parse()
         .map_err(|_| Error("invalid_live_credentials"))?;
     let mut intake = {
-        let _permit = gate.live()?;
+        let _permit = admit()?;
         Intake::open(database)?
     };
-    let run = {
-        let _permit = gate.live()?;
-        intake
-            .log
-            .start_run(from as i64, mint, decoder::DECODER_VERSION)?
+    let run = if historical {
+        None
+    } else {
+        let _permit = admit()?;
+        Some(
+            intake
+                .log
+                .start_run(from as i64, mint, decoder::DECODER_VERSION)?,
+        )
     };
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -274,6 +321,8 @@ pub fn run_mint_admitted(
         .map_err(|_| Error("runtime_failed"))?;
     let started = Instant::now();
     let mut count = 0usize;
+    let mut raw_writes = 0usize;
+    let mut duplicate_receipts = 0usize;
     let mut failures = 0usize;
     let mut bytes = 0usize;
     let mut reconnects = 0usize;
@@ -290,6 +339,10 @@ pub fn run_mint_admitted(
                     "connection_attempt",
                     if attempt == 0 { "startup" } else { "retry" },
                 );
+                if let Some(job) = replay.as_mut() {
+                    let _permit = admit()?;
+                    job.reservation.connection()?;
+                }
                 let channel =
                     Endpoint::from_static("https://laserstream-mainnet-ewr.helius-rpc.com")
                         .connect_timeout(Duration::from_secs(5))
@@ -313,13 +366,12 @@ pub fn run_mint_admitted(
                 )
                 .max_decoding_message_size(decoder::MAX_CAPTURE_BYTES)
                 .max_encoding_message_size(65536);
-                let replay = client
+                let first_available = client
                     .subscribe_replay_info(SubscribeReplayInfoRequest {})
                     .await
                     .map_err(|_| Error("replay_info_unavailable"))?
                     .into_inner()
-                    .first_available
-                    .ok_or(Error("replay_info_unavailable"))?;
+                    .first_available;
                 let reference = client
                     .get_slot(GetSlotRequest {
                         commitment: Some(CommitmentLevel::Finalized as i32),
@@ -328,13 +380,24 @@ pub fn run_mint_admitted(
                     .map_err(|_| Error("reference_unavailable"))?
                     .into_inner()
                     .slot;
-                check_replay(from, replay)?;
-                if reference > i64::MAX as u64 || replay > i64::MAX as u64 {
-                    return Err(Error("unsupported_slot"));
+                {
+                    let _permit = admit()?;
+                    if let Some(job) = replay.as_mut() {
+                        job.reservation
+                            .availability(&job.scope, first_available, reference)?;
+                    } else {
+                        let first = first_available.ok_or(Error("replay_info_unavailable"))?;
+                        check_replay(from, first)?;
+                        if reference > i64::MAX as u64 || first > i64::MAX as u64 {
+                            return Err(Error("unsupported_slot"));
+                        }
+                        intake.log.record_reference(
+                            run.ok_or(Error("live_run_missing"))?,
+                            reference as i64,
+                            first as i64,
+                        )?;
+                    }
                 }
-                intake
-                    .log
-                    .record_reference(run, reference as i64, replay as i64)?;
                 let (sender, receiver) = tokio::sync::mpsc::channel(1);
                 sender
                     .send(request_mint(from, mint))
@@ -348,6 +411,19 @@ pub fn run_mint_admitted(
                 loop {
                     if started.elapsed() >= Duration::from_secs(seconds) {
                         return Ok("time_limit");
+                    }
+                    if count >= MAX_MESSAGES {
+                        return Ok("message_limit");
+                    }
+                    if std::env::var_os("BACKFILL_CANCEL_FILE")
+                        .is_some_and(|p| std::path::Path::new(&p).exists())
+                        && historical
+                    {
+                        return Ok("cancelled");
+                    }
+                    if let Some(job) = replay.as_mut() {
+                        let _permit = admit()?;
+                        job.reservation.allowance()?;
                     }
                     let update = match next_update(&mut stream, Duration::from_secs(10)).await {
                         Ok(Some(u)) => u,
@@ -375,18 +451,36 @@ pub fn run_mint_admitted(
                     if let Some(subscribe_update::UpdateOneof::Transaction(tx)) =
                         update.update_oneof
                     {
-                        if tx.slot < from {
+                        if tx.slot < from && !historical {
                             return Err(Error("unexpected_slot"));
                         }
                         telemetry.slot = Some(tx.slot);
                         bytes = bytes.saturating_add(tx.encoded_len());
-                        let _permit = gate.live()?;
+                        let _permit = admit()?;
                         let operation = Instant::now();
-                        let id = intake.retain(&tx)?;
-                        raw_seconds += operation.elapsed().as_secs_f64();
                         count += 1;
+                        let id = if let Some(job) = replay.as_mut() {
+                            match job.input(&tx)? {
+                                crate::storage::replay::Retained::PastEnd => {
+                                    return Ok("end_observed");
+                                }
+                                crate::storage::replay::Retained::BeforeStart => continue,
+                                crate::storage::replay::Retained::AlreadyDecoded => {
+                                    duplicate_receipts += 1;
+                                    continue;
+                                }
+                                crate::storage::replay::Retained::Pending(id) => id,
+                            }
+                        } else {
+                            intake.retain(&tx)?
+                        };
+                        raw_writes += 1;
+                        raw_seconds += operation.elapsed().as_secs_f64();
                         let operation = Instant::now();
                         let processed = intake.process(id, &tx);
+                        if let Some(job) = replay.as_mut() {
+                            job.reservation.acknowledge(id, &processed)?;
+                        }
                         output_seconds += operation.elapsed().as_secs_f64();
                         match processed {
                             Ok(n) => {
@@ -414,16 +508,23 @@ pub fn run_mint_admitted(
     });
     let status = result.as_ref().map_or_else(|e| e.0, |s| *s);
     {
-        let _permit = gate.live()?;
-        intake.log.finish_run(run, status)?;
+        let _permit = admit()?;
+        if let Some(run) = run {
+            intake.log.finish_run(run, status)?;
+        }
     }
     event(telemetry, "shutdown", status);
     let elapsed = started.elapsed().as_secs_f64();
-    let report = json!({"status":status,"received":count,"unresolved_attempts":failures,"input_protobuf_bytes":bytes,"elapsed_seconds":elapsed,"reconnect_attempts":reconnects,"inserted_transfers":inserted,"input_transactions_per_second":count as f64/elapsed,"decoded_write_successes":output_successes,"coverage_valid":false,"verified_boundary":null,"freshness_seconds":null,"coverage":Intake::report(database)?});
+    let coverage = if historical {
+        json!({"coverage":"unknown","reason":"filtered_replay_has_no_validated_slot_completion_evidence"})
+    } else {
+        Intake::report(database)?
+    };
+    let report = json!({"status":status,"raw_write_successes":raw_writes,"duplicate_receipts":duplicate_receipts,"mode":if historical {"historical"}else{"live"},"received":count,"unresolved_attempts":failures,"input_protobuf_bytes":bytes,"elapsed_seconds":elapsed,"reconnect_attempts":reconnects,"inserted_transfers":inserted,"input_transactions_per_second":count as f64/elapsed,"decoded_write_successes":output_successes,"coverage_valid":false,"verified_boundary":null,"freshness_seconds":null,"coverage":coverage});
     diagnostic(
         telemetry,
-        &json!({"event":"live_metrics","mode":"live","source_kind":"laserstream","indexer_transactions_total":count,"indexer_decode_failures_total":failures,"indexer_input_bytes_total":bytes,"indexer_reconnects_total":reconnects,"indexer_coverage_valid":0,"indexer_live_freshness_seconds":null,"indexer_live_slot_gap":null,
-            "stage_metrics":[{"stage":"raw_write","success":count,"duration_seconds_sum":raw_seconds},
+        &json!({"event":"live_metrics","mode":if historical {"historical"}else{"live"},"source_kind":"laserstream","indexer_transactions_total":count,"indexer_decode_failures_total":failures,"indexer_input_bytes_total":bytes,"indexer_reconnects_total":reconnects,"indexer_coverage_valid":0,"indexer_live_freshness_seconds":null,"indexer_live_slot_gap":null,
+            "stage_metrics":[{"stage":"raw_write","success":raw_writes,"duration_seconds_sum":raw_seconds},
                 {"stage":"decode_write","success":output_successes,"unsupported":failures,"duration_seconds_sum":output_seconds}],
             "elapsed_seconds":elapsed,"input_transactions_per_second":count as f64/elapsed}),
     );
@@ -441,7 +542,7 @@ fn write_diagnostic(mut output: impl std::io::Write, value: &Value) {
 fn event(telemetry: &crate::telemetry::Telemetry, event: &'static str, outcome: &'static str) {
     let error = if matches!(
         outcome,
-        "startup" | "retry" | "time_limit" | "message_limit"
+        "startup" | "retry" | "time_limit" | "message_limit" | "end_observed" | "cancelled"
     ) {
         None
     } else {
@@ -475,11 +576,11 @@ fn check_replay(from: u64, first: u64) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::storage::pg::TestDatabase;
     use laserstream_core_proto::solana::storage::confirmed_block as wire;
-    fn update() -> SubscribeUpdateTransaction {
+    pub(crate) fn update() -> SubscribeUpdateTransaction {
         let mut data = vec![12];
         data.extend(42u64.to_le_bytes());
         data.push(6);
