@@ -703,7 +703,7 @@ mod tests {
         let mut tx = update();
         let raw = normalize(&tx).unwrap();
         let capture = decoder::parse_capture(&raw).unwrap();
-        assert_eq!(decoder::decode(&capture).unwrap()[0].amount_raw, 42);
+        assert_eq!(decoder::decode(&capture).unwrap()[0].amount_raw, Some(42));
         let message = tx
             .transaction
             .as_mut()

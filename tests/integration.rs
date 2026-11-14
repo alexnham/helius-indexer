@@ -65,7 +65,10 @@ fn captured_mainnet_transfers_match_independent_expected_records() {
         serde_json::from_str(include_str!("fixtures/mainnet-expected.json")).unwrap();
     assert_eq!(actual, expected);
     assert_eq!(
-        actual.iter().map(|t| t.amount_raw).collect::<Vec<_>>(),
+        actual
+            .iter()
+            .map(|t| t.amount_raw.unwrap())
+            .collect::<Vec<_>>(),
         [23_360_000, 23_360_000]
     );
 }
@@ -92,7 +95,9 @@ fn exact_u64_zero_self_checked_and_inner_positions_survive_queries() {
     assert_eq!(persist(db, &value).unwrap(), 3);
     let rows = Store::query(db, None, 1000).unwrap();
     assert_eq!(
-        rows.iter().map(|t| t.amount_raw).collect::<Vec<_>>(),
+        rows.iter()
+            .map(|t| t.amount_raw.unwrap())
+            .collect::<Vec<_>>(),
         [u64::MAX, 1, 0]
     );
     assert_eq!(rows[0].inner_instruction_index, None);
@@ -587,7 +592,7 @@ fn token_2022_fee_evidence_survives_persistence_exactly() {
         let rows = Store::query(db, None, 1000).unwrap();
         assert_eq!(rows.len(), 2);
         for row in &rows {
-            assert_eq!(row.amount_raw, amount);
+            assert_eq!(row.amount_raw, Some(amount));
             assert_eq!(row.fee_raw, Some(fee));
             assert!(!row.confidential);
         }
@@ -609,7 +614,7 @@ fn unknown_fee_preserves_transfer_and_zero_remains_known() {
     let value = token_2022_capture(100, None);
     assert_eq!(persist(db, &value).unwrap(), 1);
     let rows = Store::query(db, None, 1000).unwrap();
-    assert_eq!(rows[0].amount_raw, 100);
+    assert_eq!(rows[0].amount_raw, Some(100));
     assert_eq!(rows[0].fee_raw, None);
     let summary = Store::summary(db, &rows[0].mint).unwrap();
     assert_eq!(summary["known_volume_raw"], "100");
@@ -736,7 +741,7 @@ fn nontransfer_exclusions_require_known_program_and_instruction_shape() {
         .push(json!({"programIdIndex":5,"accounts":[1],"data":bs58::encode([26,4]).into_string()}));
     let rows = decode(&mixed).unwrap();
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].amount_raw, 42);
+    assert_eq!(rows[0].amount_raw, Some(42));
     assert_eq!(rows[0].token_program, SPL_TOKEN);
 }
 
@@ -779,7 +784,7 @@ fn owner_change_and_restore_keep_edges_but_clear_only_affected_owners() {
             assert_eq!(rows.len(), 1);
             assert_eq!(rows[0].source_owner, None);
             assert_eq!(rows[0].destination_owner, Some(key(5)));
-            assert_eq!(rows[0].amount_raw, 42);
+            assert_eq!(rows[0].amount_raw, Some(42));
             assert_eq!(rows[0].fee_raw, Some(0));
         }
     }
@@ -858,7 +863,7 @@ fn withheld_withdrawals_are_not_ordinary_edges_or_evidence_of_transfer_fees() {
         value["result"]["transaction"]["message"]["instructions"].as_array_mut().unwrap().push(json!({"programIdIndex":0,"accounts":accounts,"data":bs58::encode(data).into_string()}));
         let rows = decode(&value).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].amount_raw, 42);
+        assert_eq!(rows[0].amount_raw, Some(42));
         assert_eq!(rows[0].fee_raw, None);
     }
     for data in [vec![26, 2, 0], vec![26, 3], vec![26, 3, 2], vec![26, 4, 0]] {

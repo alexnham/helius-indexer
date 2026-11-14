@@ -112,3 +112,16 @@ Expected IDs, raw amounts, fees and positions come from compiled transfer operan
 not balance deltas or generated Rust output. Synthetic block headers used by
 adapter tests are not claimed as captured block anchors. Full-block retained-input
 recovery evidence and limitations are in `docs/rpc-evidence-recovery.md`.
+
+
+## Confidential transfer layouts (synthetic)
+
+`confidential-transfers.json` contains two synthetic finalized-envelope examples
+of current Token-2022 (27, 7) and (27, 13) layouts, with public placeholder keys,
+signatures, slot 123 and dummy ciphertexts. They are not captured chain
+transactions, valid cryptographic proofs or evidence of mainnet availability.
+The instruction layouts and expected account positions were checked 2026-11-14
+against the pinned primary sources in `docs/token-2022-support.md`. Expected IDs,
+positions, mint, endpoints and null hidden values are explicitly enumerated.
+No secrets or provider data are included. Additional malformed, non-transfer,
+inner invocation and conflicting-context variants are constructed in tests.

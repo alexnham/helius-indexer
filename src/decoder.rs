@@ -4,7 +4,7 @@ use std::collections::HashSet;
 
 pub const SPL_TOKEN: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 pub const TOKEN_2022: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
-pub const DECODER_VERSION: &str = "token-transfers-v5";
+pub const DECODER_VERSION: &str = "token-transfers-v6";
 pub const MAX_CAPTURE_BYTES: usize = 16 * 1024 * 1024;
 
 pub fn parse_capture(bytes: &[u8]) -> Result<Capture> {
@@ -284,17 +284,62 @@ fn decode_instruction(
         data = [&[12], &data[2..11]].concat();
     }
     let tag = *data.first().ok_or(Error("invalid_token_instruction"))?;
-    let (source, destination, explicit) = match tag {
-        3 if data.len() == 9 && ix.accounts.len() >= 3 => (ix.accounts[0], ix.accounts[1], None),
-        12 if data.len() == 10 && ix.accounts.len() >= 4 => (
+    let confidential = program == TOKEN_2022 && tag == 27;
+    let (source, destination, explicit) = if confidential {
+        let variant = *data
+            .get(1)
+            .ok_or(Error("invalid_confidential_instruction"))?;
+        let (length, accounts) = match variant {
+            // Two discriminators, 36-byte decryptable balance, two 64-byte
+            // auditor ciphertexts, then three/five proof instruction offsets.
+            7 => (169, 4),
+            13 => (171, 4),
+            // Configuration and movements within one account do not form edges.
+            0 => (67, 1),
+            1 => (35, 2),
+            2 => (47, 4),
+            3 => (2, 3),
+            4 => (3, 3),
+            5 => (11, 3),
+            6 => (49, 4),
+            8 => (46, 2),
+            9..=12 => (2, 2),
+            14 => (2, 3),
+            _ => return Err(Error("unsupported_confidential_instruction")),
+        };
+        if data.len() != length || ix.accounts.len() < accounts {
+            return Err(Error("invalid_confidential_instruction"));
+        }
+        if !matches!(variant, 7 | 13) {
+            return Ok(());
+        }
+        // A proof offset of zero consumes a context account; any nonzero
+        // offset requires one shared instructions sysvar, plus the authority.
+        let offsets = &data[166..];
+        let proof_accounts = offsets.iter().filter(|&&offset| offset == 0).count()
+            + usize::from(offsets.iter().any(|&offset| offset != 0));
+        if ix.accounts.len() < 4 + proof_accounts {
+            return Err(Error("invalid_confidential_instruction"));
+        }
+        (
             ix.accounts[0],
             ix.accounts[2],
-            Some((&keys[ix.accounts[1]], data[9])),
-        ),
-        3 | 12 => return Err(Error("invalid_transfer_instruction")),
-        // Legacy SPL's other known instructions do not transfer tokens.
-        0..=24 => return Ok(()),
-        _ => return Err(Error("unsupported_token_instruction")),
+            Some((&keys[ix.accounts[1]], None)),
+        )
+    } else {
+        match tag {
+            3 if data.len() == 9 && ix.accounts.len() >= 3 => {
+                (ix.accounts[0], ix.accounts[1], None)
+            }
+            12 if data.len() == 10 && ix.accounts.len() >= 4 => (
+                ix.accounts[0],
+                ix.accounts[2],
+                Some((&keys[ix.accounts[1]], Some(data[9]))),
+            ),
+            3 | 12 => return Err(Error("invalid_transfer_instruction")),
+            0..=24 => return Ok(()),
+            _ => return Err(Error("unsupported_token_instruction")),
+        }
     };
     let mut token = explicit.map(|(mint, decimals)| (mint.clone(), decimals));
     for index in [source, destination] {
@@ -303,8 +348,10 @@ fn decode_instruction(
                 if b.program_id.as_deref().is_some_and(|p| p != program) {
                     return Err(Error("conflicting_token_program"));
                 }
-                let observed = (b.mint.clone(), b.ui_token_amount.decimals);
-                if token.as_ref().is_some_and(|t| *t != observed) {
+                let observed = (b.mint.clone(), Some(b.ui_token_amount.decimals));
+                if token.as_ref().is_some_and(|t| {
+                    t.0 != observed.0 || t.1.is_some_and(|d| Some(d) != observed.1)
+                }) {
                     return Err(Error("conflicting_token_metadata"));
                 }
                 token = Some(observed);
@@ -312,16 +359,17 @@ fn decode_instruction(
         }
     }
     let (mint, decimals) = token.ok_or(Error("missing_token_metadata"))?;
-    let amount_raw = u64::from_le_bytes(
-        data[1..9]
-            .try_into()
-            .map_err(|_| Error("invalid_transfer_instruction"))?,
-    );
-    if program == TOKEN_2022 {
-        if fee_raw.is_some_and(|fee| fee > amount_raw) {
+    let amount_raw = if confidential {
+        None
+    } else {
+        Some(u64::from_le_bytes(data[1..9].try_into().unwrap()))
+    };
+    if program == TOKEN_2022 && !confidential {
+        let amount = amount_raw.unwrap();
+        if fee_raw.is_some_and(|fee| fee > amount) {
             return Err(Error("invalid_transfer_fee"));
         }
-        if source == destination || amount_raw == 0 || tag == 3 {
+        if source == destination || amount == 0 || tag == 3 {
             fee_raw = Some(0);
         }
     }
@@ -347,7 +395,7 @@ fn decode_instruction(
         amount_raw,
         decimals,
         fee_raw,
-        confidential: false,
+        confidential,
         decoder_version: DECODER_VERSION.to_owned(),
     });
     Ok(())

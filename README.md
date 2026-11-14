@@ -32,7 +32,7 @@ PostgreSQL, and queries persisted results from a separate process. Implementatio
 starts with [ticket #1](https://github.com/alexnham/helius-indexer/issues/1).
 
 The [proposal](PROPOSAL.md) defines the full index. Production backfill,
-full-window coverage, confidential transfers, rolling
+full-window coverage, rolling
 retention, and production analytics are subsequent tickets. This CLI is a bounded
 inspection tool, not a production 30-day API. Captured-query responses report coverage as
 `unknown`; processing one transaction never establishes complete slot coverage.
@@ -326,3 +326,9 @@ For **real provider-backed live intake and configurable backfill**, use the
 http://127.0.0.1:8767. It needs a local Helius secret, starts a 50-slot backfill
 alongside live intake, then continues live intake in 60-second cycles, and keeps only the newest 1,000
 transfers; it does not seed fixtures.
+
+
+Decoder v6 supports identifiable current-layout confidential Token-2022 transfers
+with null hidden amounts/fees and optional decimals. Summary responses disclose
+unknown-amount and confidential-transfer counts. See the [support boundary and
+reader/repair compatibility](docs/token-2022-support.md#revision-v6-confidential-transfer-queries).

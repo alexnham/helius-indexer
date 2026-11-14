@@ -31,14 +31,14 @@ fn sampled_classic_usdc_edges_have_exact_amounts_and_positions() {
                 assert_eq!(actual.len(), expected.len());
                 for edge in expected {
                     let row = actual[edge["transfer_id"].as_str().unwrap()];
-                    assert_eq!(row.amount_raw.to_string(), edge["amount_raw"]);
+                    assert_eq!(row.amount_raw.unwrap().to_string(), edge["amount_raw"]);
                     assert_eq!(row.source_token_account, edge["source_token_account"]);
                     assert_eq!(
                         row.destination_token_account,
                         edge["destination_token_account"]
                     );
                     assert_eq!(row.fee_raw, Some(0));
-                    volume += u128::from(row.amount_raw);
+                    volume += u128::from(row.amount_raw.unwrap());
                     found += 1;
                 }
             }
