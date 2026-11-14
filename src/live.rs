@@ -3,7 +3,7 @@ use crate::storage::Database;
 use crate::{
     Error, Result, decoder,
     storage::{
-        Store,
+        Acknowledge, BatchItem, Store,
         live::{LiveLog, now},
     },
 };
@@ -19,6 +19,10 @@ use tonic::{
 
 pub const USDC: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 const MAX_MESSAGES: usize = 10_000;
+/// A live batch flushes at this many inputs, bytes or age, whichever comes first.
+const BATCH_INPUTS: usize = 100;
+const BATCH_BYTES: usize = 16 * 1024 * 1024;
+const BATCH_WINDOW: Duration = Duration::from_millis(200);
 const PROTO_SCHEMA: &str = "laserstream-core-proto/14.0.0";
 const RECENT_SECONDS: i64 = 60;
 
@@ -113,24 +117,71 @@ impl Intake {
     }
     /// The wire payload commits before normalization/decoding; a crash leaves retryable pending input.
     pub fn retain(&self, update: &SubscribeUpdateTransaction) -> Result<i64> {
-        if update.encoded_len() > decoder::MAX_CAPTURE_BYTES || update.slot > i64::MAX as u64 {
-            return Err(Error("live_input_limit"));
+        Ok(self.retain_batch(std::slice::from_ref(update))?[0])
+    }
+    /// Retains wire payloads in one statement, before any normalization or decoding.
+    pub fn retain_batch(&self, updates: &[SubscribeUpdateTransaction]) -> Result<Vec<i64>> {
+        let mut rows = Vec::with_capacity(updates.len());
+        for update in updates {
+            if update.encoded_len() > decoder::MAX_CAPTURE_BYTES || update.slot > i64::MAX as u64 {
+                return Err(Error("live_input_limit"));
+            }
+            rows.push((update.slot as i64, update.encode_to_vec()));
         }
-        self.log.retain(update.slot as i64, &update.encode_to_vec())
+        self.log.retain_batch(&rows)
     }
     pub fn process(&mut self, id: i64, update: &SubscribeUpdateTransaction) -> Result<usize> {
-        let result = (|| {
-            let raw = normalize(update)?;
-            let capture = decoder::parse_capture(&raw)?;
-            // Persist the same complete record set as historical ingestion. Filter queries by mint.
-            let decoded = decoder::decode(&capture);
-            let count = self.store.persist(&capture, &raw, &decoded)?;
-            decoded?;
-            Ok(count)
-        })();
-        let status = result.as_ref().map_or_else(|e: &Error| e.0, |_| "decoded");
-        self.log.set_status(id, status)?;
-        result
+        self.process_batch(&[(id, update)]).remove(0)
+    }
+    /// Decodes and stores retained inputs; their output and status commit in one transaction,
+    /// so progress never runs ahead of durable output. Results follow input order.
+    pub fn process_batch(
+        &mut self,
+        inputs: &[(i64, &SubscribeUpdateTransaction)],
+    ) -> Vec<Result<usize>> {
+        let mut results: Vec<Option<Result<usize>>> = vec![None; inputs.len()];
+        let mut failed = Vec::new();
+        let mut ready = Vec::new();
+        for (position, (id, update)) in inputs.iter().enumerate() {
+            match normalize(update).and_then(|raw| Ok((decoder::parse_capture(&raw)?, raw))) {
+                Ok((capture, raw)) => {
+                    // Persist the same complete record set as historical ingestion. Filter queries by mint.
+                    let decoded = decoder::decode(&capture);
+                    ready.push((position, *id, capture, raw, decoded));
+                }
+                Err(error) => {
+                    failed.push((*id, error.0));
+                    results[position] = Some(Err(error));
+                }
+            }
+        }
+        let items: Vec<BatchItem<'_>> = ready
+            .iter()
+            .map(|(_, _, capture, raw, decoded)| BatchItem {
+                capture,
+                raw,
+                decoded,
+            })
+            .collect();
+        let ids: Vec<i64> = ready.iter().map(|r| r.1).collect();
+        let stored = self.store.persist_batch_acknowledged(
+            &items,
+            Some(&Acknowledge {
+                ids: &ids,
+                failed: &failed,
+            }),
+        );
+        for ((position, _, _, _, decoded), stored) in ready.iter().zip(stored) {
+            results[*position] = Some(match (stored, decoded) {
+                (Ok(count), Ok(_)) => Ok(count),
+                (Ok(_), Err(error)) => Err(*error),
+                (Err(error), _) => Err(error),
+            });
+        }
+        results
+            .into_iter()
+            .map(|r| r.unwrap_or(Err(Error("storage_write_failed"))))
+            .collect()
     }
     pub fn retry(&mut self) -> Result<Value> {
         let cursor = self.log.retry_cursor()?;
@@ -138,10 +189,12 @@ impl Intake {
         telemetry.set_context("live", "laserstream", "recovery");
         telemetry.emit("retry_batch_started", "retry", "retry", None);
         let pending = self.log.pending_after(cursor, 100)?;
-        let mut success = 0;
+        // Fairness only: a crash can delay these rows until wraparound, never acknowledge them.
+        if let Some(last) = pending.last() {
+            self.log.advance_retry_cursor(*last)?;
+        }
+        let mut updates = Vec::with_capacity(pending.len());
         for id in &pending {
-            // Fairness only: a crash can delay this row until wraparound, never acknowledge it.
-            self.log.advance_retry_cursor(*id)?;
             let (raw, schema) = self.log.raw(*id)?;
             if schema != PROTO_SCHEMA {
                 return Err(Error("unsupported_stored_proto_schema"));
@@ -149,10 +202,18 @@ impl Intake {
             if raw.len() > decoder::MAX_CAPTURE_BYTES {
                 return Err(Error("stored_record_invalid"));
             }
-            let update = SubscribeUpdateTransaction::decode(raw.as_slice())
-                .map_err(|_| Error("stored_record_invalid"))?;
-            success += usize::from(self.process(*id, &update).is_ok());
+            updates.push(
+                SubscribeUpdateTransaction::decode(raw.as_slice())
+                    .map_err(|_| Error("stored_record_invalid"))?,
+            );
         }
+        let inputs: Vec<(i64, &SubscribeUpdateTransaction)> =
+            pending.iter().copied().zip(updates.iter()).collect();
+        let success = self
+            .process_batch(&inputs)
+            .iter()
+            .filter(|r| r.is_ok())
+            .count();
         telemetry.emit(
             "retry_batch_completed",
             "retry",
@@ -281,137 +342,188 @@ pub fn run_mint_admitted(
     let mut output_seconds = 0.0;
     let mut output_successes = 0usize;
     let mut inserted = 0usize;
-    let result = runtime.block_on(async {
-        tokio::time::timeout(Duration::from_secs(seconds), async {
-            for attempt in 0..=2 {
-                reconnects = attempt;
-                event(
-                    telemetry,
-                    "connection_attempt",
-                    if attempt == 0 { "startup" } else { "retry" },
-                );
-                let channel =
-                    Endpoint::from_static("https://laserstream-mainnet-ewr.helius-rpc.com")
-                        .connect_timeout(Duration::from_secs(5))
-                        .timeout(Duration::from_secs(10))
-                        .initial_stream_window_size(65536)
-                        .initial_connection_window_size(65536)
-                        .http2_adaptive_window(false)
-                        .buffer_size(1)
-                        .tls_config(ClientTlsConfig::new().with_native_roots())
-                        .map_err(|_| Error("tls_failed"))?
-                        .connect()
-                        .await
-                        .map_err(|_| Error("provider_unavailable"))?;
-                let auth = token.clone();
-                let mut client = geyser_client::GeyserClient::with_interceptor(
-                    channel,
-                    move |mut req: Request<()>| {
-                        req.metadata_mut().insert("x-token", auth.clone());
-                        Ok(req)
-                    },
-                )
-                .max_decoding_message_size(decoder::MAX_CAPTURE_BYTES)
-                .max_encoding_message_size(65536);
-                let replay = client
-                    .subscribe_replay_info(SubscribeReplayInfoRequest {})
-                    .await
-                    .map_err(|_| Error("replay_info_unavailable"))?
-                    .into_inner()
-                    .first_available
-                    .ok_or(Error("replay_info_unavailable"))?;
-                let reference = client
-                    .get_slot(GetSlotRequest {
-                        commitment: Some(CommitmentLevel::Finalized as i32),
-                    })
-                    .await
-                    .map_err(|_| Error("reference_unavailable"))?
-                    .into_inner()
-                    .slot;
-                check_replay(from, replay)?;
-                if reference > i64::MAX as u64 || replay > i64::MAX as u64 {
-                    return Err(Error("unsupported_slot"));
+    let mut buffer: Vec<SubscribeUpdateTransaction> = Vec::new();
+    let mut buffered_bytes = 0usize;
+    let mut buffered_since: Option<Instant> = None;
+    let mut accepted = 0usize;
+    // Stores the buffered inputs: raw rows in one statement, then output plus status in one
+    // transaction. A storage error stops intake; retained rows stay pending for retry.
+    let mut flush = |intake: &mut Intake,
+                     buffer: &mut Vec<SubscribeUpdateTransaction>,
+                     telemetry: &crate::telemetry::Telemetry|
+     -> Result<()> {
+        if buffer.is_empty() {
+            return Ok(());
+        }
+        let _permit = gate.live()?;
+        let operation = Instant::now();
+        let ids = intake.retain_batch(buffer)?;
+        raw_seconds += operation.elapsed().as_secs_f64();
+        count += buffer.len();
+        let operation = Instant::now();
+        let inputs: Vec<(i64, &SubscribeUpdateTransaction)> =
+            ids.iter().copied().zip(buffer.iter()).collect();
+        let results = intake.process_batch(&inputs);
+        output_seconds += operation.elapsed().as_secs_f64();
+        let mut storage_error = None;
+        for result in results {
+            match result {
+                Ok(n) => {
+                    output_successes += 1;
+                    inserted += n;
                 }
-                intake
-                    .log
-                    .record_reference(run, reference as i64, replay as i64)?;
-                let (sender, receiver) = tokio::sync::mpsc::channel(1);
-                sender
-                    .send(request_mint(from, mint))
-                    .await
-                    .map_err(|_| Error("subscription_failed"))?;
-                let mut stream = client
-                    .subscribe(tokio_stream::wrappers::ReceiverStream::new(receiver))
-                    .await
-                    .map_err(|_| Error("subscription_failed"))?
-                    .into_inner();
-                loop {
-                    if started.elapsed() >= Duration::from_secs(seconds) {
-                        return Ok("time_limit");
-                    }
-                    let update = match next_update(&mut stream, Duration::from_secs(10)).await {
-                        Ok(Some(u)) => u,
-                        Ok(None) => {
-                            event(telemetry, "connection_ended", "provider_unavailable");
-                            break;
-                        }
-                        Err(e) => {
-                            event(telemetry, "connection_failed", e.0);
-                            break;
-                        }
-                    };
-                    if matches!(
-                        update.update_oneof,
-                        Some(subscribe_update::UpdateOneof::Ping(_))
-                    ) {
-                        sender
-                            .send(SubscribeRequest {
-                                ping: Some(SubscribeRequestPing { id: 1 }),
-                                ..Default::default()
-                            })
-                            .await
-                            .map_err(|_| Error("subscription_failed"))?;
-                    }
-                    if let Some(subscribe_update::UpdateOneof::Transaction(tx)) =
-                        update.update_oneof
-                    {
-                        if tx.slot < from {
-                            return Err(Error("unexpected_slot"));
-                        }
-                        telemetry.slot = Some(tx.slot);
-                        bytes = bytes.saturating_add(tx.encoded_len());
-                        let _permit = gate.live()?;
-                        let operation = Instant::now();
-                        let id = intake.retain(&tx)?;
-                        raw_seconds += operation.elapsed().as_secs_f64();
-                        count += 1;
-                        let operation = Instant::now();
-                        let processed = intake.process(id, &tx);
-                        output_seconds += operation.elapsed().as_secs_f64();
-                        match processed {
-                            Ok(n) => {
-                                output_successes += 1;
-                                inserted += n;
-                            }
-                            Err(e) => {
-                                event(telemetry, "decode_or_write_failed", e.0);
-                                if e.0.starts_with("storage_") {
-                                    return Err(e);
-                                }
-                                failures += 1;
-                            }
-                        }
-                        if count >= MAX_MESSAGES {
-                            return Ok("message_limit");
-                        }
+                Err(e) => {
+                    event(telemetry, "decode_or_write_failed", e.0);
+                    if e.0.starts_with("storage_") {
+                        storage_error = Some(e);
+                    } else {
+                        failures += 1;
                     }
                 }
             }
-            Err(Error("provider_unavailable"))
-        })
+        }
+        buffer.clear();
+        storage_error.map_or(Ok(()), Err)
+    };
+    let result = runtime.block_on(async {
+        // The grace period lets the loop flush buffered input before the hard stop.
+        tokio::time::timeout(
+            Duration::from_secs(seconds) + Duration::from_secs(5),
+            async {
+                for attempt in 0..=2 {
+                    reconnects = attempt;
+                    event(
+                        telemetry,
+                        "connection_attempt",
+                        if attempt == 0 { "startup" } else { "retry" },
+                    );
+                    let channel =
+                        Endpoint::from_static("https://laserstream-mainnet-ewr.helius-rpc.com")
+                            .connect_timeout(Duration::from_secs(5))
+                            .timeout(Duration::from_secs(10))
+                            .initial_stream_window_size(65536)
+                            .initial_connection_window_size(65536)
+                            .http2_adaptive_window(false)
+                            .buffer_size(1)
+                            .tls_config(ClientTlsConfig::new().with_native_roots())
+                            .map_err(|_| Error("tls_failed"))?
+                            .connect()
+                            .await
+                            .map_err(|_| Error("provider_unavailable"))?;
+                    let auth = token.clone();
+                    let mut client = geyser_client::GeyserClient::with_interceptor(
+                        channel,
+                        move |mut req: Request<()>| {
+                            req.metadata_mut().insert("x-token", auth.clone());
+                            Ok(req)
+                        },
+                    )
+                    .max_decoding_message_size(decoder::MAX_CAPTURE_BYTES)
+                    .max_encoding_message_size(65536);
+                    let replay = client
+                        .subscribe_replay_info(SubscribeReplayInfoRequest {})
+                        .await
+                        .map_err(|_| Error("replay_info_unavailable"))?
+                        .into_inner()
+                        .first_available
+                        .ok_or(Error("replay_info_unavailable"))?;
+                    let reference = client
+                        .get_slot(GetSlotRequest {
+                            commitment: Some(CommitmentLevel::Finalized as i32),
+                        })
+                        .await
+                        .map_err(|_| Error("reference_unavailable"))?
+                        .into_inner()
+                        .slot;
+                    check_replay(from, replay)?;
+                    if reference > i64::MAX as u64 || replay > i64::MAX as u64 {
+                        return Err(Error("unsupported_slot"));
+                    }
+                    intake
+                        .log
+                        .record_reference(run, reference as i64, replay as i64)?;
+                    let (sender, receiver) = tokio::sync::mpsc::channel(1);
+                    sender
+                        .send(request_mint(from, mint))
+                        .await
+                        .map_err(|_| Error("subscription_failed"))?;
+                    let mut stream = client
+                        .subscribe(tokio_stream::wrappers::ReceiverStream::new(receiver))
+                        .await
+                        .map_err(|_| Error("subscription_failed"))?
+                        .into_inner();
+                    loop {
+                        if started.elapsed() >= Duration::from_secs(seconds) {
+                            flush(&mut intake, &mut buffer, telemetry)?;
+                            return Ok("time_limit");
+                        }
+                        let wait = buffered_since.map_or(Duration::from_secs(10), |since| {
+                            BATCH_WINDOW.saturating_sub(since.elapsed())
+                        });
+                        let update = match next_update(&mut stream, wait).await {
+                            Ok(Some(u)) => u,
+                            Err(e) if e.0 == "stream_inactive" && !buffer.is_empty() => {
+                                flush(&mut intake, &mut buffer, telemetry)?;
+                                (buffered_bytes, buffered_since) = (0, None);
+                                continue;
+                            }
+                            Ok(None) => {
+                                flush(&mut intake, &mut buffer, telemetry)?;
+                                (buffered_bytes, buffered_since) = (0, None);
+                                event(telemetry, "connection_ended", "provider_unavailable");
+                                break;
+                            }
+                            Err(e) => {
+                                flush(&mut intake, &mut buffer, telemetry)?;
+                                (buffered_bytes, buffered_since) = (0, None);
+                                event(telemetry, "connection_failed", e.0);
+                                break;
+                            }
+                        };
+                        if matches!(
+                            update.update_oneof,
+                            Some(subscribe_update::UpdateOneof::Ping(_))
+                        ) {
+                            sender
+                                .send(SubscribeRequest {
+                                    ping: Some(SubscribeRequestPing { id: 1 }),
+                                    ..Default::default()
+                                })
+                                .await
+                                .map_err(|_| Error("subscription_failed"))?;
+                        }
+                        if let Some(subscribe_update::UpdateOneof::Transaction(tx)) =
+                            update.update_oneof
+                        {
+                            if tx.slot < from {
+                                return Err(Error("unexpected_slot"));
+                            }
+                            telemetry.slot = Some(tx.slot);
+                            bytes = bytes.saturating_add(tx.encoded_len());
+                            buffered_bytes = buffered_bytes.saturating_add(tx.encoded_len());
+                            buffered_since.get_or_insert_with(Instant::now);
+                            buffer.push(tx);
+                            let full =
+                                buffer.len() >= BATCH_INPUTS || buffered_bytes >= BATCH_BYTES;
+                            accepted += 1;
+                            let last = accepted >= MAX_MESSAGES;
+                            if full || last {
+                                flush(&mut intake, &mut buffer, telemetry)?;
+                                (buffered_bytes, buffered_since) = (0, None);
+                            }
+                            if last {
+                                return Ok("message_limit");
+                            }
+                        }
+                    }
+                }
+                Err(Error("provider_unavailable"))
+            },
+        )
         .await
         .unwrap_or(Ok("time_limit"))
     });
+    drop(flush);
     let status = result.as_ref().map_or_else(|e| e.0, |s| *s);
     {
         let _permit = gate.live()?;
@@ -815,6 +927,50 @@ mod tests {
         assert_eq!(intake.retry().unwrap()["decoded"], 1);
         assert_eq!(Intake::report(path).unwrap()["recent"]["decoded"], 1);
         assert_eq!(Store::query(path, None, 100).unwrap().len(), 1);
+    }
+    #[test]
+    fn batch_progress_commits_only_with_its_output() {
+        let test = TestDatabase::new();
+        let path = &test.0;
+        let mut intake = Intake::open(path).unwrap();
+        let mut other = update();
+        let info = other.transaction.as_mut().unwrap();
+        info.signature = vec![8; 64];
+        info.transaction.as_mut().unwrap().signatures = vec![vec![8; 64]];
+        let mut broken = update();
+        broken.transaction.as_mut().unwrap().meta = None;
+        let status = |test: &TestDatabase| -> Vec<String> {
+            test.sql()
+                .query("SELECT status FROM live_raw ORDER BY id", &[])
+                .unwrap()
+                .iter()
+                .map(|r| r.get(0))
+                .collect()
+        };
+        // Output fails for the whole batch: no input may be acknowledged.
+        test.sql().batch_execute("CREATE FUNCTION fail() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RAISE EXCEPTION 'injected'; END$$; CREATE TRIGGER fail_transfers BEFORE INSERT ON transfers FOR EACH ROW EXECUTE FUNCTION fail();").unwrap();
+        let batch = [update(), broken.clone(), other.clone()];
+        let ids = intake.retain_batch(&batch).unwrap();
+        let inputs: Vec<_> = ids.iter().copied().zip(batch.iter()).collect();
+        let results = intake.process_batch(&inputs);
+        assert_eq!(results[0], Err(Error("storage_write_failed")));
+        assert_eq!(results[2], Err(Error("storage_write_failed")));
+        assert!(Store::query(path, None, 100).unwrap().is_empty());
+        assert!(status(&test).iter().all(|s| s != "decoded"));
+        test.sql()
+            .batch_execute("DROP TRIGGER fail_transfers ON transfers;")
+            .unwrap();
+        // The same retained rows succeed together; the broken one stays retryable.
+        let results = intake.process_batch(&inputs);
+        assert_eq!(results[0], Ok(1));
+        assert_eq!(results[1], Err(Error("missing_execution_metadata")));
+        assert_eq!(results[2], Ok(1));
+        assert_eq!(
+            status(&test),
+            ["decoded", "missing_execution_metadata", "decoded"]
+        );
+        assert_eq!(Intake::report(path).unwrap()["unresolved_items"], 1);
+        assert_eq!(Store::query(path, None, 100).unwrap().len(), 2);
     }
     #[tokio::test(flavor = "current_thread")]
     async fn transport_end_failure_and_inactivity_are_distinct() {

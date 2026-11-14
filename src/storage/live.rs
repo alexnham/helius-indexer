@@ -37,24 +37,26 @@ impl LiveLog {
         Ok(Self(RefCell::new(db.connect()?)))
     }
 
-    pub(crate) fn retain(&self, slot: i64, protobuf: &[u8]) -> Result<i64> {
-        Ok(self
+    /// Retains many wire payloads with one statement; ids return in input order.
+    pub(crate) fn retain_batch(&self, rows: &[(i64, Vec<u8>)]) -> Result<Vec<i64>> {
+        let slots: Vec<i64> = rows.iter().map(|r| r.0).collect();
+        let payloads: Vec<&[u8]> = rows.iter().map(|r| r.1.as_slice()).collect();
+        let mut ids: Vec<i64> = self
             .0
             .borrow_mut()
-            .query_one(
-                "INSERT INTO live_raw(slot,protobuf,status,received_at) VALUES($1,$2,'pending',$3) RETURNING id",
-                &[&slot, &protobuf, &now()],
+            .query(
+                "INSERT INTO live_raw(slot,protobuf,status,received_at)
+                 SELECT s,p,'pending',$3 FROM unnest($1::bigint[],$2::bytea[]) WITH ORDINALITY AS u(s,p,n) ORDER BY n
+                 RETURNING id",
+                &[&slots, &payloads, &now()],
             )
             .map_err(write_failed)?
-            .get(0))
-    }
-
-    pub(crate) fn set_status(&self, id: i64, status: &str) -> Result<()> {
-        self.0
-            .borrow_mut()
-            .execute("UPDATE live_raw SET status=$1 WHERE id=$2", &[&status, &id])
-            .map_err(write_failed)?;
-        Ok(())
+            .iter()
+            .map(|r| r.get(0))
+            .collect();
+        // Identity values follow insertion order, which follows the ordinality.
+        ids.sort_unstable();
+        Ok(ids)
     }
 
     pub(crate) fn retry_cursor(&self) -> Result<i64> {
