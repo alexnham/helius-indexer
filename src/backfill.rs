@@ -247,7 +247,6 @@ impl Metrics {
             "indexer_historical_cached_blocks_total {}\n",
             self.cached_blocks
         ));
-        output.push_str(&self.storage.prometheus("historical"));
         let mut prior_pending = false;
         let mut missing_ranges = 0;
         for slot in &coverage.slots {
@@ -257,7 +256,13 @@ impl Metrics {
             }
             prior_pending = pending;
         }
-        output.push_str(&format!("indexer_missing_ranges{{mode=\"historical\"}} {missing_ranges}\nindexer_stage_duration_seconds_sum{{operation=\"historical_range\"}} {}\nindexer_stage_duration_seconds_count{{operation=\"historical_range\"}} 1\nindexer_stage_duration_seconds_bucket{{operation=\"historical_range\",le=\"+Inf\"}} 1\n",self.elapsed_seconds));
+        output.push_str(&format!(
+            "indexer_missing_ranges{{mode=\"historical\"}} {missing_ranges}\n"
+        ));
+        output.push_str(&self.storage.counter_lines("historical"));
+        // One metric family must be contiguous for strict text-format parsers.
+        output.push_str(&self.storage.duration_lines("historical"));
+        output.push_str(&format!("indexer_stage_duration_seconds_bucket{{operation=\"historical_range\",mode=\"historical\",le=\"+Inf\"}} 1\nindexer_stage_duration_seconds_sum{{operation=\"historical_range\",mode=\"historical\"}} {}\nindexer_stage_duration_seconds_count{{operation=\"historical_range\",mode=\"historical\"}} 1\n",self.elapsed_seconds));
         if self.archive_input {
             output = output.replace("source_kind=\"rpc\"", "source_kind=\"archive\"");
         }

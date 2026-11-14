@@ -1139,7 +1139,7 @@ fn write_stats_count_writes_transfers_failures_and_latency_buckets() {
     );
     let stats = store.stats();
     assert_eq!((stats.writes, stats.failed_writes), (3, 1));
-    let text = stats.prometheus("historical");
+    let text = stats.duration_lines("historical") + &stats.counter_lines("historical");
     assert!(text.contains(
         "indexer_stage_duration_seconds_count{operation=\"transfer_write\",mode=\"historical\"} 3"
     ));

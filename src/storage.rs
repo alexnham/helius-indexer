@@ -35,8 +35,9 @@ pub struct WriteStats {
 pub const WRITE_BUCKETS: [f64; 5] = [0.001, 0.01, 0.1, 1.0, 10.0];
 
 impl WriteStats {
-    /// Prometheus lines for this store's writes; labels are bounded by `mode`.
-    pub fn prometheus(&self, mode: &str) -> String {
+    /// `indexer_stage_duration_seconds` samples for transfer writes; callers keep the
+    /// family contiguous with their own samples. Labels are bounded by `mode`.
+    pub fn duration_lines(&self, mode: &str) -> String {
         let mut out = String::new();
         for (bound, count) in WRITE_BUCKETS.iter().zip(self.buckets) {
             out.push_str(&format!(
@@ -44,13 +45,18 @@ impl WriteStats {
             ));
         }
         out.push_str(&format!(
-            "indexer_stage_duration_seconds_bucket{{operation=\"transfer_write\",mode=\"{mode}\",le=\"+Inf\"}} {writes}\nindexer_stage_duration_seconds_sum{{operation=\"transfer_write\",mode=\"{mode}\"}} {}\nindexer_stage_duration_seconds_count{{operation=\"transfer_write\",mode=\"{mode}\"}} {writes}\nindexer_storage_write_failures_total{{mode=\"{mode}\"}} {}\nindexer_storage_transfers_written_total{{mode=\"{mode}\"}} {}\n",
+            "indexer_stage_duration_seconds_bucket{{operation=\"transfer_write\",mode=\"{mode}\",le=\"+Inf\"}} {writes}\nindexer_stage_duration_seconds_sum{{operation=\"transfer_write\",mode=\"{mode}\"}} {}\nindexer_stage_duration_seconds_count{{operation=\"transfer_write\",mode=\"{mode}\"}} {writes}\n",
             self.seconds,
-            self.failed_writes,
-            self.transfers_written,
             writes = self.writes,
         ));
         out
+    }
+
+    pub fn counter_lines(&self, mode: &str) -> String {
+        format!(
+            "indexer_storage_write_failures_total{{mode=\"{mode}\"}} {}\nindexer_storage_transfers_written_total{{mode=\"{mode}\"}} {}\n",
+            self.failed_writes, self.transfers_written
+        )
     }
 }
 
