@@ -79,7 +79,7 @@ fn expected_columns(rows: &[Transfer]) -> Columns {
 }
 
 #[test]
-fn migration_0006_backfills_block_time_and_exact_amounts_on_existing_rows() {
+fn migration_0008_backfills_block_time_and_exact_amounts_on_existing_rows() {
     let db = pg::TestDatabase::new();
     let mut sql = db.sql();
     migrate(&mut sql, &pg::MIGRATIONS[..5]).unwrap();
@@ -116,7 +116,10 @@ fn migration_0006_backfills_block_time_and_exact_amounts_on_existing_rows() {
         )
         .unwrap();
     }
-    assert_eq!(migrate(&mut sql, MIGRATIONS).unwrap(), 6);
+    assert_eq!(
+        migrate(&mut sql, MIGRATIONS).unwrap(),
+        MIGRATIONS.len() as i32
+    );
     assert_eq!(
         columns(&db.0),
         expected_columns(&[known.clone(), unknown.clone()])

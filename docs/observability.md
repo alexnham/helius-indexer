@@ -153,6 +153,16 @@ source/storage time, and is not a benchmark. Failed candidates are retained in
 historical raw blocks with scoped durable error/retry state. Snapshot counters
 are attempts; replay does not imply new unique query results.
 
+Range progress uses the gauges `indexer_historical_range_slots_requested`,
+`indexer_historical_range_slots_completed` (complete or skipped), and
+`indexer_historical_range_first_slot`/`last_slot`; the coverage JSON carries the
+same values as `progress`. `historical_range_completed` is emitted once per
+invocation, only when the re-read coverage of the whole requested range is complete
+and the run was not cancelled. It carries `mint`, `slot_start`, `slot_end` and the
+decoder version. The mint is the filter-set identity; no separate filter-set
+revision exists yet. The per-slot `durable_range_completed` event remains and means
+only that one slot's status was acknowledged.
+
 ## Bounded live slice status
 
 The opt-in LaserStream command now emits connection/retry/end/failure events and
@@ -366,6 +376,24 @@ transaction/input-byte/write diagnostics with mode `historical` for replay.
 component with bounded failure classes. Retrying retained input makes no provider
 request. Telemetry writes remain best-effort and cannot undo durable input/output.
 No mint/slot/signature metric labels are added.
+
+Source routing (#31) appends a revision per measurement. The report's `routing`
+block shows the latest revision, measurement age, replay first-available and
+finalized reference, whether the archive was probed and its last available slot
+or failure class, and the routed segments (`archive`, `replay`, `overlap`,
+`uncovered`) marked `routed_not_processed`. Unknown availability appears as null
+and routes to `uncovered`. Each measurement emits `route_measured` with outcome
+`incomplete` when any segment is uncovered, plus revision, whether the archive was
+probed and the uncovered segment count; a failed replay measurement emits it with
+outcome `failed` and records no revision.
+
+Each archive batch emits `archive_attempt_finished` (component `replay_archive`) with
+outcome `success`, `incomplete`, `cancelled` or the error class, and the observed
+requests, response bytes and cached chunks. The status `archive` block reports
+attempts and response bytes by status, remaining batches and per-segment pending
+slots with oldest pending age; `archive_budget_granted` records an explicit grant.
+These are JSON inspection snapshots like the replay report, with no job, mint or
+slot metric labels.
 
 The console shows remaining budgets, processing versus raw retention and unknown
 coverage, alongside live reports and actual query output. Current JSON snapshots

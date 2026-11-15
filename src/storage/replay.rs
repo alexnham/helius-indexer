@@ -9,6 +9,10 @@ pub const SECONDS_PER_GRANT: i64 = 60;
 pub const MESSAGES_PER_GRANT: i64 = 10_000;
 pub const BYTES_PER_GRANT: i64 = 64 * 1024 * 1024;
 pub const CONNECTIONS_PER_GRANT: i64 = 3;
+/// Archive batches per archive grant; at most 64 grants, so 256 batches per job.
+pub const ARCHIVE_BATCHES_PER_GRANT: i64 = 4;
+/// Ceilings one archive batch runs under: requests, response bytes, seconds.
+pub const ARCHIVE_BATCH_LIMITS: (i64, i64, i64) = (32, 128 * 1024 * 1024, 120);
 
 pub(crate) fn valid_id(id: &str) -> Result<()> {
     if id.is_empty()
@@ -28,6 +32,19 @@ pub struct Scope {
     pub mint: String,
     pub start: u64,
     pub end: u64,
+}
+
+/// Routed (start, end, kind) segments of one revision.
+pub type RouteSegments = Vec<(u64, u64, String)>;
+
+/// One measurement of where each slot of a job may come from.
+pub struct Route {
+    pub replay_first: Option<u64>,
+    pub reference: u64,
+    pub archive_probed: bool,
+    pub archive_last: Option<u64>,
+    pub archive_error: Option<&'static str>,
+    pub segments: Vec<(u64, u64, &'static str)>,
 }
 
 pub struct Pending {
@@ -153,6 +170,34 @@ impl JobLog {
         let failures:Vec<Value>=tx.query("SELECT status,COUNT(*) FROM replay_receipts WHERE job=$1 AND status NOT IN ('pending','decoded') GROUP BY status ORDER BY status LIMIT 16", &[&id]).map_err(read_failed)?.into_iter().map(|r|json!({"error_class":r.get::<_,String>(0),"inputs":r.get::<_,i64>(1)})).collect();
         let oldest:Option<i64>=tx.query_one("SELECT MIN(first_received) FROM replay_receipts WHERE job=$1 AND status<>'decoded'", &[&id]).map_err(read_failed)?.get(0);
         let retained:i64=tx.query_one("SELECT COUNT(*) FROM transfers t WHERE mint=$1 AND slot BETWEEN $2 AND $3 AND NOT EXISTS(SELECT 1 FROM decoder_repairs r WHERE r.signature=t.signature AND r.status='unresolved')", &[&r.get::<_,String>(0),&r.get::<_,i64>(1),&r.get::<_,i64>(2)]).map_err(read_failed)?.get(0);
+        let routing = match tx.query_opt("SELECT revision,observed_at,replay_first,reference_slot,archive_probed,archive_last,archive_error FROM replay_routes WHERE job=$1 ORDER BY revision DESC LIMIT 1", &[&id]).map_err(read_failed)? {
+            None => Value::Null,
+            Some(route) => {
+                let revision: i64 = route.get(0);
+                let segments: Vec<Value> = tx.query("SELECT start_slot,end_slot,kind FROM replay_route_segments WHERE job=$1 AND revision=$2 ORDER BY start_slot", &[&id,&revision]).map_err(read_failed)?.into_iter()
+                    .map(|s| json!({"start":s.get::<_,i64>(0),"end":s.get::<_,i64>(1),"kind":s.get::<_,String>(2)})).collect();
+                let observed: i64 = route.get(1);
+                json!({"revision":revision,"observed_at":observed,"measurement_age_seconds":now().checked_sub(observed).filter(|n|*n>=0),
+                    "replay_first_available":route.get::<_,Option<i64>>(2),"reference_slot":route.get::<_,i64>(3),
+                    "archive":{"probed":route.get::<_,bool>(4),"last_available":route.get::<_,Option<i64>>(5),"error_class":route.get::<_,Option<String>>(6)},
+                    "segments":segments,"state":"routed_not_processed"})
+            }
+        };
+        let archive_row = tx
+            .query_one(
+                "SELECT archive_grants,archive_batches_charged FROM replay_jobs WHERE id=$1",
+                &[&id],
+            )
+            .map_err(read_failed)?;
+        let archive_attempts: Vec<Value> = tx.query("SELECT id,route_revision,start_slot,end_slot,started_at,status,request_limit,byte_limit,second_limit,requests,response_bytes,cached_chunks FROM archive_attempts WHERE job=$1 ORDER BY id DESC LIMIT 20", &[&id]).map_err(read_failed)?.into_iter()
+            .map(|a| json!({"attempt":a.get::<_,i64>(0),"route_revision":a.get::<_,i64>(1),"start":a.get::<_,i64>(2),"end":a.get::<_,i64>(3),"started_at":a.get::<_,i64>(4),"status":a.get::<_,String>(5),
+                "limits":{"requests":a.get::<_,i64>(6),"response_bytes":a.get::<_,i64>(7),"seconds":a.get::<_,i64>(8)},
+                "observed":{"requests":a.get::<_,Option<i64>>(9),"response_bytes":a.get::<_,Option<i64>>(10),"cached_chunks":a.get::<_,Option<i64>>(11)}})).collect();
+        let archive_by_status: serde_json::Map<String, Value> = tx.query("SELECT status,COUNT(*),COALESCE(SUM(response_bytes),0)::BIGINT FROM archive_attempts WHERE job=$1 GROUP BY status ORDER BY status LIMIT 16", &[&id]).map_err(read_failed)?.into_iter()
+            .map(|r| (r.get::<_,String>(0), json!({"attempts":r.get::<_,i64>(1),"response_bytes":r.get::<_,i64>(2)}))).collect();
+        let (archive_grants, archive_charged): (i64, i64) =
+            (archive_row.get(0), archive_row.get(1));
+        let archive = json!({"grants":archive_grants,"batches_charged":archive_charged,"batches_remaining":archive_grants*ARCHIVE_BATCHES_PER_GRANT-archive_charged,"by_status":archive_by_status,"attempts":archive_attempts});
         tx.commit().map_err(read_failed)?;
         let (grants, seconds, connections, messages, bytes): (i64, i64, i64, i64, i64) =
             (r.get(5), r.get(6), r.get(7), r.get(8), r.get(9));
@@ -169,10 +214,122 @@ impl JobLog {
         };
         Ok(
             json!({"job":id,"state":state,"pending_age_seconds":now().checked_sub(r.get::<_,i64>(4)).filter(|n|*n>=0),"oldest_unresolved_age_seconds":if receipts.get::<_,i64>(2)==0 {Some(0)}else{oldest.and_then(|t|now().checked_sub(t)).filter(|n|*n>=0)},"failures":failures,"retained":{"transfer_count":retained,"coverage":"unknown"},"mint":r.get::<_,String>(0),"start":r.get::<_,i64>(1),"end":r.get::<_,i64>(2),"decoder_version":r.get::<_,String>(3),"created_at":r.get::<_,i64>(4),
-            "coverage":"unknown","verified_boundary":null,"resume_from":r.get::<_,i64>(1),"pending_interval":{"start":r.get::<_,i64>(1),"end":r.get::<_,i64>(2),"kind":"unverified"},"attempts":attempts,"reason":"filtered_replay_has_no_validated_slot_completion_evidence",
+            "coverage":"unknown","verified_boundary":null,"resume_from":r.get::<_,i64>(1),"pending_interval":{"start":r.get::<_,i64>(1),"end":r.get::<_,i64>(2),"kind":"unverified"},"attempts":attempts,"routing":routing,"archive":archive,"reason":"filtered_replay_has_no_validated_slot_completion_evidence",
             "receipts":{"unique_inputs":receipts.get::<_,i64>(0),"decoded":receipts.get::<_,i64>(1),"unresolved":receipts.get::<_,i64>(2),"raw_still_retained":receipts.get::<_,i64>(3)},
             "budget":{"grants":grants,"seconds_charged":seconds,"seconds_remaining":grants*SECONDS_PER_GRANT-seconds,"connections_used":connections,"connections_remaining":grants*CONNECTIONS_PER_GRANT-connections,"messages_used":messages,"messages_remaining":grants*MESSAGES_PER_GRANT-messages,"bytes_used":bytes,"bytes_remaining":grants*BYTES_PER_GRANT-bytes}}),
         )
+    }
+
+    /// Append the next routing revision; earlier revisions and their segments stay.
+    pub fn record_route(&mut self, id: &str, route: &Route) -> Result<i64> {
+        valid_id(id)?;
+        let slot = |n: u64| i64::try_from(n).map_err(|_| Error("unsupported_slot"));
+        let opt = |n: Option<u64>| n.map(slot).transpose();
+        let mut tx = self.0.transaction().map_err(write_failed)?;
+        // Serialize revisions per job; the row lock lasts until commit.
+        tx.query_opt("SELECT 1 FROM replay_jobs WHERE id=$1 FOR UPDATE", &[&id])
+            .map_err(write_failed)?
+            .ok_or(Error("replay_job_missing"))?;
+        let revision: i64 = tx
+            .query_one(
+                "SELECT COALESCE(MAX(revision),0)+1 FROM replay_routes WHERE job=$1",
+                &[&id],
+            )
+            .map_err(read_failed)?
+            .get(0);
+        tx.execute(
+            "INSERT INTO replay_routes VALUES($1,$2,$3,$4,$5,$6,$7,$8)",
+            &[
+                &id,
+                &revision,
+                &now(),
+                &opt(route.replay_first)?,
+                &slot(route.reference)?,
+                &route.archive_probed,
+                &opt(route.archive_last)?,
+                &route.archive_error,
+            ],
+        )
+        .map_err(write_failed)?;
+        for (start, end, kind) in &route.segments {
+            tx.execute(
+                "INSERT INTO replay_route_segments VALUES($1,$2,$3,$4,$5)",
+                &[&id, &revision, &slot(*start)?, &slot(*end)?, kind],
+            )
+            .map_err(write_failed)?;
+        }
+        tx.commit().map_err(write_failed)?;
+        Ok(revision)
+    }
+
+    /// Latest routing revision and its segments, if the job was ever routed.
+    pub fn latest_route(&mut self, id: &str) -> Result<Option<(i64, RouteSegments)>> {
+        valid_id(id)?;
+        let Some(revision) = self
+            .0
+            .query_one(
+                "SELECT MAX(revision) FROM replay_routes WHERE job=$1",
+                &[&id],
+            )
+            .map_err(read_failed)?
+            .get::<_, Option<i64>>(0)
+        else {
+            return Ok(None);
+        };
+        let segments = self.0.query("SELECT start_slot,end_slot,kind FROM replay_route_segments WHERE job=$1 AND revision=$2 ORDER BY start_slot", &[&id, &revision])
+            .map_err(read_failed)?
+            .into_iter()
+            .map(|r| (r.get::<_, i64>(0) as u64, r.get::<_, i64>(1) as u64, r.get(2)))
+            .collect();
+        Ok(Some((revision, segments)))
+    }
+
+    /// Explicit archive refill; replay grants never replenish archive work.
+    pub fn archive_grant(&mut self, id: &str) -> Result<()> {
+        valid_id(id)?;
+        let n = self
+            .0
+            .execute(
+                "UPDATE replay_jobs SET archive_grants=archive_grants+1 WHERE id=$1 AND archive_grants<64 AND decoder=$2",
+                &[&id, &DECODER_VERSION],
+            )
+            .map_err(write_failed)?;
+        if n != 1 {
+            return Err(Error("archive_grant_rejected"));
+        }
+        Ok(())
+    }
+
+    /// Charge one whole archive batch before any cache or network work. The
+    /// connection holding the advisory lock owns the attempt until it closes.
+    pub fn archive_reserve(
+        database: &Database,
+        id: &str,
+        revision: i64,
+        start: u64,
+        end: u64,
+    ) -> Result<ArchiveReservation> {
+        valid_id(id)?;
+        let mut client = database.connect()?;
+        let locked: bool = client.query_one("SELECT pg_try_advisory_lock(hashtextextended(current_schema() || ':archive:' || $1,0))", &[&id]).map_err(write_failed)?.get(0);
+        if !locked {
+            return Err(Error("archive_job_busy"));
+        }
+        let mut tx = client.transaction().map_err(write_failed)?;
+        let n = tx.execute("UPDATE replay_jobs SET archive_batches_charged=archive_batches_charged+1 WHERE id=$1 AND decoder=$2 AND archive_batches_charged<archive_grants*$3", &[&id, &DECODER_VERSION, &ARCHIVE_BATCHES_PER_GRANT]).map_err(write_failed)?;
+        if n != 1 {
+            return Err(Error("archive_budget_exhausted"));
+        }
+        tx.execute(
+            "UPDATE archive_attempts SET status='interrupted' WHERE job=$1 AND status='running'",
+            &[&id],
+        )
+        .map_err(write_failed)?;
+        let (requests, bytes, seconds) = ARCHIVE_BATCH_LIMITS;
+        let attempt: i64 = tx.query_one("INSERT INTO archive_attempts(job,route_revision,start_slot,end_slot,started_at,status,request_limit,byte_limit,second_limit) VALUES($1,$2,$3,$4,$5,'running',$6,$7,$8) RETURNING id",
+            &[&id, &revision, &(start as i64), &(end as i64), &now(), &requests, &bytes, &seconds]).map_err(write_failed)?.get(0);
+        tx.commit().map_err(write_failed)?;
+        Ok(ArchiveReservation { client, attempt })
     }
 
     /// Explicit refill; ordinary restart never replenishes a consumed allowance.
@@ -227,6 +384,20 @@ pub struct Reservation {
     client: Client,
     job: String,
     pub attempt: i64,
+}
+
+pub struct ArchiveReservation {
+    client: Client,
+    pub attempt: i64,
+}
+impl ArchiveReservation {
+    /// Observed (requests, response bytes, cached chunks); dropping releases the lock.
+    pub fn finish(mut self, status: &str, observed: (u64, u64, u64)) -> Result<()> {
+        let n = |v: u64| i64::try_from(v).map_err(|_| Error("stored_record_invalid"));
+        self.client.execute("UPDATE archive_attempts SET status=$1,requests=$2,response_bytes=$3,cached_chunks=$4 WHERE id=$5",
+            &[&status, &n(observed.0)?, &n(observed.1)?, &n(observed.2)?, &self.attempt]).map_err(write_failed)?;
+        Ok(())
+    }
 }
 
 pub enum Retained {

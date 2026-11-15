@@ -358,11 +358,7 @@ fn run_intake(
         if historical { "historical" } else { "live" },
     );
     validate_options(from, seconds)?;
-    let api_key = std::env::var("HELIUS_API_KEY").map_err(|_| Error("missing_live_credentials"))?;
-    // Fixed canonical mainnet endpoint prevents credential-bearing URLs entering diagnostics/config.
-    let token: tonic::metadata::MetadataValue<_> = api_key
-        .parse()
-        .map_err(|_| Error("invalid_live_credentials"))?;
+    let token = Token::from_env()?;
     let mut intake = {
         let _permit = admit()?;
         Intake::open(database)?
@@ -410,48 +406,8 @@ fn run_intake(
                 let _permit = admit()?;
                 job.reservation.connection()?;
             }
-            let channel = network(&runtime, deadline, async {
-                Endpoint::from_static("https://laserstream-mainnet-ewr.helius-rpc.com")
-                    .connect_timeout(Duration::from_secs(5))
-                    .timeout(Duration::from_secs(10))
-                    .initial_stream_window_size(65536)
-                    .initial_connection_window_size(65536)
-                    .http2_adaptive_window(false)
-                    .buffer_size(1)
-                    .tls_config(ClientTlsConfig::new().with_native_roots())
-                    .map_err(|_| Error("tls_failed"))?
-                    .connect()
-                    .await
-                    .map_err(|_| Error("provider_unavailable"))
-            })?;
-            let auth = token.clone();
-            let mut client = geyser_client::GeyserClient::with_interceptor(
-                channel,
-                move |mut req: Request<()>| {
-                    req.metadata_mut().insert("x-token", auth.clone());
-                    Ok(req)
-                },
-            )
-            .max_decoding_message_size(decoder::MAX_CAPTURE_BYTES)
-            .max_encoding_message_size(65536);
-            let first_available = network(&runtime, deadline, async {
-                Ok(client
-                    .subscribe_replay_info(SubscribeReplayInfoRequest {})
-                    .await
-                    .map_err(|_| Error("replay_info_unavailable"))?
-                    .into_inner()
-                    .first_available)
-            })?;
-            let reference = network(&runtime, deadline, async {
-                Ok(client
-                    .get_slot(GetSlotRequest {
-                        commitment: Some(CommitmentLevel::Finalized as i32),
-                    })
-                    .await
-                    .map_err(|_| Error("reference_unavailable"))?
-                    .into_inner()
-                    .slot)
-            })?;
+            let mut client = connect(&runtime, deadline, &token)?;
+            let (first_available, reference) = availability(&runtime, deadline, &mut client)?;
             {
                 let _permit = admit()?;
                 if let Some(job) = replay.as_mut() {
@@ -804,9 +760,87 @@ fn live_producer() -> Result<Option<crate::kafka::IntakeProducer>> {
     }
 }
 
+/// Helius credential sent as `x-token`; loaded from the environment only.
+#[derive(Clone)]
+pub(crate) struct Token(tonic::metadata::MetadataValue<tonic::metadata::Ascii>);
+impl Token {
+    pub(crate) fn from_env() -> Result<Self> {
+        let api_key =
+            std::env::var("HELIUS_API_KEY").map_err(|_| Error("missing_live_credentials"))?;
+        Ok(Self(
+            api_key
+                .parse()
+                .map_err(|_| Error("invalid_live_credentials"))?,
+        ))
+    }
+}
+impl tonic::service::Interceptor for Token {
+    fn call(&mut self, mut req: Request<()>) -> std::result::Result<Request<()>, tonic::Status> {
+        req.metadata_mut().insert("x-token", self.0.clone());
+        Ok(req)
+    }
+}
+pub(crate) type Client = geyser_client::GeyserClient<
+    tonic::service::interceptor::InterceptedService<tonic::transport::Channel, Token>,
+>;
+
+pub(crate) fn connect(
+    runtime: &tokio::runtime::Runtime,
+    deadline: Instant,
+    token: &Token,
+) -> Result<Client> {
+    // Fixed canonical mainnet endpoint prevents credential-bearing URLs entering diagnostics/config.
+    let channel = network(runtime, deadline, async {
+        Endpoint::from_static("https://laserstream-mainnet-ewr.helius-rpc.com")
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(10))
+            .initial_stream_window_size(65536)
+            .initial_connection_window_size(65536)
+            .http2_adaptive_window(false)
+            .buffer_size(1)
+            .tls_config(ClientTlsConfig::new().with_native_roots())
+            .map_err(|_| Error("tls_failed"))?
+            .connect()
+            .await
+            .map_err(|_| Error("provider_unavailable"))
+    })?;
+    Ok(
+        geyser_client::GeyserClient::with_interceptor(channel, token.clone())
+            .max_decoding_message_size(decoder::MAX_CAPTURE_BYTES)
+            .max_encoding_message_size(65536),
+    )
+}
+
+/// Actual earliest replayable slot (None means unavailable, not zero) and the finalized reference.
+pub(crate) fn availability(
+    runtime: &tokio::runtime::Runtime,
+    deadline: Instant,
+    client: &mut Client,
+) -> Result<(Option<u64>, u64)> {
+    let first_available = network(runtime, deadline, async {
+        Ok(client
+            .subscribe_replay_info(SubscribeReplayInfoRequest {})
+            .await
+            .map_err(|_| Error("replay_info_unavailable"))?
+            .into_inner()
+            .first_available)
+    })?;
+    let reference = network(runtime, deadline, async {
+        Ok(client
+            .get_slot(GetSlotRequest {
+                commitment: Some(CommitmentLevel::Finalized as i32),
+            })
+            .await
+            .map_err(|_| Error("reference_unavailable"))?
+            .into_inner()
+            .slot)
+    })?;
+    Ok((first_available, reference))
+}
+
 /// Drive only network futures here. Synchronous PostgreSQL operations run after
 /// block_on returns, outside Tokio's enter guard (the postgres client owns a runtime).
-fn network<T>(
+pub(crate) fn network<T>(
     runtime: &tokio::runtime::Runtime,
     deadline: Instant,
     future: impl std::future::Future<Output = Result<T>>,
