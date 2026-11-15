@@ -21,7 +21,7 @@ pub const USDC: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 const MAX_MESSAGES: usize = 10_000;
 /// A live batch flushes at this many inputs, bytes or age, whichever comes first.
 pub(crate) const BATCH_INPUTS: usize = 100;
-const BATCH_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const BATCH_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const BATCH_WINDOW: Duration = Duration::from_millis(200);
 pub(crate) const PROTO_SCHEMA: &str = "laserstream-core-proto/14.0.0";
 const RECENT_SECONDS: i64 = 60;
