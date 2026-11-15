@@ -18,6 +18,19 @@ pub const PARTITIONS: i32 = 6;
 pub const RETENTION_MS: i64 = 37 * 24 * 60 * 60 * 1000;
 /// Matches the decoder's capture bound; larger inputs become retained errors, never drops.
 pub const MAX_MESSAGE_BYTES: usize = crate::decoder::MAX_CAPTURE_BYTES;
+/// Producer queue bounds: when either is full, `send` waits, which stalls the stream.
+const PRODUCER_QUEUE_MESSAGES: usize = 10_000;
+const PRODUCER_QUEUE_KBYTES: usize = 64 * 1024;
+/// An undelivered message fails after this long and stops intake behind the cursor.
+const DELIVERY_TIMEOUT: Duration = Duration::from_secs(120);
+/// Consumer prefetch bound (librdkafka may overshoot it by one fetch per partition).
+/// It must hold at least one maximum-size message.
+const PREFETCH_KBYTES: usize = 32 * 1024;
+/// Per partition; the byte bound is for the whole consumer.
+const PREFETCH_MESSAGES: usize = 1_000;
+/// A storage write blocked longer than this loses the consumer's partitions; positions
+/// stored with the output keep the next owner correct.
+const MAX_POLL_INTERVAL: Duration = Duration::from_secs(300);
 
 /// A crashed consumer keeps its partitions until this expires. Heartbeats come from
 /// librdkafka's own thread, so a blocked storage write does not trigger it.
@@ -79,13 +92,21 @@ pub struct IntakeProducer {
 
 impl IntakeProducer {
     pub fn new(brokers: &str, topic: &str) -> Result<Self> {
+        Self::bounded(brokers, topic, PRODUCER_QUEUE_MESSAGES, DELIVERY_TIMEOUT)
+    }
+
+    fn bounded(brokers: &str, topic: &str, queue: usize, timeout: Duration) -> Result<Self> {
         require_loopback(brokers)?;
         let producer = config(brokers)
             .set("enable.idempotence", "true")
             .set("acks", "all")
             .set("linger.ms", "20")
-            // Bounded local queue: a full queue applies backpressure to the stream.
-            .set("queue.buffering.max.messages", "10000")
+            .set("queue.buffering.max.messages", queue.to_string())
+            .set(
+                "queue.buffering.max.kbytes",
+                PRODUCER_QUEUE_KBYTES.to_string(),
+            )
+            .set("message.timeout.ms", timeout.as_millis().to_string())
             .create_with_context(Deliveries::default())
             .map_err(|_| Error("kafka_unavailable"))?;
         Ok(Self {
@@ -124,6 +145,16 @@ impl IntakeProducer {
                 Err((KafkaError::MessageProduction(RDKafkaErrorCode::QueueFull), back)) => {
                     record = back;
                     self.producer.poll(Duration::from_millis(100));
+                    // A full queue frees only by delivery or timeout; a timeout ends the wait.
+                    let failed = self
+                        .producer
+                        .context()
+                        .0
+                        .lock()
+                        .map_or(true, |reports| reports.iter().any(|(_, ok)| !ok));
+                    if failed {
+                        return Err(Error("kafka_delivery_failed"));
+                    }
                 }
                 Err(_) => return Err(Error("kafka_produce_failed")),
             }
@@ -261,9 +292,22 @@ struct Positions {
     topic: String,
     revoked: std::sync::atomic::AtomicBool,
     failed: std::sync::Mutex<Option<Error>>,
+    /// Largest prefetched byte count librdkafka reported, summed over partitions.
+    prefetch_peak: std::sync::atomic::AtomicU64,
 }
 
-impl ClientContext for Positions {}
+impl ClientContext for Positions {
+    fn stats(&self, statistics: rdkafka::Statistics) {
+        let queued: u64 = statistics
+            .topics
+            .values()
+            .flat_map(|t| t.partitions.values())
+            .map(|p| p.fetchq_size)
+            .sum();
+        self.prefetch_peak
+            .fetch_max(queued, std::sync::atomic::Ordering::Relaxed);
+    }
+}
 
 impl rdkafka::consumer::ConsumerContext for Positions {
     fn rebalance(
@@ -323,7 +367,7 @@ pub fn consume(
     topic: &str,
     seconds: u64,
 ) -> Result<serde_json::Value> {
-    use crate::live::{BATCH_INPUTS, BATCH_WINDOW};
+    use crate::live::{BATCH_BYTES, BATCH_INPUTS, BATCH_WINDOW};
     use rdkafka::consumer::{BaseConsumer, Consumer};
     require_loopback(brokers)?;
     ensure_topic(brokers, topic, PARTITIONS)?;
@@ -333,6 +377,14 @@ pub fn consume(
         .set("enable.auto.commit", "false")
         .set("enable.auto.offset.store", "false")
         .set("auto.offset.reset", "earliest")
+        // A blocked storage write stops polling; librdkafka then stops fetching at these bounds.
+        .set("queued.max.messages.kbytes", PREFETCH_KBYTES.to_string())
+        .set("queued.min.messages", PREFETCH_MESSAGES.to_string())
+        .set(
+            "max.poll.interval.ms",
+            MAX_POLL_INTERVAL.as_millis().to_string(),
+        )
+        .set("statistics.interval.ms", "1000")
         .set(
             "session.timeout.ms",
             SESSION_TIMEOUT.as_millis().to_string(),
@@ -343,6 +395,7 @@ pub fn consume(
             topic: topic.into(),
             revoked: Default::default(),
             failed: Default::default(),
+            prefetch_peak: Default::default(),
         })
         .map_err(|_| Error("kafka_unavailable"))?;
     consumer
@@ -354,6 +407,7 @@ pub fn consume(
     telemetry.set_context("kafka_consumer", "kafka", "live");
     let deadline = std::time::Instant::now() + Duration::from_secs(seconds);
     let mut buffer: Vec<rdkafka::message::OwnedMessage> = Vec::new();
+    let mut buffered_bytes = 0;
     let mut since: Option<std::time::Instant> = None;
     let mut totals = Totals::default();
     loop {
@@ -368,12 +422,15 @@ pub fn consume(
         }
         let now = std::time::Instant::now();
         let done = now >= deadline;
-        let due =
-            since.is_some_and(|s| s.elapsed() >= BATCH_WINDOW) || buffer.len() >= BATCH_INPUTS;
+        let due = since.is_some_and(|s| s.elapsed() >= BATCH_WINDOW)
+            || buffer.len() >= BATCH_INPUTS
+            || buffered_bytes >= BATCH_BYTES;
         if (done || due) && !buffer.is_empty() {
-            if let Err(error) =
-                write_consumed(&mut store, &group, topic, &buffer, &mut totals, &telemetry)
-            {
+            let started = std::time::Instant::now();
+            let written =
+                write_consumed(&mut store, &group, topic, &buffer, &mut totals, &telemetry);
+            totals.storage_seconds += started.elapsed().as_secs_f64();
+            if let Err(error) = written {
                 telemetry.emit(
                     "consumer_stopped_on_storage_failure",
                     "consume",
@@ -383,6 +440,7 @@ pub fn consume(
                 return Err(error);
             }
             buffer.clear();
+            buffered_bytes = 0;
             since = None;
         }
         if done {
@@ -394,6 +452,7 @@ pub fn consume(
             .max(Duration::from_millis(1));
         match consumer.poll(wait) {
             Some(Ok(message)) => {
+                buffered_bytes += message.payload_len();
                 buffer.push(message.detach());
                 since.get_or_insert_with(std::time::Instant::now);
             }
@@ -408,6 +467,7 @@ pub fn consume(
             // Positions for these messages were never stored; the next owner replays them.
             totals.revoked_unwritten += buffer.len() as u64;
             buffer.clear();
+            buffered_bytes = 0;
             since = None;
         }
     }
@@ -415,6 +475,8 @@ pub fn consume(
         serde_json::json!({"consumer_group":group,"topic":topic,"consumed":totals.consumed,
         "inserted_transfers":totals.inserted,"retained_failures":totals.retained,
         "batches":totals.batches,"revoked_unwritten":totals.revoked_unwritten,"storage_failures_retained":totals.storage_retained,
+        "storage_write_seconds":totals.storage_seconds,
+        "prefetch_peak_bytes":consumer.context().prefetch_peak.load(std::sync::atomic::Ordering::Relaxed),
         "storage":store.stats(),"coverage":"unknown"}),
     )
 }
@@ -428,6 +490,7 @@ struct Totals {
     revoked_unwritten: u64,
     storage_retained: u64,
     consecutive_retained: u64,
+    storage_seconds: f64,
 }
 
 /// Consecutive inputs retained for storage failure before the consumer treats the fault
@@ -1081,6 +1144,68 @@ mod consumer_tests {
         assert!(
             consumed >= 40,
             "every input consumed; redelivery is allowed"
+        );
+    }
+
+    #[test]
+    fn a_full_producer_queue_waits_then_fails_at_the_delivery_timeout() {
+        // Nothing listens on the discard port, so no message is ever delivered.
+        let mut producer =
+            IntakeProducer::bounded("127.0.0.1:9", "unreachable", 2, Duration::from_secs(1))
+                .unwrap();
+        producer.send(1, b"a", PROTO_SCHEMA).unwrap();
+        producer.send(2, b"b", PROTO_SCHEMA).unwrap();
+        let started = std::time::Instant::now();
+        assert_eq!(
+            producer.send(3, b"c", PROTO_SCHEMA).unwrap_err().0,
+            "kafka_delivery_failed"
+        );
+        let waited = started.elapsed();
+        assert!(
+            waited >= Duration::from_millis(500) && waited < Duration::from_secs(15),
+            "the full queue blocked until the timeout: {waited:?}"
+        );
+        assert_eq!(
+            producer.cursor(),
+            Some(1),
+            "the cursor stays at the first undelivered slot"
+        );
+    }
+
+    #[test]
+    fn a_blocked_database_stops_fetching_at_the_prefetch_bound_and_loses_nothing() {
+        const MIB: usize = 1024 * 1024;
+        let test = TestDatabase::new();
+        let topic = TestTopic::new(1);
+        // 64 MiB of undecodable inputs: more than one batch plus the prefetch bound.
+        let mut producer = IntakeProducer::new(&test_brokers(), &topic.0).unwrap();
+        for slot in 0..64 {
+            producer.send(slot, &vec![0; MIB], PROTO_SCHEMA).unwrap();
+        }
+        producer.flush(Duration::from_secs(60)).unwrap();
+        Store::open(&test.0).unwrap();
+        // EXCLUSIVE blocks the batch's position write but still allows the assignment read.
+        let mut lock = test.sql();
+        lock.batch_execute("BEGIN; LOCK TABLE kafka_offsets IN EXCLUSIVE MODE;")
+            .unwrap();
+        let worker = {
+            let (db, name) = (test.0.clone(), topic.0.clone());
+            std::thread::spawn(move || consume(&db, &test_brokers(), &name, 30).unwrap())
+        };
+        std::thread::sleep(Duration::from_secs(10));
+        assert_eq!(stored_positions(&test), 0, "nothing advances while blocked");
+        lock.batch_execute("COMMIT;").unwrap();
+        let report = worker.join().unwrap();
+        assert_eq!(report["consumed"], 64);
+        assert_eq!(report["retained_failures"], 64);
+        assert_eq!(stored_positions(&test), 64, "every input stored once");
+        assert!(report["storage_write_seconds"].as_f64().unwrap() >= 5.0);
+        let peak = report["prefetch_peak_bytes"].as_u64().unwrap() as usize;
+        // Prefetch fills toward the bound while blocked; the documented overshoot is one
+        // fetch per partition, so allow two messages for it.
+        assert!(
+            (16 * MIB..=super::PREFETCH_KBYTES * 1024 + 2 * (MIB + 1024)).contains(&peak),
+            "prefetch stayed bounded while the write was blocked: {peak}"
         );
     }
 

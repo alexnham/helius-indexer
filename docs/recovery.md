@@ -8,6 +8,30 @@ and historical repair read. With `INDEXER_KAFKA_BROKERS` configured, live input 
 also published to Kafka; the producer cursor follows delivery confirmation, and the
 topic does not replace the PostgreSQL raw records.
 
+## Kafka bounds and backpressure
+
+Every Kafka buffer is bounded, and a slow stage stalls the one before it rather
+than dropping input:
+
+- **Producer:** at most 10,000 messages or 64 MiB wait locally. When the queue is
+  full, `send` waits and the LaserStream loop stops reading. An undelivered message
+  fails after 120 s (`message.timeout.ms`); intake then stops with
+  `kafka_delivery_failed` and the cursor stays at the first undelivered slot, so a
+  restart produces it again.
+- **Consumer:** one batch holds at most 100 inputs or 16 MiB, matching live intake.
+  librdkafka prefetches at most 32 MiB in total, or 1,000 messages per partition, and
+  may overshoot the byte bound by one fetch per partition. While a PostgreSQL write is blocked the consumer stops polling,
+  so fetching stops at that bound, positions stay where they were, and the rest stays
+  on the broker.
+- A write blocked longer than `max.poll.interval.ms` (300 s) loses the consumer's
+  partitions. The next owner resumes from the positions stored with the output, so
+  inputs may be redelivered but are stored once.
+
+The consumer report gives `storage_write_seconds` (time in PostgreSQL writes) and
+`prefetch_peak_bytes` (largest prefetched byte count librdkafka reported). Tests
+cover a full producer queue against an unreachable broker and a consumer whose
+position writes are locked for ten seconds.
+
 ## First response
 
 1. Inspect `live-status SESSION` and `coverage SESSION MINT START END`. A run left `running`
