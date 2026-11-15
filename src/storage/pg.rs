@@ -13,9 +13,10 @@ pub(crate) const MIGRATIONS: &[(i32, &str)] = &[
         include_str!("migrations/0005_replay_input_provenance.sql"),
     ),
     (6, include_str!("migrations/0006_replay_routes.sql")),
+    (7, include_str!("migrations/0007_archive_attempts.sql")),
     (
-        7,
-        include_str!("migrations/0007_transfer_block_time_amounts.sql"),
+        8,
+        include_str!("migrations/0008_transfer_block_time_amounts.sql"),
     ),
 ];
 

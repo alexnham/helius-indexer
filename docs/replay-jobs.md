@@ -46,10 +46,10 @@ Main uses versions 2/3 for Kafka; the unpublished replay prototypes used those
 numbers for different tables. Migration 4 supplies any missing Kafka tables and
 retains existing replay tables. Migration 5 adds missing input provenance without
 resetting scope, receipts or charged budgets. This supports both main and the
-version 2/3 replay prototypes; migration 6 adds append-only routing tables; the current schema version is 6. Raw rows referenced by replay receipts are classified as replay;
+version 2/3 replay prototypes; migration 6 adds append-only routing tables and migration 7 archive attempts; the current schema version is 7. Raw rows referenced by replay receipts are classified as replay;
 missing historical attempt/hash/acknowledgment provenance stays null. Back up the
 session using PostgreSQL tooling before upgrading. Earlier binaries reject newer
-schema versions (the current version is 6); rolling back requires restoring the
+schema versions (the current version is 7); rolling back requires restoring the
 pre-upgrade backup into a separate session and using its matching binary. Do not manually decrement the migration
 version or delete receipts to make an older binary open an upgraded session.
 The new tables currently have no deletion/TTL policy; job receipt retention will
@@ -67,8 +67,11 @@ helius-indexer replay-retry SESSION recent
 INDEXER_LIVE_OPT_IN=1 helius-indexer replay-route SESSION recent CACHE
 INDEXER_LIVE_OPT_IN=1 helius-indexer replay SESSION recent 60
 INDEXER_LIVE_OPT_IN=1 helius-indexer replay-monitor SESSION recent LIVE_FROM 60
+# Archive feature, INDEXER_ARCHIVE_OPT_IN=1: one charged batch of routed archive slots
+INDEXER_ARCHIVE_OPT_IN=1 helius-indexer replay-archive SESSION recent CACHE
 # Explicitly replenish an exhausted allowance; never done automatically:
 helius-indexer replay-grant SESSION recent
+helius-indexer archive-grant SESSION recent
 ```
 
 The first test range is 50 slots. Creation accepts at most the existing 128-slot
@@ -116,6 +119,35 @@ routes cover small windows only.
 
 Migration 6 is additive; an older binary refuses the newer schema, so roll back as
 above by restoring the pre-upgrade backup.
+
+## Archive batches
+
+`replay-archive` takes the latest route revision and processes the first up to
+eight incomplete slots of its `archive` or `overlap` segments, within one segment,
+through the shared History path: retained raw input, shared decoder and storage,
+and per-slot `complete`/`skipped`/`unknown` status from full blocks. A job with no
+route is refused; a job whose route has no pending archive slots charges nothing.
+
+Archive work has its own allowance (migration 7), separate from replay's. Before
+any cache or network work, one transaction charges a whole batch and records a
+`running` attempt with the ceilings it runs under: 32 requests, 128 MiB of
+response bodies and 120 seconds, the existing per-batch limits. A grant allows four
+batches; `archive-grant` adds one grant, up to 64, so a job can run at most 256
+batches. `replay-grant` never replenishes archive work. A batch served entirely
+from cache is still charged. Observed requests, response bytes and cached chunks
+are written when the batch ends (finished, incomplete, cancelled or an error
+class); they are diagnostics, not provider billing. A crash keeps the charge and
+leaves the attempt `running` until the next batch marks it `interrupted`. A
+PostgreSQL advisory lock allows one archive worker per job; it is released when
+the worker's connection closes, including on a crash. `BACKFILL_CANCEL_FILE` or the
+120-second limit stops between slots.
+
+Status adds an `archive` block: grants, batches charged and remaining, attempts and
+response bytes by status, the last 20 attempts, and per routed archive/overlap
+segment the complete, skipped and pending slot counts with oldest pending age.
+Replay segments get no counts. Full-block slot status for an overlap segment is
+archive evidence only; reconciling it with replay input is the next slice of #31,
+and job coverage stays `unknown`. Migration 7 is additive; roll back as above.
 
 ## Scope still pending
 

@@ -78,7 +78,7 @@ fn expected_columns(rows: &[Transfer]) -> Columns {
 }
 
 #[test]
-fn migration_0007_backfills_block_time_and_exact_amounts_on_existing_rows() {
+fn migration_0008_backfills_block_time_and_exact_amounts_on_existing_rows() {
     let db = pg::TestDatabase::new();
     let mut sql = db.sql();
     migrate(&mut sql, &pg::MIGRATIONS[..5]).unwrap();

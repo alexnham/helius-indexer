@@ -110,7 +110,7 @@ pub(crate) fn measure_with(
         json!(route.segments.iter().filter(|s| s.2 == "uncovered").count());
     use std::io::Write;
     let _ = writeln!(std::io::stderr().lock(), "{event}");
-    log.status(id)
+    super::status(database, id)
 }
 
 /// Opt-in provider measurement. Without the archive feature the archive side is unknown.
