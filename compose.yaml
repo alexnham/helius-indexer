@@ -1,18 +1,20 @@
 services:
+  # Captured-data test console: `docker compose --profile test up --build console`.
   console:
+    profiles: [test]
     image: ${INDEXER_CONSOLE_IMAGE:-helius-indexer-console:local}
     build:
       context: .
       target: console
     environment:
-      INDEXER_CONSOLE_PORT: ${INDEXER_CONSOLE_PORT:-8765}
+      INDEXER_CONSOLE_PORT: ${INDEXER_CONSOLE_PORT:-8766}
       # Unix socket on a shared volume: private to these containers, so plaintext is allowed.
       DATABASE_URL: host=/var/run/postgresql user=indexer dbname=indexer
     depends_on:
       postgres:
         condition: service_healthy
     ports:
-      - "127.0.0.1:${INDEXER_CONSOLE_PORT:-8765}:${INDEXER_CONSOLE_PORT:-8765}"
+      - "127.0.0.1:${INDEXER_CONSOLE_PORT:-8766}:${INDEXER_CONSOLE_PORT:-8766}"
     volumes:
       - console-data:/app/data
       - postgres-socket:/var/run/postgresql
@@ -27,15 +29,15 @@ services:
     pids_limit: 64
     stop_grace_period: 20s
 
+  # Default service: provider-backed live intake and backfill (needs HELIUS_API_KEY).
   runtime:
-    profiles: [live]
     image: ${INDEXER_RUNTIME_IMAGE:-helius-indexer-runtime:local}
     build:
       context: .
       target: ${INDEXER_RUNTIME_TARGET:-console-archive}
     entrypoint: [python3, /app/scripts/indexer-runtime.py]
     environment:
-      INDEXER_CONSOLE_PORT: ${INDEXER_RUNTIME_PORT:-8767}
+      INDEXER_CONSOLE_PORT: ${INDEXER_RUNTIME_PORT:-8765}
       INDEXER_RUN: ${INDEXER_RUN:-1}
       INDEXER_MINT: ${INDEXER_MINT:-EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v}
       INDEXER_LIVE_SECONDS: ${INDEXER_LIVE_SECONDS:-60}
@@ -62,7 +64,7 @@ services:
       kafka:
         condition: service_healthy
     ports:
-      - "127.0.0.1:${INDEXER_RUNTIME_PORT:-8767}:${INDEXER_RUNTIME_PORT:-8767}"
+      - "127.0.0.1:${INDEXER_RUNTIME_PORT:-8765}:${INDEXER_RUNTIME_PORT:-8765}"
     secrets: [helius]
     volumes:
       - runtime-data:/app/data
@@ -81,7 +83,6 @@ services:
   # Drains the runtime's Kafka intake into its PostgreSQL session. Each `consume` run is
   # bounded; the loop restarts it, and a failed run retries after 5 s from stored positions.
   consumer:
-    profiles: [live]
     image: ${INDEXER_CONSOLE_IMAGE:-helius-indexer-console:local}
     build:
       context: .

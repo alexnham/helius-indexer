@@ -6,11 +6,14 @@
 docker compose up --build
 ```
 
-Open **http://127.0.0.1:8765**. A dedicated named volume keeps the same captured
-session across restarts; the image contains the compiled CLI, so Rust/Python do
-not need to be installed on the host. No ingestion or credentials are enabled.
-If the native console is already using 8765, set `INDEXER_CONSOLE_PORT=8766` before
-the command. See [Docker operation and data reset](docs/docker.md).
+Open **http://127.0.0.1:8765**. This starts the provider-backed
+[runtime console](docs/runtime-testing.md): real live intake plus a bounded backfill,
+through Kafka into PostgreSQL. It needs `HELIUS_API_KEY` in an ignored `.env` and
+makes provider requests. Set `INDEXER_RUN=0` to reopen existing data without them.
+
+The offline captured-data test console is opt-in:
+`docker compose --profile test up --build console`, then open http://127.0.0.1:8766.
+See [Docker operation and data reset](docs/docker.md).
 
 ## Start testing
 
@@ -356,9 +359,9 @@ These measurements include small reference/genesis responses and partial reads;
 they are not provider-billed or full wire bytes. See [telemetry](docs/observability.md#rpc-response-body-accounting).
 
 For **real provider-backed live intake and configurable backfill**, use the
-[opt-in runtime console](docs/runtime-testing.md):
-`docker compose --profile live up --build -d runtime`, then open
-http://127.0.0.1:8767. It needs a local Helius secret, starts a 50-slot backfill
+default [runtime console](docs/runtime-testing.md):
+`docker compose up --build -d`, then open
+http://127.0.0.1:8765. It needs a local Helius secret, starts a 50-slot backfill
 alongside live intake, then continues live intake in 60-second cycles, and keeps only the newest 1,000
 transfers; it does not seed fixtures.
 

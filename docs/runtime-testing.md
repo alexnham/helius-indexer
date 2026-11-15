@@ -1,6 +1,6 @@
 # Test live ingestion and configurable replay
 
-The opt-in `runtime` service uses PostgreSQL, live finalized LaserStream intake
+The default `runtime` service (`docker compose up`) uses PostgreSQL, live finalized LaserStream intake
 and an independent historical worker in the same native process: LaserStream
 replay for recent slots and, in the default `console-archive` image, Old Faithful
 archive batches for older routed slots (#31, #32). It never seeds fixtures or
@@ -13,14 +13,14 @@ only into the runtime and passed to the child via its environment. It is never
 put in argv, images or logs.
 
 ```sh
-docker compose --profile live up --build -d runtime
-# Open http://127.0.0.1:8767
+docker compose up --build -d
+# Open http://127.0.0.1:8765
 ```
 
-The `live` profile also starts Kafka and a `consumer` service. Live input is
+Compose also starts Kafka and a `consumer` service. Live input is
 published to Kafka (`kafka:9092` on the private Compose network, plaintext under
 `INDEXER_KAFKA_PRIVATE_NETWORK=1`) and the consumer writes it to the same PostgreSQL
-session; historical replay keeps writing directly. Outside that opt-in, brokers
+session; historical replay keeps writing directly. Outside this Compose network, brokers
 must still be loopback. Check consumer progress with `docker compose logs consumer`.
 
 Defaults are USDC, 60-second live cycles, an initial frozen 50-slot finalized
@@ -92,15 +92,15 @@ unknown. This is not a disk-byte cap or the production 30-day retention policy.
 A live-source failure backs off 30 seconds. History failure alone does not delay
 the next live cycle. Shutdown terminates and, if needed, kills/reaps its child.
 
-`INDEXER_RUN=0 docker compose --profile live up -d --force-recreate runtime` reopens
+`INDEXER_RUN=0 docker compose up -d --force-recreate runtime` reopens
 an existing session for inspection without provider requests. Set it back to `1`
 explicitly to ingest again. No new runtime has been deployed by these code changes.
 
 ## Query and check
 
 ```sh
-curl -fsS http://127.0.0.1:8767/api/status
-curl -fsS 'http://127.0.0.1:8767/api/transfers?mint=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
+curl -fsS http://127.0.0.1:8765/api/status
+curl -fsS 'http://127.0.0.1:8765/api/transfers?mint=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
 docker compose exec runtime /app/data/runtime-replay/helius-indexer replay-status runtime recent
 docker compose exec runtime /app/data/runtime-replay/helius-indexer live-status runtime
 ```

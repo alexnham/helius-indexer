@@ -10,7 +10,7 @@ from urllib.request import urlopen
 ROOT = Path(__file__).resolve().parent.parent
 IMAGE = os.environ.get("INDEXER_CONSOLE_IMAGE", "helius-indexer-console:local")
 PROJECT = "indexer-smoke-" + uuid.uuid4().hex[:12]
-PORT = os.environ.get("INDEXER_CONSOLE_PORT", "8765")
+PORT = os.environ.get("INDEXER_CONSOLE_PORT", "8766")
 
 
 def compose(*args):
@@ -49,7 +49,7 @@ def main():
     if not host.startswith(("unix://", "npipe://")):
         raise RuntimeError("Smoke tests require a local Docker engine")
     try:
-        compose("up", "-d", "--no-build", "--wait", "--wait-timeout", "90")
+        compose("up", "-d", "--no-build", "--wait", "--wait-timeout", "90", "console")
         health = get("/healthz")
         assert health == {"status": "ready", "mode": "captured data", "coverage": "unknown"}
         replay = json.loads(compose("exec", "-T", "console", "/app/data/session/helius-indexer",
@@ -65,7 +65,7 @@ def main():
         stopped = subprocess.check_output(["docker", "inspect", "--format", "{{.State.ExitCode}} {{.State.OOMKilled}}", container], text=True).strip()
         assert stopped == "0 false", "Console did not stop gracefully"
         compose("down")
-        compose("up", "-d", "--no-build", "--wait", "--wait-timeout", "90")
+        compose("up", "-d", "--no-build", "--wait", "--wait-timeout", "90", "console")
         assert snapshot() == before, "Restart replaced the session receipt or binary"
         assert get("/api/transfers") == initial, "Restart changed transfer output"
         restarted = json.loads(compose("exec", "-T", "console", "/app/data/session/helius-indexer",
