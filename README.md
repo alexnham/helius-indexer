@@ -76,14 +76,33 @@ CLI syntax:
 
 ```text
 helius-indexer ingest DB CAPTURE [--metrics NEW_FILE]
-helius-indexer query DB [MINT]
+helius-indexer query DB [MINT] [WINDOW] [--limit N] [--cursor C]
+helius-indexer query-recent DB [MINT] [WINDOW] [--limit N] [--cursor C]
+helius-indexer summary DB MINT [WINDOW]
+helius-indexer query DB [MINT] --all-stored     (inspection only; see below)
+helius-indexer query-recent DB [MINT] --all-stored
+helius-indexer summary DB MINT --all-stored
+WINDOW = --window-seconds N | --from T --to T   (block times, [from, to))
 ```
 
-`query` opens existing storage read-only and returns up to 1,000 records, sorted
-by slot, signature, outer position, and inner position (outer before inner).
-Pagination, time filtering, and aggregates arrive in the analytics ticket. Amounts
-and fees are decimal JSON strings so clients preserve the full unsigned 64-bit
-range. Internally they are integers. Missing block time or historically unresolved
+`--all-stored` is local inspection of captured data, not a query mode: it returns
+every retained row, including rows older than the 30-day window (up to 37 days old)
+and rows with unknown block time, with the pre-window output shape and
+`coverage: "unknown"`. It cannot be combined with `WINDOW` or `--cursor`. Served APIs
+must not expose it; the local console and smoke scripts use it.
+
+`query` and `query-recent` open existing storage read-only and return up to
+`--limit` records (1 to 1,000, default 1,000), sorted by slot, signature, outer
+position, and inner position (outer before inner); `query-recent` is newest first.
+Without a window the rolling 30-day window applies. The server computes the cutoff
+as now minus the window and returns `now`, `cutoff` and `window`. Only rows with a
+known block time inside `[from, to)` are listed or summed; rows with unknown block
+time are never listed and appear only as `null_block_time`. Each page returns
+`next_cursor` (null on the last page) for keyset pagination; pass it back with
+`--cursor`. Each response carries a `coverage` object for the window (see
+[the coverage mapping](docs/observability.md#query-window-coverage)). Amounts and
+fees are decimal JSON strings so clients preserve the full unsigned 64-bit range;
+`summary` sums them exactly in SQL. Missing block time or historically unresolved
 owners remain null; an instruction's signing authority is not assumed to be the
 wallet owner. In live-only operation most rows have null block time until history
 or reconcile enriches them.

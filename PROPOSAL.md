@@ -88,6 +88,7 @@ Block-time policy (reviewed 2026-11-14):
 - Time-filtered responses report such transfers as an explicit `null_block_time` count. Aggregates state that they cover known-time rows only.
 - There is no slot-derived time fallback. Unknown time stays unknown until history or reconciliation supplies it.
 - The server computes each cutoff from an injected clock and returns the cutoff in the response.
+- Requirements change (2026-11-14): the 30-day window is the default for the CLI `query`, `query-recent` and `summary`. The `--all-stored` flag is an explicit exception: it is a local captured-data inspection mode over every retained row, including rows up to 37 days old and rows with unknown block time, and returns the pre-window output shape with `coverage: "unknown"`. It is not query-eligible, must not be exposed by any served API, and a served API must default to the window.
 
 Provisionally retain matched raw transactions for 37 days: 30 days of query history plus a seven-day repair margin. Compressed object storage is the candidate raw store. Preserve instructions, inner instructions, relevant execution metadata, source provenance, and schema/version information needed to repeat decoding. Size and validate this policy before production.
 
@@ -193,6 +194,8 @@ Helius Business is listed at **USD $499/month**, including mainnet LaserStream a
 Before approving production infrastructure, produce a measured estimate covering provider usage and overages, compute, databases, queue, raw storage, requests, networking, monitoring, and initial backfill. Separate one-time initialization from recurring operation.
 
 The total acceptable monthly budget remains unresolved. Production mint selection, numerical freshness/query/recovery targets, backfill deadline, deployment topology, exact storage schemas, and technology selection must be decided using validation results. Do not present unmeasured capacity, cost, latency, or archive availability as guarantees.
+
+Unresolved: observed-empty windows. Window coverage maps a block-time window to the slot span of its known-time transfers (`src/storage/window.rs`), so a window with no such transfers has no slot span and reports `unknown` (`no_known_time_transfers_in_window`), never an observed empty range, even when history is complete. Reporting observed-empty needs a time-to-slot mapping for historical slots (for example a block time on `historical_slots`), which is a requirements change. Until decided, the surface is conservative: it never claims coverage it cannot show.
 
 ## Next review
 

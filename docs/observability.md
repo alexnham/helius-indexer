@@ -41,6 +41,47 @@ Coverage is based on verified processed ranges, including empty produced blocks 
 
 Provider usage reports must distinguish measured transport bytes, authoritative billed usage, and estimates. Record pricing basis, verification date, report delay, and uncertainty for projected spend. Report initial backfill costs separately from recurring operation.
 
+## Query window API and retention
+
+The rolling-window query CLI (`query`, `query-recent`, `summary`) applies the cutoff
+`now - window` from an injected clock (the CLI passes system time; tests pass a fixed
+time). Rows with `block_time >= cutoff` and `< to` are eligible; the boundary row at
+exactly the cutoff is included. Rows with unknown block time are counted in
+`null_block_time` and never listed or summed. Storage tests cover exact cutoff,
+null-time exclusion, exact sums above u64, keyset ties and coverage states against
+real PostgreSQL.
+
+Route request/error/latency metrics (`indexer_api_requests_total`,
+`indexer_api_request_duration_seconds`) are not exported yet: there is no HTTP server,
+so no route template exists to label. They are deferred to the HTTP route layer and
+will not be approximated from CLI invocations. Raw-expiration checks remain with
+the retention work and are not part of this query surface.
+
+### Query window coverage
+
+`coverage` on a window response is the coverage of the slot span of the window's
+known-block-time transfers for the mint and decoder. The span is the minimum to
+maximum slot of those rows (`slot_range`). Coverage describes only that span: it does
+not prove slots at the window edges before the first or after the last transfer were
+processed, so a clean `complete` is not a claim about the whole window.
+
+- `complete`: every slot in the span is `complete` or `skipped` in `historical_slots`.
+- `partial`: some slot in the span is missing or not complete; `missing_ranges` gives
+  bounded contiguous ranges (first 100, `missing_range_count` is exact).
+- `unknown` with `no_coverage_evidence`: transfers exist but no historical slot record
+  covers the span (for example live-only ingestion).
+- `unknown` with `no_known_time_transfers_in_window`: no known-time transfer falls in
+  the window, so there is no slot span to evaluate. This is not an observed-empty range.
+- `unknown` with `mint_required`: a mint-less listing has no per-mint coverage.
+- `unknown` with `all_stored` (`query --all-stored`, `summary --all-stored`): inspection
+  output has no window, so no coverage is computed and `coverage` is the literal
+  `"unknown"`. This is never a window coverage claim.
+
+An observed-empty window (covered, zero transfers) is not produced: deriving a slot
+span from time without transfers would need block times from historical slots, which
+this slice does not use. Coverage is one aggregate over `historical_slots` (status
+counts, covered runs and missing runs), not a per-slot loop.
+
 ## Cardinality and sensitive data
 
 Metric labels use bounded enums: component, stage, source kind, live/historical mode, operation, outcome, failure class, route template, and status class. Keep a documented label allowlist.

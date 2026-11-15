@@ -83,10 +83,10 @@ class LocalConsole(unittest.TestCase):
             self.assertIn("BigInt", html)
             self.assertIn("frame-ancestors 'none'", response.headers["Content-Security-Policy"])
         self.assertEqual(self.server.server_address[0], "127.0.0.1")
-        before = CONSOLE.command(self.session, "query", self.metadata["database"])
+        before = CONSOLE.command(self.session, "query", self.metadata["database"], "--all-stored")
         self.get("/api/session")
         self.get("/api/transfers")
-        after = CONSOLE.command(self.session, "query", self.metadata["database"])
+        after = CONSOLE.command(self.session, "query", self.metadata["database"], "--all-stored")
         self.assertEqual(before, after)
 
 

@@ -27,14 +27,14 @@ class PersistentConsole(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, fresh_database():
             path = Path(directory) / "session"
             with CONSOLE.persistent_session(path, BINARY) as (session, metadata):
-                before = CONSOLE.command(session, "query", metadata["database"])
+                before = CONSOLE.command(session, "query", metadata["database"], "--all-stored")
                 self.assertTrue(metadata["replay_verified"])
                 self.assertEqual(CONSOLE.readiness(session)["coverage"], "unknown")
                 with self.assertRaises(RuntimeError):
                     with CONSOLE.persistent_session(path, BINARY):
                         pass
             with CONSOLE.persistent_session(path, Path("missing-new-image-binary")) as (session, metadata):
-                self.assertEqual(before, CONSOLE.command(session, "query", metadata["database"]))
+                self.assertEqual(before, CONSOLE.command(session, "query", metadata["database"], "--all-stored"))
                 self.assertEqual(metadata["transfer_count"], len(before["transfers"]))
 
     def test_interrupted_initial_seed_replays_without_resetting_existing_output(self):
@@ -53,11 +53,11 @@ class PersistentConsole(unittest.TestCase):
                     with CONSOLE.persistent_session(path, BINARY):
                         pass
             self.assertFalse((path / "session.json").exists())
-            partial = original(path, "query", os.environ["INDEXER_DB_SESSION"])["transfers"]
+            partial = original(path, "query", os.environ["INDEXER_DB_SESSION"], "--all-stored")["transfers"]
             self.assertTrue(partial)
             with CONSOLE.persistent_session(path, Path("missing-new-image-binary")) as (session, metadata):
                 self.assertTrue(metadata["replay_verified"])
-                rows = CONSOLE.command(session, "query", metadata["database"])["transfers"]
+                rows = CONSOLE.command(session, "query", metadata["database"], "--all-stored")["transfers"]
                 self.assertEqual(len(rows), metadata["transfer_count"])
                 self.assertEqual(len({r["transfer_id"] for r in rows}), len(rows))
 
