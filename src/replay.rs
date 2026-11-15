@@ -16,6 +16,7 @@ use sha2::{Digest, Sha256};
 use std::time::{Duration, Instant};
 
 pub mod archive;
+pub mod overlap;
 pub mod route;
 
 pub fn create(database: &Database, id: &str, mint: &str, start: u64, end: u64) -> Result<Value> {
@@ -29,6 +30,7 @@ pub fn status(database: &Database, id: &str) -> Result<Value> {
     valid_id(id)?;
     let mut report = JobLog::open(database)?.status(id)?;
     report["archive"]["slot_status"] = archive::segment_status(database, id)?;
+    report["verified"] = overlap::verified(database, id)?;
     Ok(report)
 }
 pub fn grant(database: &Database, id: &str, telemetry: &mut Telemetry) -> Result<Value> {
@@ -137,6 +139,7 @@ pub fn monitor(
     id: &str,
     live_from: u64,
     seconds: u64,
+    cache: Option<&std::path::Path>,
     telemetry: &mut Telemetry,
 ) -> Result<Value> {
     valid_id(id)?;
@@ -152,15 +155,75 @@ pub fn monitor(
         seconds,
         &scope.mint,
         telemetry,
-        |gate| {
-            let mut context = Telemetry::default();
-            retry_admitted(database, id, &mut context, &gate)?;
-            run_admitted(database, id, seconds.min(60), &mut context, &gate)
-        },
+        |gate| historical_cycle(database, id, seconds.min(60), cache, gate),
     )?;
     result["job"] = status(database, id)?;
     result["coverage"] = json!("unknown");
     Ok(result)
+}
+
+/// A named step of a historical cycle.
+pub(crate) type Step<'a> = (&'static str, Box<dyn FnOnce() -> Result<Value> + 'a>);
+
+/// Run each step in order; a failed or exhausted step never stops the next one.
+pub(crate) fn cycle<'a>(steps: Vec<Step<'a>>) -> Value {
+    let mut out = serde_json::Map::new();
+    for (name, step) in steps {
+        out.insert(
+            name.into(),
+            match step() {
+                Ok(v) => json!({"outcome":"reported","report":v}),
+                Err(e) => json!({"outcome":"failed","error_class":e.0}),
+            },
+        );
+    }
+    Value::Object(out)
+}
+
+/// Historical worker of one monitor cycle, under the shared live-priority gate:
+/// retained retry, then replay when the route has replayable slots, then one archive
+/// batch (archive builds with a cache), then offline overlap reconciliation.
+fn historical_cycle(
+    database: &Database,
+    id: &str,
+    seconds: u64,
+    cache: Option<&std::path::Path>,
+    gate: std::sync::Arc<WriteGate>,
+) -> Result<Value> {
+    // Without a route the job keeps its original replay-only behavior.
+    let replayable = JobLog::open(database)?
+        .latest_route(id)?
+        .is_none_or(|(_, segments)| segments.iter().any(|s| s.2 == "replay" || s.2 == "overlap"));
+    let mut steps: Vec<Step<'_>> = vec![(
+        "retry",
+        Box::new(|| retry_admitted(database, id, &mut Telemetry::default(), &gate)),
+    )];
+    if replayable {
+        steps.push((
+            "replay",
+            Box::new(|| run_admitted(database, id, seconds, &mut Telemetry::default(), &gate)),
+        ));
+    }
+    #[cfg(feature = "archive")]
+    if let Some(cache) = cache {
+        let gate = std::sync::Arc::clone(&gate);
+        steps.push((
+            "archive",
+            Box::new(move || {
+                archive::run_admitted(database, id, cache, gate, &mut Telemetry::default())
+            }),
+        ));
+    }
+    #[cfg(not(feature = "archive"))]
+    let _ = cache;
+    steps.push((
+        "overlap",
+        Box::new(|| {
+            let _permit = gate.historical()?;
+            overlap::reconcile(database, id, &mut Telemetry::default())
+        }),
+    ));
+    Ok(cycle(steps))
 }
 
 /// Retry at most 100 retained unresolved inputs without a provider connection.

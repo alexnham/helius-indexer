@@ -46,10 +46,10 @@ Main uses versions 2/3 for Kafka; the unpublished replay prototypes used those
 numbers for different tables. Migration 4 supplies any missing Kafka tables and
 retains existing replay tables. Migration 5 adds missing input provenance without
 resetting scope, receipts or charged budgets. This supports both main and the
-version 2/3 replay prototypes; migration 6 adds append-only routing tables and migration 7 archive attempts; the current schema version is 7. Raw rows referenced by replay receipts are classified as replay;
+version 2/3 replay prototypes; migrations 6, 7 and 9 add routing, archive attempts and overlap outcomes (8 adds transfer columns); the current schema version is 9. Raw rows referenced by replay receipts are classified as replay;
 missing historical attempt/hash/acknowledgment provenance stays null. Back up the
 session using PostgreSQL tooling before upgrading. Earlier binaries reject newer
-schema versions (the current version is 7); rolling back requires restoring the
+schema versions (the current version is 9); rolling back requires restoring the
 pre-upgrade backup into a separate session and using its matching binary. Do not manually decrement the migration
 version or delete receipts to make an older binary open an upgraded session.
 The new tables currently have no deletion/TTL policy; job receipt retention will
@@ -66,7 +66,9 @@ helius-indexer replay-retry SESSION recent
 # Explicit provider opt-in and HELIUS_API_KEY are required for these two commands:
 INDEXER_LIVE_OPT_IN=1 helius-indexer replay-route SESSION recent CACHE
 INDEXER_LIVE_OPT_IN=1 helius-indexer replay SESSION recent 60
-INDEXER_LIVE_OPT_IN=1 helius-indexer replay-monitor SESSION recent LIVE_FROM 60
+INDEXER_LIVE_OPT_IN=1 helius-indexer replay-monitor SESSION recent LIVE_FROM 60 [CACHE]
+# Offline: reconcile routed overlap slots from retained archive and replay input
+helius-indexer replay-overlap SESSION recent
 # Archive feature, INDEXER_ARCHIVE_OPT_IN=1: one charged batch of routed archive slots
 INDEXER_ARCHIVE_OPT_IN=1 helius-indexer replay-archive SESSION recent CACHE
 # Explicitly replenish an exhausted allowance; never done automatically:
@@ -146,13 +148,48 @@ Status adds an `archive` block: grants, batches charged and remaining, attempts 
 response bytes by status, the last 20 attempts, and per routed archive/overlap
 segment the complete, skipped and pending slot counts with oldest pending age.
 Replay segments get no counts. Full-block slot status for an overlap segment is
-archive evidence only; reconciling it with replay input is the next slice of #31,
-and job coverage stays `unknown`. Migration 7 is additive; roll back as above.
+archive evidence only until `replay-overlap` reconciles it (below). Migration 7 is
+additive; roll back as above.
+
+## Overlap reconciliation and verified slots
+
+`replay-overlap` makes no provider request. For each slot of the latest route's
+`overlap` segments it compares retained archive and replay captures through the
+shared reconciler and decoder, and appends an outcome (migration 9) tied to the
+route and decoder revision:
+
+| Outcome | Meaning |
+| --- | --- |
+| `consistent` | Every replay-delivered signature is in the archive block with identical decoded transfers (identity, raw amounts, fees, confidentiality, instruction positions); block time is compared only when both sides have it. |
+| `replay_omission` | As above, and the archive block has mint transactions replay never delivered. Archive is authoritative on membership. |
+| `conflict` | `replay_not_in_archive` (a replay signature missing from a complete archive block) or `effects_differ`. Fails closed and stays visible. |
+| `pending` | The archive slot is incomplete, a replay input is unresolved or no longer retained, or the stored output's decoder revision differs. |
+
+"Mint transaction" uses the replay filter's predicate: the mint is a static or loaded
+account key, or the mint of a pre/post token balance.
+
+The report's `verified` block derives verified slots under the latest route:
+`archive` slots whose full-block status is complete or skipped with raw archive
+input still retained, and `overlap` slots whose latest outcome is `consistent` or
+`replay_omission` and whose archive evidence is still retained. Replay-only and
+uncovered slots stay unknown, because filtered replay cannot prove a slot complete.
+`verified_through` is the contiguous verified boundary from the job start and never
+crosses an unverified slot. A new route revision or decoder revision stops earlier
+outcomes from counting. Pruning removes the archive slot evidence, so verified slots
+fall back to unknown while outcome receipts remain. The job-level `coverage` field
+stays `unknown`; read `verified` for slot evidence.
+
+`replay-monitor` runs one historical cycle beside live intake under the shared
+live-priority gate: retained retry, a replay attempt when the route has replay or
+overlap slots (or the job has no route), one archive batch when the binary has the
+archive feature and CACHE is given, then overlap reconciliation. A failed or
+exhausted step is reported and the next step still runs; none can stop live intake.
+Migration 9 is additive; roll back as above.
 
 ## Scope still pending
 
-Automatic archive routing, independently verified replay range coverage, full
-30-day retention, Kafka, distributed leases and production benchmarking remain
+Provider-measured overlap, replay coverage outside archive overlap, full 30-day
+retention, Kafka, distributed leases and production benchmarking remain
 separate work. Budget exhaustion requires an explicit grant; current replay
 contract cannot infer which quiet filtered slots were empty. Repeated inclusive
 replay can cost provider traffic even when storage deduplicates it.
