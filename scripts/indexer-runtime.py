@@ -25,6 +25,8 @@ def integer(env, name, default, low, high):
 
 
 def configuration(env, tip):
+    # Unset is an exact dataset; 1-100 keeps that percentage of the mint's transfers.
+    percent = integer(env, "INDEXER_SAMPLE_PERCENT", 0, 1, 100) if env.get("INDEXER_SAMPLE_PERCENT") else None
     mint = env.get("INDEXER_MINT", CONSOLE.USDC)
     if not CONSOLE.valid_mint(mint):
         raise ValueError("Invalid INDEXER_MINT")
@@ -36,7 +38,7 @@ def configuration(env, tip):
     job=env.get("INDEXER_REPLAY_JOB", "recent")
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}",job):
         raise ValueError("Invalid INDEXER_REPLAY_JOB")
-    return {"historical_source":"laserstream_replay","replay_job":job,"mint": mint, "mints": [mint], "slot_start": start, "slot_end": end,
+    return {"historical_source":"laserstream_replay","replay_job":job,"mint": mint, "mints": [mint], "sample_percent": percent, "slot_start": start, "slot_end": end,
             "live_from": integer(env, "INDEXER_LIVE_FROM", max(0, tip - 4), 0, tip),
             "seconds": integer(env, "INDEXER_LIVE_SECONDS", 60, 1, 300),
             "keep": integer(env, "INDEXER_KEEP_TRANSFERS", 1000, 1, 1_000_000),
@@ -56,13 +58,14 @@ def resume_configuration(session, env, tip):
     requested.setdefault("INDEXER_MINT",saved["mint"])
     requested.setdefault("INDEXER_DB_SESSION",saved["database"])
     requested.setdefault("INDEXER_REPLAY_JOB",saved["replay_job"])
+    requested.setdefault("INDEXER_SAMPLE_PERCENT",str(saved.get("sample_percent") or ""))
     requested["INDEXER_BACKFILL_END"]=env.get("INDEXER_BACKFILL_END") or str(saved["slot_end"])
     requested["INDEXER_BACKFILL_START"]=env.get("INDEXER_BACKFILL_START") or str(saved["slot_start"])
     if env.get("INDEXER_BACKFILL_SLOTS") and not env.get("INDEXER_BACKFILL_START"):
         requested["INDEXER_BACKFILL_START"]=str(int(requested["INDEXER_BACKFILL_END"])-int(env["INDEXER_BACKFILL_SLOTS"])+1)
     current=configuration(requested,tip)
-    for field in ["mint","database","replay_job","slot_start","slot_end"]:
-        if current[field]!=saved[field]:
+    for field in ["mint","database","replay_job","slot_start","slot_end","sample_percent"]:
+        if current[field]!=saved.get(field):
             raise ValueError("Frozen replay scope changed; choose a new directory and job ID")
     return current
 
@@ -148,12 +151,20 @@ def install_binary(session, binary, upgrade):
     return "upgraded" if state == "upgrade_required" else state
 
 
-def initialize(session, binary, database, upgrade=False):
+def initialize(session, binary, database, upgrade=False, mint=None, percent=None):
     session.mkdir(parents=True, exist_ok=True, mode=0o700)
     state = install_binary(session, binary, upgrade)
-    if state != "upgrade_required":
-        # Recovery runs behind live-priority admission inside the native paired worker.
-        CONSOLE.command(session, "migrate", database)
+    if state == "upgrade_required":
+        return state
+    # Recovery runs behind live-priority admission inside the native paired worker.
+    CONSOLE.command(session, "migrate", database)
+    # The dataset policy is immutable; it must be set before any input is admitted.
+    if percent is not None:
+        CONSOLE.command(session, "sample-init", database, mint, percent)
+    policy = CONSOLE.command(session, "sample-status", database)
+    sampled = policy.get("policy") != "exact"
+    if sampled != (percent is not None) or (sampled and (policy.get("mint"), policy.get("numerator")) != (mint, percent)):
+        raise ValueError("Dataset sampling mode or mint does not match runtime configuration")
     return state
 
 
@@ -221,7 +232,8 @@ def main():
             env["INDEXER_ARCHIVE_OPT_IN"] = "1"
         CONSOLE.require_database_url()
         binary = initialize(session, image, config["database"],
-                            upgrade=not inspect_only and os.environ.get("INDEXER_UPGRADE_BINARY") == "1")
+                            upgrade=not inspect_only and os.environ.get("INDEXER_UPGRADE_BINARY") == "1",
+                            mint=config["mint"], percent=config.get("sample_percent"))
         if binary == "upgrade_required":
             # Serve the existing session for inspection; run nothing with a binary it was not started with.
             inspect_only = True
@@ -256,9 +268,12 @@ def main():
                     if stopped.is_set():
                         atomic_json(session / "worker.json", {"state": "stopped", "cycle": number, "coverage": "unknown"})
                         return
-                    prune_code, pruned = cycle(["prune", db, config["keep"]], timeout=300, report_name="prune.json")
-                    if prune_code != 0:
-                        raise RuntimeError("Prune failed")
+                    if config.get("sample_percent") is not None:
+                        pruned = None  # A sampled demo keeps every raw input for decoder repair.
+                    else:
+                        prune_code, pruned = cycle(["prune", db, config["keep"]], timeout=300, report_name="prune.json")
+                        if prune_code != 0:
+                            raise RuntimeError("Prune failed")
                     resume = resume_slot(CONSOLE.command(session, "live-status", db), config["mint"]) or resume
                 except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
                     code, result, failed, pruned = None, None, True, None

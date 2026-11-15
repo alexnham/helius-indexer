@@ -129,3 +129,16 @@ Use [replay job commands](replay-jobs.md) for offline retry/refill and the separ
 [archive validation](archive.md) for older data. The former independent block
 parser requires retained full block observations; filtered replay does not fabricate
 those inputs.
+
+## Isolated sampled demo
+
+`INDEXER_SAMPLE_PERCENT=N` (1–100) makes a fresh runtime directory and PostgreSQL
+session (`INDEXER_DB_SESSION`) a single-mint dataset keeping N% of transfers; see
+`PROPOSAL.md`. The
+policy is set before any input is admitted and saved with the session, so a
+restart keeps it. Startup refuses to convert a populated exact session, change the
+sampled mint or percentage, or restart a sampled session as exact. Query, summary and console
+output label the policy and show the actual sampled count; coverage still
+describes source evidence. Sampling runs after decoding: every raw input is kept
+for retries and decoder corrections and the newest-transfer prune does not run, so
+only transfer-row storage shrinks.

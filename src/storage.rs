@@ -116,6 +116,58 @@ fn read_failed(_: postgres::Error) -> Error {
     Error("storage_read_failed")
 }
 
+#[derive(Clone)]
+struct Sampling {
+    mint: Option<String>,
+    /// Inclusion percentage, 1..=100; 100 for an exact dataset.
+    percent: i16,
+}
+
+impl Sampling {
+    fn from_tx(tx: &mut Transaction<'_>) -> Result<Self> {
+        let row = tx
+            .query_one(
+                "SELECT policy,mint,percent FROM dataset_policy WHERE singleton FOR SHARE",
+                &[],
+            )
+            .map_err(read_failed)?;
+        Self::from_row(&row).ok_or(Error("stored_policy_invalid"))
+    }
+    fn from_row(row: &postgres::Row) -> Option<Self> {
+        let percent: i16 = row.get(2);
+        match (row.get::<_, &str>(0), row.get::<_, Option<String>>(1)) {
+            ("exact", None) if percent == 100 => Some(Self {
+                mint: None,
+                percent,
+            }),
+            ("sha256-transfer-id-v1", Some(mint)) if (1..=100).contains(&percent) => Some(Self {
+                mint: Some(mint),
+                percent,
+            }),
+            _ => None,
+        }
+    }
+    fn accepts(&self, transfer: &Transfer) -> bool {
+        self.mint.as_ref().is_none_or(|mint| {
+            if &transfer.mint != mint {
+                return false;
+            }
+            let hash = Sha256::digest(transfer.transfer_id.as_bytes());
+            let prefix = u64::from_be_bytes(hash[..8].try_into().expect("hash prefix"));
+            // prefix / 2^64 < percent / 100, exactly, in integers.
+            u128::from(prefix) * 100 < (self.percent as u128) << 64
+        })
+    }
+    fn json(&self) -> serde_json::Value {
+        match &self.mint {
+            None => serde_json::json!({"policy":"exact","numerator":100,"denominator":100}),
+            Some(mint) => {
+                serde_json::json!({"policy":"sha256-transfer-id-v1","numerator":self.percent,"denominator":100,"mint":mint})
+            }
+        }
+    }
+}
+
 impl Store {
     pub fn open(db: &Database) -> Result<Self> {
         Ok(Self {
@@ -124,6 +176,59 @@ impl Store {
             stats: WriteStats::default(),
             statements: None,
         })
+    }
+
+    /// The policy is fixed before any input is admitted to this session.
+    pub fn init_sample(db: &Database, mint: &str, percent: i16) -> Result<serde_json::Value> {
+        if !(1..=100).contains(&percent) {
+            return Err(Error("invalid_sample_percent"));
+        }
+        if bs58::decode(mint)
+            .into_vec()
+            .map_or(true, |v| v.len() != 32)
+        {
+            return Err(Error("invalid_mint"));
+        }
+        let mut client = db.connect()?;
+        let mut tx = client.transaction().map_err(write_failed)?;
+        let row = tx
+            .query_one(
+                "SELECT policy,mint,percent FROM dataset_policy WHERE singleton FOR UPDATE",
+                &[],
+            )
+            .map_err(read_failed)?;
+        let policy: String = row.get(0);
+        let existing: Option<String> = row.get(1);
+        let sampled = Sampling {
+            mint: Some(mint.into()),
+            percent,
+        };
+        if policy == "sha256-transfer-id-v1"
+            && existing.as_deref() == Some(mint)
+            && row.get::<_, i16>(2) == percent
+        {
+            tx.commit().map_err(|_| Error("storage_commit_failed"))?;
+            return Ok(sampled.json());
+        }
+        let occupied: bool = tx.query_one("SELECT EXISTS(SELECT 1 FROM captures) OR EXISTS(SELECT 1 FROM live_raw) OR EXISTS(SELECT 1 FROM historical_inputs) OR EXISTS(SELECT 1 FROM historical_slots) OR EXISTS(SELECT 1 FROM live_runs) OR EXISTS(SELECT 1 FROM transfers)", &[]).map_err(read_failed)?.get(0);
+        if policy != "exact" || occupied {
+            return Err(Error("sample_session_not_empty"));
+        }
+        tx.execute(
+            "UPDATE dataset_policy SET policy='sha256-transfer-id-v1', mint=$1, percent=$2 WHERE singleton",
+            &[&mint, &percent],
+        )
+        .map_err(write_failed)?;
+        tx.commit().map_err(|_| Error("storage_commit_failed"))?;
+        Ok(sampled.json())
+    }
+
+    pub fn sampling(db: &Database) -> Result<serde_json::Value> {
+        let mut client = db.connect()?;
+        let mut tx = client.transaction().map_err(read_failed)?;
+        let policy = Sampling::from_tx(&mut tx)?;
+        tx.commit().map_err(read_failed)?;
+        Ok(policy.json())
     }
 
     /// Creates and migrates the session schema, reporting the schema version.
@@ -304,6 +409,11 @@ impl Store {
         }
         let statements = self.statements.clone().expect("prepared above");
         let mut tx = self.db.transaction()?;
+        let sampling = Sampling::from_row(&tx.query_one(
+            "SELECT policy,mint,percent FROM dataset_policy WHERE singleton FOR SHARE",
+            &[],
+        )?)
+        .expect("dataset policy constrained by schema");
         let mut seen = HashSet::new();
         let firsts: Vec<&Prepared<'_>> = prepared
             .iter()
@@ -356,6 +466,7 @@ impl Store {
                 .iter()
                 .filter_map(|p| p.item.decoded.as_ref().ok().map(|t| (p.signature, t)))
                 .flat_map(|(signature, transfers)| transfers.iter().map(move |t| (signature, t)))
+                .filter(|(_, transfer)| sampling.accepts(transfer))
                 .collect();
             rows.sort_by(|a, b| (a.1.slot, &a.1.transfer_id).cmp(&(b.1.slot, &b.1.transfer_id)));
             let counts = insert_transfer_rows(&mut tx, &statements.transfers, &rows)?;
@@ -365,7 +476,7 @@ impl Store {
         }
         for p in repeats {
             let mut item = tx.savepoint("item")?;
-            match reconcile_repeat(&mut item, p) {
+            match reconcile_repeat(&mut item, p, &sampling) {
                 Ok(kept) => {
                     item.commit()?;
                     results[p.index] = Some(kept);
@@ -438,6 +549,7 @@ impl Store {
         let mut out = window::aggregate(&mut client, mint, None)?;
         out["coverage"] = serde_json::json!("unknown");
         out["window"] = serde_json::json!("all_stored");
+        out["sampling"] = Self::sampling(db)?;
         Ok(out)
     }
 
@@ -450,6 +562,9 @@ impl Store {
         }
         let mut client = db.connect()?;
         let mut transaction = client.transaction().map_err(write_failed)?;
+        if Sampling::from_tx(&mut transaction)?.mint.is_some() {
+            return Err(Error("sample_prune_not_supported"));
+        }
         // Serializes concurrent prunes; writers are not blocked.
         transaction
             .execute("SELECT pg_advisory_xact_lock(7311946003)", &[])
@@ -729,7 +844,11 @@ fn insert_transfer_rows(
 /// Reconciles an observation of an already stored transaction inside the caller's
 /// savepoint. `Err` rolls the item back; `Ok(result)` keeps its writes, including a
 /// durable quarantine receipt when `result` is an error.
-fn reconcile_repeat(tx: &mut Transaction<'_>, prepared: &Prepared<'_>) -> Result<Result<usize>> {
+fn reconcile_repeat(
+    tx: &mut Transaction<'_>,
+    prepared: &Prepared<'_>,
+    sampling: &Sampling,
+) -> Result<Result<usize>> {
     let Prepared {
         item: BatchItem {
             capture,
@@ -811,10 +930,10 @@ fn reconcile_repeat(tx: &mut Transaction<'_>, prepared: &Prepared<'_>) -> Result
             .iter()
             .map(|r| (r.get::<_, String>(0), r.get::<_, String>(1)))
             .collect::<BTreeMap<_, _>>();
-        if old.len() != incoming.len() {
+        if old.len() != incoming.iter().filter(|t| sampling.accepts(t)).count() {
             outcome = Err(Error("capture_conflict"));
         }
-        for new in incoming {
+        for new in incoming.iter().filter(|t| sampling.accepts(t)) {
             let Some(old) = old.get(&new.transfer_id) else {
                 outcome = Err(Error("capture_conflict"));
                 break;
@@ -894,7 +1013,8 @@ pub(crate) fn insert_transfers(
         Vec::new(),
     );
     let (mut block_times, mut amounts, mut fees) = (Vec::new(), Vec::new(), Vec::new());
-    for transfer in transfers {
+    let sampling = Sampling::from_tx(tx)?;
+    for transfer in transfers.iter().filter(|t| sampling.accepts(t)) {
         ids.push(transfer.transfer_id.as_str());
         slots.push(i64::try_from(transfer.slot).map_err(|_| Error("unsupported_slot"))?);
         outer.push(

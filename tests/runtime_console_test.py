@@ -36,10 +36,12 @@ class RuntimeConsole(unittest.TestCase):
             "INDEXER_BACKFILL_START": "100", "INDEXER_BACKFILL_END": "149",
             "INDEXER_LIVE_FROM": "990", "INDEXER_LIVE_SECONDS": "10"}, 1000)
         self.assertEqual((custom["slot_start"], custom["slot_end"], custom["live_from"]), (100, 149, 990))
+        self.assertIsNone(default["sample_percent"])
+        self.assertEqual(RUNTIME.configuration({"INDEXER_SAMPLE_PERCENT": "100"}, 1000)["sample_percent"], 100)
         for options in [{"INDEXER_MINT": "bad"}, {"INDEXER_BACKFILL_SLOTS": "129"},
                         {"INDEXER_LIVE_SECONDS": "301"}, {"INDEXER_BACKFILL_END": "1001"},
                         {"INDEXER_BACKFILL_START": "0"}, {"INDEXER_LIVE_FROM": "-1"},
-                        {"INDEXER_KEEP_TRANSFERS": "0"}]:
+                        {"INDEXER_KEEP_TRANSFERS": "0"}, {"INDEXER_SAMPLE_PERCENT": "0"}, {"INDEXER_SAMPLE_PERCENT": "101"}]:
             with self.assertRaises(ValueError):
                 RUNTIME.configuration(options, 1000)
 
@@ -53,7 +55,7 @@ class RuntimeConsole(unittest.TestCase):
             self.assertEqual(restarted["live_from"],1996)
             self.assertEqual(restarted["replay_job"],original["replay_job"])
             for changed in [{"INDEXER_BACKFILL_SLOTS":"49"},{"INDEXER_BACKFILL_START":"952"},
-                            {"INDEXER_REPLAY_JOB":"different"},{"INDEXER_MINT":"So11111111111111111111111111111111111111112"}]:
+                            {"INDEXER_REPLAY_JOB":"different"},{"INDEXER_SAMPLE_PERCENT":"10"},{"INDEXER_MINT":"So11111111111111111111111111111111111111112"}]:
                 with self.assertRaises(ValueError):
                     RUNTIME.resume_configuration(session,changed,2000)
             self.assertEqual(json.loads((session / "session.json").read_text()),original)
@@ -102,6 +104,25 @@ class RuntimeConsole(unittest.TestCase):
                 server.shutdown()
                 server.server_close()
                 thread.join()
+
+    def test_sampled_runtime_fixes_policy_once_and_rejects_mismatched_restarts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            session = Path(directory)
+            binary = ROOT / "target/debug/helius-indexer"
+            sampled, exact = database(), database()
+            RUNTIME.initialize(session, binary, sampled, CONSOLE_MINT, 25)
+            RUNTIME.initialize(session, binary, sampled, CONSOLE_MINT, 25)
+            policy = RUNTIME.CONSOLE.command(session, "sample-status", sampled)
+            self.assertEqual((policy["policy"], policy["numerator"], policy["mint"]),
+                             ("sha256-transfer-id-v1", 25, CONSOLE_MINT))
+            self.assertEqual(RUNTIME.CONSOLE.command(session, "query", sampled)["sampling"], policy)
+            for changed in [None, 10]:
+                with self.assertRaises((ValueError, RuntimeError)):
+                    RUNTIME.initialize(session, binary, sampled, CONSOLE_MINT, changed)
+            RUNTIME.initialize(session, binary, exact)
+            RUNTIME.CONSOLE.command(session, "ingest", exact, ROOT / "tests/fixtures/mainnet-transfer.json")
+            with self.assertRaises(RuntimeError):
+                RUNTIME.initialize(session, binary, exact, CONSOLE_MINT, 25)
 
     def test_independent_sample_checks_retained_instruction_values(self):
         spec = importlib.util.spec_from_file_location("comparison", ROOT / "scripts/compare-captured-usdc.py")

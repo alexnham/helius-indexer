@@ -18,7 +18,7 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
-const USAGE: &str = "usage: DATABASE_URL=postgres://... helius-indexer COMMAND, where SESSION is a schema name (^[a-z][a-z0-9_]*$), not a file path: replay-create SESSION JOB MINT START END | replay-status/replay-retry/replay-grant SESSION JOB | replay-route SESSION JOB CACHE | archive-grant SESSION JOB | replay-gap SESSION JOB | gap-grant SESSION JOB | replay SESSION JOB SECONDS | replay-monitor SESSION JOB LIVE_FROM SECONDS [CACHE] | replay-overlap SESSION JOB | health SESSION | migrate SESSION | consume SESSION SECONDS (uses INDEXER_KAFKA_BROKERS) | comparison-input SESSION MINT [--sample] | monitor SESSION MINT LIVE_FROM START END SECONDS | query-recent SESSION [MINT] [WINDOW] [--limit N] [--cursor C] | ingest SESSION CAPTURE [--metrics FILE] | query SESSION [MINT] [WINDOW] [--limit N] [--cursor C] | backfill SESSION MINT START END [--metrics FILE] | coverage SESSION MINT START END | live SESSION FROM_SLOT SECONDS [MINT] | prune SESSION KEEP | live-status SESSION | live-retry SESSION | summary SESSION MINT [WINDOW] | overlap SESSION START END SECONDS | repair SESSION START END | repair-status SESSION START END | repair-history-archive SESSION MINT START END | repair-history SESSION MINT START END | [feature archive] replay-archive SESSION JOB CACHE | archive/archive-replay/archive-overlap SESSION CACHE MINT START END | bridge-plan SESSION CACHE MINT START | bridge SESSION CACHE MINT START | bridge-status SESSION MINT START | bridge-live SESSION CACHE START SECONDS | archive-overlap-replay SESSION MINT START END | archive-tip CACHE | archive-live SESSION CACHE START END SECONDS";
+const USAGE: &str = "usage: DATABASE_URL=postgres://... helius-indexer COMMAND, where SESSION is a schema name (^[a-z][a-z0-9_]*$), not a file path: replay-create SESSION JOB MINT START END | replay-status/replay-retry/replay-grant SESSION JOB | replay-route SESSION JOB CACHE | archive-grant SESSION JOB | replay-gap SESSION JOB | gap-grant SESSION JOB | replay SESSION JOB SECONDS | replay-monitor SESSION JOB LIVE_FROM SECONDS [CACHE] | replay-overlap SESSION JOB | health SESSION | migrate SESSION | sample-init SESSION MINT PERCENT | sample-status SESSION | consume SESSION SECONDS (uses INDEXER_KAFKA_BROKERS) | comparison-input SESSION MINT [--sample] | monitor SESSION MINT LIVE_FROM START END SECONDS | query-recent SESSION [MINT] [WINDOW] [--limit N] [--cursor C] | ingest SESSION CAPTURE [--metrics FILE] | query SESSION [MINT] [WINDOW] [--limit N] [--cursor C] | backfill SESSION MINT START END [--metrics FILE] | coverage SESSION MINT START END | live SESSION FROM_SLOT SECONDS [MINT] | prune SESSION KEEP | live-status SESSION | live-retry SESSION | summary SESSION MINT [WINDOW] | overlap SESSION START END SECONDS | repair SESSION START END | repair-status SESSION START END | repair-history-archive SESSION MINT START END | repair-history SESSION MINT START END | [feature archive] replay-archive SESSION JOB CACHE | archive/archive-replay/archive-overlap SESSION CACHE MINT START END | bridge-plan SESSION CACHE MINT START | bridge SESSION CACHE MINT START | bridge-status SESSION MINT START | bridge-live SESSION CACHE START SECONDS | archive-overlap-replay SESSION MINT START END | archive-tip CACHE | archive-live SESSION CACHE START END SECONDS";
 
 fn ingest(db: &str, input: &str, telemetry: &mut Telemetry) -> Result<serde_json::Value> {
     let started = Instant::now();
@@ -296,6 +296,14 @@ fn run(args: &[String], telemetry: &mut Telemetry) -> Result<serde_json::Value> 
                 telemetry,
             )
         }
+        [command, db, mint, percent] if command == "sample-init" => Store::init_sample(
+            &Database::from_env(db)?,
+            mint,
+            percent
+                .parse()
+                .map_err(|_| Error("invalid_sample_percent"))?,
+        ),
+        [command, db] if command == "sample-status" => Store::sampling(&Database::from_env(db)?),
         [command, db] if command == "migrate" => Store::migrate(&Database::from_env(db)?),
         [command, db, seconds] if command == "consume" => {
             let seconds: u64 = seconds.parse().map_err(|_| Error("invalid_live_bounds"))?;
@@ -468,7 +476,9 @@ fn windowed(command: &str, args: &[String]) -> Result<serde_json::Value> {
         let [mint] = mint else {
             return Err(Error(USAGE));
         };
-        return window::window_summary(&database, mint, window);
+        let mut out = window::window_summary(&database, mint, window)?;
+        out["sampling"] = Store::sampling(&database)?;
+        return Ok(out);
     }
     if mint.len() > 1 {
         return Err(Error(USAGE));
@@ -482,6 +492,7 @@ fn windowed(command: &str, args: &[String]) -> Result<serde_json::Value> {
         cursor,
     )?;
     out["live"] = helius_indexer::live::Intake::report(&database)?;
+    out["sampling"] = Store::sampling(&database)?;
     Ok(out)
 }
 
@@ -509,7 +520,7 @@ fn stored(
     } else {
         Store::query(database, mint, limit)?
     };
-    let mut out = json!({"coverage":"unknown","limit":limit,"transfers":transfers,
+    let mut out = json!({"sampling":Store::sampling(database)?,"coverage":"unknown","limit":limit,"transfers":transfers,
         "live":helius_indexer::live::Intake::report(database)?});
     if recent {
         out["order"] = json!("newest_first");

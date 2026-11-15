@@ -49,6 +49,7 @@ services:
       INDEXER_ARCHIVE: ${INDEXER_ARCHIVE:-1}
       # Replace the session's copied binary with a rebuilt image's only when set to 1.
       INDEXER_UPGRADE_BINARY: ${INDEXER_UPGRADE_BINARY:-0}
+      INDEXER_SAMPLE_PERCENT: ${INDEXER_SAMPLE_PERCENT:-}
       # Unix socket on a shared volume: private to these containers, so plaintext is allowed.
       DATABASE_URL: host=/var/run/postgresql user=indexer dbname=indexer
       # Live input goes through Kafka; the consumer service writes it to PostgreSQL.
