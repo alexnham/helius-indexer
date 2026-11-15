@@ -452,8 +452,11 @@ lifetime of the demo.
 The standalone archive backfill wrapper preserves the bridge's frozen range,
 independent pending/verified counts and overlap proof. Its fsynced manifest
 records each batch's pessimistic byte reservation before starting the native
-worker. Interrupted or failed work retains the charge with unknown actual bytes;
-reported source response bytes remain distinct from reserved ceilings and billing.
+worker. A batch that reports its source response bytes is then charged those bytes;
+interrupted or failed work retains the worst-case charge with unknown actual bytes.
+Charged bytes are a scheduling allowance, distinct from billing. A failed or timed-out
+native command appends its redacted stderr events to the session's `events.jsonl` and
+reports only the CLI's fixed error class.
 Cancellation, low disk and exhausted allowances stop scheduling without advancing
 coverage. Time probes are bounded, preserve null/skipped/unavailable time as
 unknown, and explicitly label the selected start as unverified temporal coverage.

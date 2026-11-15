@@ -24,7 +24,7 @@ render({worker: {state: 'budget_exhausted'}, configuration: {mint: 'USDC', slot_
   backfill: {window: {cutoff_unix_seconds: 100, measured_at_unix_seconds: 200},
     budget: {reserved_bytes: 738197504, max_reserved_bytes: 2147483648, actual_response_bytes: 12, unknown_actual_batches: 1}}});
 assert.match(get('stages').textContent, /80/);
-assert.match(get('stages').textContent, /Reserved bytes: 738197504/);
+assert.match(get('stages').textContent, /Charged bytes: 738197504/);
 assert.match(get('stages').textContent, /Batches with unknown actual bytes: 1/);
 assert.match(get('meta').textContent, /sample/i);
 assert.match(get('notice').textContent, /incomplete/i);

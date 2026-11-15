@@ -19,7 +19,8 @@ SAMPLE_PERCENT = 10
 BATCH_RESERVE = 704 * 1024 * 1024  # archive 128 MiB + nine RPC blocks at 64 MiB
 DEFAULT_RESERVE_LIMIT = 2 * 1024**3
 DEFAULT_MIN_FREE = 10 * 1024**3
-CHILD_TIMEOUT_SECONDS = 180
+# Above the native per-batch bounds: 120 s archive plus nine 20 s RPC block requests.
+CHILD_TIMEOUT_SECONDS = 360
 MANIFEST_NAME = "archive-backfill.json"
 
 
@@ -52,34 +53,45 @@ def read_json_output(stdout):
     return value
 
 
-def child(binary, args, env, timeout=None):
+def child(session, argv, env, timeout=None):
     if timeout is None:
         timeout = CHILD_TIMEOUT_SECONDS
     process = subprocess.Popen(
-        [str(binary), *map(str, args)], stdout=subprocess.PIPE,
+        [str(session.binary), *map(str, argv)], stdout=subprocess.PIPE,
         stderr=subprocess.PIPE, env=env, cwd=ROOT,
     )
-    try:
-        stdout, _ = process.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
+
+    def reap():
         process.terminate()
         try:
-            process.communicate(timeout=5)
+            return process.communicate(timeout=5)[1]
         except subprocess.TimeoutExpired:
             process.kill()
-            process.communicate()
+            return process.communicate()[1]
+
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # Keep the killed command's diagnostics; they are the only evidence of the timeout.
+        keep_events(session.directory, reap())
         raise SafeError("indexer command timed out; actual bytes are unknown") from None
     except KeyboardInterrupt:
-        process.terminate()
-        try:
-            process.communicate(timeout=5)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.communicate()
+        keep_events(session.directory, reap())
         raise
+    keep_events(session.directory, stderr)
     if process.returncode:
-        raise SafeError("indexer command failed; actual bytes are unknown")
+        # Error classes are fixed identifiers from the CLI, never inputs or credentials.
+        classes = re.findall(rb'"error_class":"([a-z0-9_]{1,64})"', stderr)
+        detail = ": " + classes[-1].decode() if classes else ""
+        raise SafeError(f"indexer command failed{detail}; actual bytes are unknown; inspect events.jsonl")
     return read_json_output(stdout)
+
+
+def keep_events(directory, stderr):
+    # The indexer's stderr is its redacted structured event stream, as in scripts/local-test.py.
+    if stderr:
+        with (directory / "events.jsonl").open("ab") as log:
+            log.write(stderr)
 
 
 def session_args(parser):
@@ -234,20 +246,12 @@ def plan(args):
         start = args.start_slot
 
     if window is not None:
-        allowed = {"cutoff_unix_seconds", "measured_at_unix_seconds", "reference_slot",
-                   "start_slot", "boundary_status", "days"}
-        observations = window.get("observations", []) if isinstance(window, dict) else []
-        window = {key: window[key] for key in allowed if key in window}
-        if isinstance(observations, list):
-            window["observations"] = [
-                {key: row[key] for key in ("slot", "block_time") if key in row}
-                for row in observations if isinstance(row, dict)
-            ]
+        window = sanitize_window(window)
 
-    child(args.binary, ["sample-init", args.session, args.mint, SAMPLE_PERCENT], env)
-    report = child(args.binary, ["bridge-plan", args.session,
+    child(args, ["sample-init", args.session, args.mint, SAMPLE_PERCENT], env)
+    report = child(args, ["bridge-plan", args.session,
                                  args.directory / "archive-cache", args.mint, start], env)
-    sampling = child(args.binary, ["sample-status", args.session], env)
+    sampling = child(args, ["sample-status", args.session], env)
     if sampling.get("policy") != "sha256-transfer-id-v1" or sampling.get("numerator") != SAMPLE_PERCENT or sampling.get("mint") != args.mint:
         raise SafeError("sampling policy did not confirm the requested 10% sample")
     if not stored_binary.exists():
@@ -287,32 +291,41 @@ def read_window_file(path):
             or any(not isinstance(raw.get(key), int) for key in required_ints)
             or not isinstance(raw.get("observations"), list)):
         raise SafeError("window file metadata is invalid")
+    safe = sanitize_window(raw)
+    if safe["start_slot"] <= 0 or safe["reference_slot"] <= 0:
+        raise SafeError("window file has invalid slot bounds")
+    return safe
+
+
+def sanitize_window(raw):
     allowed = {"cutoff_unix_seconds", "measured_at_unix_seconds", "reference_slot",
                "start_slot", "boundary_status", "days"}
     safe = {key: raw[key] for key in allowed if key in raw}
-    safe["observations"] = [
-        {key: row[key] for key in ("slot", "block_time") if key in row}
-        for row in raw["observations"] if isinstance(row, dict)
-    ]
-    if safe["start_slot"] <= 0 or safe["reference_slot"] <= 0:
-        raise SafeError("window file has invalid slot bounds")
+    observations = raw.get("observations", [])
+    if isinstance(observations, list):
+        safe["observations"] = [
+            {key: row[key] for key in ("slot", "block_time") if key in row}
+            for row in observations if isinstance(row, dict)
+        ]
     return safe
 
 
 def status(args):
     env = setup(args, provider=False)
     path, _ = manifest_paths(args.directory)
-    with locked(args.directory):
-        manifest = load_manifest(path, args)
-        frozen_binary(args, manifest)
-        bridge = child(args.binary, ["bridge-status", args.session, args.mint, manifest["start_slot"]], env)
-        sampling = child(args.binary, ["sample-status", args.session], env)
-        output = {
-            "manifest": {key: manifest.get(key) for key in (
-                "session", "mint", "start_slot", "window", "sampling", "budget", "batches",
-            )},
-            "bridge": bridge, "sampling": sampling,
-        }
+    # Read-only, so no lock: a run holds it for its whole loop, and the manifest is
+    # replaced atomically.
+    manifest = load_manifest(path, args)
+    frozen_binary(args, manifest)
+    bridge = child(args, ["bridge-status", args.session, args.mint, manifest["start_slot"]], env)
+    sampling = child(args, ["sample-status", args.session], env)
+    output = {
+        "manifest": {key: manifest.get(key) for key in (
+            "session", "mint", "start_slot", "state", "stop_reason", "window", "sampling",
+            "budget", "batches",
+        )},
+        "bridge": bridge, "sampling": sampling,
+    }
     print(json.dumps(output, sort_keys=True))
 
 
@@ -333,6 +346,10 @@ def run(args):
     with locked(args.directory):
         manifest = load_manifest(path, args)
         frozen_binary(args, manifest)
+        # Starting a run is the operator's explicit resume; a CANCEL left by an earlier
+        # run would otherwise stop every later one before its first batch.
+        stale_cancel = cancel_file.exists()
+        cancel_file.unlink(missing_ok=True)
         manifest["state"] = "running"
         manifest["stop_reason"] = None
         manifest["budget"]["max_reserved_bytes"] = args.max_reserved_bytes
@@ -344,68 +361,16 @@ def run(args):
         write_manifest(path, manifest)
 
         initial_total_batches = manifest.get("total_batches", 0)
-        for _ in range(args.max_batches):
-            if cancel_file.exists():
-                manifest["stop_reason"] = "cancel_file"
-                break
-            bridge = child(args.binary, ["bridge-status", args.session, args.mint,
-                                         manifest["start_slot"]], env)
-            progress = bridge.get("historical", {})
-            if progress.get("complete") is True or progress.get("pending_slots") == 0:
-                manifest["state"] = "complete"
-                manifest["stop_reason"] = "coverage_complete"
-                break
-            free_bytes = shutil.disk_usage(args.directory).free
-            if free_bytes < args.min_free_bytes:
-                manifest["stop_reason"] = "free_disk_below_threshold"
-                break
-            budget = manifest["budget"]
-            if budget["reserved_bytes"] + BATCH_RESERVE > args.max_reserved_bytes:
-                manifest["stop_reason"] = "byte_reservation_limit"
-                break
-
-            manifest["total_batches"] = manifest.get("total_batches", 0) + 1
-            attempt = {"number": manifest["total_batches"],
-                       "state": "running", "reserved_bytes": BATCH_RESERVE,
-                       "actual_response_bytes": None, "started_at_unix_seconds": int(time.time())}
-            manifest["batches"].append(attempt)
-            budget["reserved_bytes"] += BATCH_RESERVE
-            write_manifest(path, manifest)  # reservation survives a crash before the child starts
-            try:
-                report = child(args.binary, ["bridge", args.session,
-                                             args.directory / "archive-cache", args.mint,
-                                             manifest["start_slot"]], env)
-            except KeyboardInterrupt:
-                attempt.update(state="cancelled_unknown", finished_at_unix_seconds=int(time.time()))
-                budget["unknown_actual_batches"] += 1
-                manifest["stop_reason"] = "interrupted"
-                write_manifest(path, manifest)
-                break
-            except SafeError as error:
-                attempt.update(state="failed_unknown", failure="child_failed",
-                               finished_at_unix_seconds=int(time.time()))
-                budget["unknown_actual_batches"] += 1
-                manifest["state"] = "stopped"
-                manifest["stop_reason"] = "child_failed"
-                write_manifest(path, manifest)
-                raise error
-
-            actual = source_bytes(report)
-            attempt.update(state="complete", actual_response_bytes=actual,
-                           finished_at_unix_seconds=int(time.time()))
-            if actual is None:
-                budget["unknown_actual_batches"] += 1
-            else:
-                budget["actual_response_bytes"] += actual
-            attempt["progress"] = concise_bridge(report)["historical"]
-            manifest["batches"] = manifest["batches"][-256:]
+        try:
+            run_batches(args, env, path, manifest, cancel_file)
+        except KeyboardInterrupt:
+            manifest["stop_reason"] = manifest["stop_reason"] or "interrupted"
+        except BaseException:
+            # Never leave a dead run recorded as running without a reason.
+            manifest["state"] = "stopped"
+            manifest["stop_reason"] = manifest["stop_reason"] or "error"
             write_manifest(path, manifest)
-            if report.get("cancelled") is True:
-                manifest["stop_reason"] = "cancelled_by_indexer"
-                break
-            if report.get("historical", {}).get("pending_slots", 0) >= progress.get("pending_slots", 0):
-                manifest["stop_reason"] = "batch_did_not_reduce_pending_slots"
-                break
+            raise
 
         if manifest["state"] != "complete":
             manifest["state"] = "stopped"
@@ -416,7 +381,73 @@ def run(args):
     print(json.dumps({"manifest": str(path), "budget": manifest["budget"],
                       "batches_run": manifest.get("total_batches", 0) - initial_total_batches,
                       "latest_progress": manifest["batches"][-1].get("progress") if manifest["batches"] else None,
+                      "cleared_stale_cancel": stale_cancel,
                       "cancel_requested": cancel_file.exists()}, sort_keys=True))
+
+
+def run_batches(args, env, path, manifest, cancel_file):
+    for _ in range(args.max_batches):
+        if cancel_file.exists():
+            manifest["stop_reason"] = "cancel_file"
+            return
+        bridge = child(args, ["bridge-status", args.session, args.mint,
+                              manifest["start_slot"]], env)
+        progress = bridge.get("historical", {})
+        if progress.get("complete") is True or progress.get("pending_slots") == 0:
+            manifest["state"] = "complete"
+            manifest["stop_reason"] = "coverage_complete"
+            return
+        free_bytes = shutil.disk_usage(args.directory).free
+        if free_bytes < args.min_free_bytes:
+            manifest["stop_reason"] = "free_disk_below_threshold"
+            return
+        budget = manifest["budget"]
+        if budget["reserved_bytes"] + BATCH_RESERVE > args.max_reserved_bytes:
+            manifest["stop_reason"] = "byte_reservation_limit"
+            return
+
+        manifest["total_batches"] = manifest.get("total_batches", 0) + 1
+        attempt = {"number": manifest["total_batches"],
+                   "state": "running", "reserved_bytes": BATCH_RESERVE,
+                   "actual_response_bytes": None, "started_at_unix_seconds": int(time.time())}
+        manifest["batches"].append(attempt)
+        budget["reserved_bytes"] += BATCH_RESERVE
+        write_manifest(path, manifest)  # reservation survives a crash before the child starts
+        try:
+            report = child(args, ["bridge", args.session,
+                                  args.directory / "archive-cache", args.mint,
+                                  manifest["start_slot"]], env)
+        except KeyboardInterrupt:
+            attempt.update(state="cancelled_unknown", finished_at_unix_seconds=int(time.time()))
+            budget["unknown_actual_batches"] += 1
+            manifest["stop_reason"] = "interrupted"
+            return
+        except SafeError:
+            attempt.update(state="failed_unknown", failure="child_failed",
+                           finished_at_unix_seconds=int(time.time()))
+            budget["unknown_actual_batches"] += 1
+            manifest["stop_reason"] = "child_failed"
+            raise
+
+        actual = source_bytes(report)
+        attempt.update(state="complete", actual_response_bytes=actual,
+                       finished_at_unix_seconds=int(time.time()))
+        if actual is None:
+            budget["unknown_actual_batches"] += 1
+        else:
+            budget["actual_response_bytes"] += actual
+            # A measured batch is charged what it read; only unknown batches keep the worst case.
+            budget["reserved_bytes"] += actual - BATCH_RESERVE
+            attempt["reserved_bytes"] = actual
+        attempt["progress"] = concise_bridge(report)["historical"]
+        manifest["batches"] = manifest["batches"][-256:]
+        write_manifest(path, manifest)
+        if report.get("cancelled") is True:
+            manifest["stop_reason"] = "cancelled_by_indexer"
+            return
+        if report.get("historical", {}).get("pending_slots", 0) >= progress.get("pending_slots", 0):
+            manifest["stop_reason"] = "batch_did_not_reduce_pending_slots"
+            return
 
 
 def serve(args):
@@ -435,10 +466,10 @@ def serve(args):
 
     def runtime_status():
         current = json.loads(path.read_text(encoding="utf-8"))
-        bridge = child(args.binary, ["bridge-status", args.session, args.mint,
+        bridge = child(args, ["bridge-status", args.session, args.mint,
                                      current["start_slot"]], env)
-        sampling = child(args.binary, ["sample-status", args.session], env)
-        summary = child(args.binary, ["summary", args.session, args.mint], env)
+        sampling = child(args, ["sample-status", args.session], env)
+        summary = child(args, ["summary", args.session, args.mint], env)
         return {
             "worker": {"state": current.get("state", "stopped"),
                        "stop_reason": current.get("stop_reason")},

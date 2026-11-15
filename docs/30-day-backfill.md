@@ -28,10 +28,17 @@ known block-time eligibility and disclose null block times.
 
 Each bridge batch processes at most eight positions, under its existing 128 MiB
 archive and nine 64 MiB RPC response ceilings. The wrapper reserves 704 MiB before
-each batch, retains that charge across crashes, and stops at its total allowance
-or low free disk. A reservation is a conservative upper bound, not observed
-traffic or billing; actual diagnostics and an unknown failed-attempt result stay
-separate. Raw archive cache, normalized blocks and captures are all retained for
+each batch so a crash cannot reset its charge. When the batch finishes and reports
+its source response bytes, the charge drops to those bytes; failed, timed-out and
+interrupted batches keep the full 704 MiB. `run` stops at `--max-reserved-bytes`
+(default 2 GiB), low free disk, a `CANCEL` file in the session directory, or a batch
+that verified nothing new. Charged bytes are a scheduling allowance, not billing.
+Each native command may take up to 360 s, above its own 120 s archive and nine 20 s
+RPC request bounds; its stderr events go to the session's `events.jsonl`.
+
+`status` takes no lock, so it works while `run` is active. Starting `run` deletes a
+`CANCEL` file left from an earlier stop and reports `cleared_stale_cancel`; create
+the file again to stop a run in progress. Raw archive cache, normalized blocks and captures are all retained for
 repair. A 10% transfer sample saves no raw-input bytes or network/decoding work.
 Monitor the PostgreSQL disk as well as the cache filesystem, especially if they
 are on different hosts or volumes. The local dashboard shows actual sample
