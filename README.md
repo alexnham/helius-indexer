@@ -85,7 +85,8 @@ Pagination, time filtering, and aggregates arrive in the analytics ticket. Amoun
 and fees are decimal JSON strings so clients preserve the full unsigned 64-bit
 range. Internally they are integers. Missing block time or historically unresolved
 owners remain null; an instruction's signing authority is not assumed to be the
-wallet owner.
+wallet owner. In live-only operation most rows have null block time until history
+or reconcile enriches them.
 
 ## Capture contract and support boundary
 
