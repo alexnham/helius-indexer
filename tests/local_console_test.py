@@ -81,6 +81,9 @@ class LocalConsole(unittest.TestCase):
             html = response.read().decode()
             self.assertIn("Coverage is unknown", html)
             self.assertIn("BigInt", html)
+            for tab in ["transfers", "pipeline", "commands", "help"]:
+                self.assertIn(f'href="#{tab}"', html)
+                self.assertIn(f'id="tab-{tab}"', html)
             self.assertIn("frame-ancestors 'none'", response.headers["Content-Security-Policy"])
         self.assertEqual(self.server.server_address[0], "127.0.0.1")
         before = CONSOLE.command(self.session, "query", self.metadata["database"])
