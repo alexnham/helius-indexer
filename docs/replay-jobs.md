@@ -46,10 +46,10 @@ Main uses versions 2/3 for Kafka; the unpublished replay prototypes used those
 numbers for different tables. Migration 4 supplies any missing Kafka tables and
 retains existing replay tables. Migration 5 adds missing input provenance without
 resetting scope, receipts or charged budgets. This supports both main and the
-version 2/3 replay prototypes; migrations 6–8 add routing, archive attempts and overlap outcomes; the current schema version is 8. Raw rows referenced by replay receipts are classified as replay;
+version 2/3 replay prototypes; migrations 6, 7 and 9 add routing, archive attempts and overlap outcomes (8 adds transfer columns); the current schema version is 9. Raw rows referenced by replay receipts are classified as replay;
 missing historical attempt/hash/acknowledgment provenance stays null. Back up the
 session using PostgreSQL tooling before upgrading. Earlier binaries reject newer
-schema versions (the current version is 8); rolling back requires restoring the
+schema versions (the current version is 9); rolling back requires restoring the
 pre-upgrade backup into a separate session and using its matching binary. Do not manually decrement the migration
 version or delete receipts to make an older binary open an upgraded session.
 The new tables currently have no deletion/TTL policy; job receipt retention will
@@ -155,7 +155,7 @@ additive; roll back as above.
 
 `replay-overlap` makes no provider request. For each slot of the latest route's
 `overlap` segments it compares retained archive and replay captures through the
-shared reconciler and decoder, and appends an outcome (migration 8) tied to the
+shared reconciler and decoder, and appends an outcome (migration 9) tied to the
 route and decoder revision:
 
 | Outcome | Meaning |
@@ -184,7 +184,7 @@ live-priority gate: retained retry, a replay attempt when the route has replay o
 overlap slots (or the job has no route), one archive batch when the binary has the
 archive feature and CACHE is given, then overlap reconciliation. A failed or
 exhausted step is reported and the next step still runs; none can stop live intake.
-Migration 8 is additive; roll back as above.
+Migration 9 is additive; roll back as above.
 
 ## Scope still pending
 

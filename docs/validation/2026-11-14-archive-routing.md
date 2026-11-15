@@ -75,7 +75,7 @@ both sides are the same transaction in each source's form.
 
 ## Recovery and rollback
 
-Migrations 6–8 are additive: new tables, plus two defaulted columns on
+Migrations 6, 7 and 9 are additive: new tables, plus two defaulted columns on
 `replay_jobs`. Existing jobs, receipts, budgets and output are untouched; a job
 without a route behaves as before. Each migration raises the schema version, and
 earlier binaries refuse a newer session. Roll back by restoring the pre-upgrade
