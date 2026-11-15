@@ -1608,7 +1608,7 @@ mod consumer_tests {
             .unwrap();
         let worker = consume_in_background(&test, &topic.0, 12);
         wait_for_lock_waiter(&test);
-        // Statistics snapshots taken while the input is fetched but not yet stored.
+        // Settle while the batch write waits; the lag measured before it saw nothing stored.
         std::thread::sleep(Duration::from_secs(3));
         lock.batch_execute("COMMIT;").unwrap();
         let report = worker.join().unwrap();

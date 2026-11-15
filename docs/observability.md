@@ -470,7 +470,9 @@ For the #36 metrics, the consumer report and events give:
   high watermark minus the position stored with the output, summed over assigned
   partitions. Fetched but unwritten input therefore counts. It is measured at most once a
   second before a write, within a one-second request budget; a failed or slow request,
-  or no assignment, gives `null` (unknown), never zero.
+  or no assignment, gives `null` (unknown), never zero. While the broker is unreachable each
+  measurement spends its whole budget, so writes can slow by up to one second per second,
+  and the exit report can take one more second.
 - **Rebalances:** `rebalances.assigned` and `rebalances.revoked`, plus a
   `consumer_rebalanced` event (operation `assign` or `revoke`) for each one.
 - **Retries:** `batch_retries` counts batches that failed storage and were retried
