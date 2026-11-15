@@ -47,8 +47,14 @@ services:
       INDEXER_KEEP_TRANSFERS: ${INDEXER_KEEP_TRANSFERS:-1000}
       # Unix socket on a shared volume: private to these containers, so plaintext is allowed.
       DATABASE_URL: host=/var/run/postgresql user=indexer dbname=indexer
+      # Live input goes through Kafka; the consumer service writes it to PostgreSQL.
+      # The Compose network is private to these containers, so plaintext is allowed.
+      INDEXER_KAFKA_BROKERS: kafka:9092
+      INDEXER_KAFKA_PRIVATE_NETWORK: "1"
     depends_on:
       postgres:
+        condition: service_healthy
+      kafka:
         condition: service_healthy
     ports:
       - "127.0.0.1:${INDEXER_RUNTIME_PORT:-8767}:${INDEXER_RUNTIME_PORT:-8767}"
@@ -64,6 +70,40 @@ services:
     security_opt: [no-new-privileges:true]
     cpus: 1.0
     mem_limit: 768m
+    pids_limit: 64
+    stop_grace_period: 20s
+
+  # Drains the runtime's Kafka intake into its PostgreSQL session. Each `consume` run is
+  # bounded; the loop restarts it, and a failed run retries after 5 s from stored positions.
+  consumer:
+    profiles: [live]
+    image: ${INDEXER_CONSOLE_IMAGE:-helius-indexer-console:local}
+    build:
+      context: .
+      target: console
+    entrypoint: [sh, -c, 'while :; do helius-indexer consume "$$INDEXER_DB_SESSION" 300 || sleep 5; done']
+    environment:
+      INDEXER_DB_SESSION: ${INDEXER_DB_SESSION:-runtime}
+      DATABASE_URL: host=/var/run/postgresql user=indexer dbname=indexer
+      INDEXER_KAFKA_BROKERS: kafka:9092
+      INDEXER_KAFKA_PRIVATE_NETWORK: "1"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    volumes:
+      - postgres-socket:/var/run/postgresql
+    healthcheck:
+      disable: true
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    init: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    cpus: 1.0
+    mem_limit: 512m
     pids_limit: 64
     stop_grace_period: 20s
 
