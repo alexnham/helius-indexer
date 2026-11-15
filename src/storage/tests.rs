@@ -158,6 +158,35 @@ fn sampled_activation_rejects_existing_exact_inputs() {
 }
 
 #[test]
+fn version_ten_session_upgrades_to_an_exact_dataset_that_cannot_turn_sampled() {
+    let db = pg::TestDatabase::new();
+    let mut sql = db.sql();
+    migrate(&mut sql, &MIGRATIONS[..10]).unwrap();
+    sql.execute(
+        "INSERT INTO captures VALUES('test',1,'{}',$1,'decoded','test')",
+        &[&b"{}".as_slice()],
+    )
+    .unwrap();
+    assert_eq!(
+        migrate(&mut sql, MIGRATIONS).unwrap(),
+        MIGRATIONS.len() as i32
+    );
+    let path = &db.0;
+    assert_eq!(Store::sampling(path).unwrap()["policy"], "exact");
+    assert_eq!(
+        Store::init_sample(path, &bs58::encode([3u8; 32]).into_string(), 10)
+            .unwrap_err()
+            .0,
+        "sample_session_not_empty"
+    );
+    let kept: i64 = sql
+        .query_one("SELECT COUNT(*) FROM captures", &[])
+        .unwrap()
+        .get(0);
+    assert_eq!(kept, 1);
+}
+
+#[test]
 fn activation_waits_for_inflight_input_and_rejects_exact_dataset() {
     let db = pg::TestDatabase::new();
     let path = &db.0;
