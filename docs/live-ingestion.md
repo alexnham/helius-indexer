@@ -49,10 +49,12 @@ at a time; there is no unbounded transaction/telemetry queue.
 
 ```sh
 # Set HELIUS_API_KEY securely in the process environment; do not put it in argv.
-INDEXER_LIVE_OPT_IN=1 cargo run --locked -- live data/live.sqlite START_SLOT 30
-cargo run --locked -- live-status data/live.sqlite
-cargo run --locked -- live-retry data/live.sqlite
-cargo run --locked -- query data/live.sqlite EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+# DATABASE_URL names the PostgreSQL server; SESSION is a schema name, not a file path.
+export DATABASE_URL=postgres://...
+INDEXER_LIVE_OPT_IN=1 cargo run --locked -- live SESSION START_SLOT 30
+cargo run --locked -- live-status SESSION
+cargo run --locked -- live-retry SESSION
+cargo run --locked -- query SESSION EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
 ```
 
 Compatible sources can now share a validation database; use the combined overlap
@@ -62,8 +64,8 @@ seconds; intake stops at 10,000 received transactions even if time remains.
 Subscription attempts stop at three; connection timeout is five seconds,
 unary request timeout ten seconds, and stream inactivity timeout ten seconds.
 The overall asynchronous deadline also covers connect/replay/reference work.
-A synchronous SQLite operation can extend shutdown by its bounded five-second
-busy wait. Ctrl-C/process termination closes the connection; committed raw inputs
+The deadline bounds network waits only; a synchronous PostgreSQL write already in
+progress completes before shutdown and can extend it. Ctrl-C/process termination closes the connection; committed raw inputs
 remain retryable. No network is opened by ordinary commands/tests. A fixed
 mainnet endpoint avoids accepting credential-bearing URLs or arbitrary networks.
 
@@ -78,7 +80,7 @@ unresolved IDs across calls/restarts so an unsupported oldest batch cannot hide
 later recoverable input. It is manual bounded recovery, not a durable supervisor.
 See [the recovery runbook](recovery.md) for restart order, cursor semantics, and
 verified failure boundaries. A stored schema identifier that differs from the pinned decoder is
-rejected without interpreting the payload. Preserve the SQLite database; the stream cursor alone is insufficient.
+rejected without interpreting the payload. Preserve the PostgreSQL session schema; the stream cursor alone is insufficient.
 The additive `live_raw`/`live_runs` tables preserve existing offline tables;
 rollback consists of using the previous binary (which ignores the new tables).
 No automatic deletion or production migration policy is added.
