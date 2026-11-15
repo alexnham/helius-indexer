@@ -19,6 +19,10 @@ pub const RETENTION_MS: i64 = 37 * 24 * 60 * 60 * 1000;
 /// Matches the decoder's capture bound; larger inputs become retained errors, never drops.
 pub const MAX_MESSAGE_BYTES: usize = crate::decoder::MAX_CAPTURE_BYTES;
 
+/// A crashed consumer keeps its partitions until this expires. Heartbeats come from
+/// librdkafka's own thread, so a blocked storage write does not trigger it.
+const SESSION_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Broker addresses from INDEXER_KAFKA_BROKERS (never logged).
 pub fn brokers() -> Result<String> {
     std::env::var("INDEXER_KAFKA_BROKERS").map_err(|_| Error("missing_kafka_brokers"))
@@ -329,6 +333,10 @@ pub fn consume(
         .set("enable.auto.commit", "false")
         .set("enable.auto.offset.store", "false")
         .set("auto.offset.reset", "earliest")
+        .set(
+            "session.timeout.ms",
+            SESSION_TIMEOUT.as_millis().to_string(),
+        )
         .create_with_context(Positions {
             db: database.clone(),
             group: group.clone(),
@@ -1154,5 +1162,197 @@ mod consumer_tests {
             .unwrap()
             .get(0);
         assert_eq!(stored, 10);
+    }
+
+    // Crash matrix (#36). Consumer crashes kill a real child process; producer crashes are
+    // reproduced from the state they leave, since the stream loop has no offline source yet (#59).
+
+    /// Runs `consume` in a child copy of this test binary so a test can SIGKILL it.
+    fn spawn_consumer(test: &TestDatabase, topic: &str) -> std::process::Child {
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "kafka::consumer_tests::child_consumer",
+                "--exact",
+                "--ignored",
+            ])
+            .env(
+                "INDEXER_TEST_CHILD_CONSUMER",
+                format!("{} {topic}", test.0.session()),
+            )
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+
+    #[test]
+    #[ignore = "run as a child process by the crash tests"]
+    fn child_consumer() {
+        let Ok(spec) = std::env::var("INDEXER_TEST_CHILD_CONSUMER") else {
+            return;
+        };
+        let (session, topic) = spec.split_once(' ').unwrap();
+        let db = crate::storage::Database::new(TestDatabase::url(), session).unwrap();
+        let _ = consume(&db, &test_brokers(), topic, 60);
+    }
+
+    fn wait_for_positions(test: &TestDatabase, expected: i64) {
+        let started = std::time::Instant::now();
+        while stored_positions(test) < expected {
+            assert!(
+                started.elapsed() < Duration::from_secs(30),
+                "positions stalled"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    fn consume_in_background(
+        test: &TestDatabase,
+        topic: &str,
+        seconds: u64,
+    ) -> std::thread::JoinHandle<serde_json::Value> {
+        let (db, name) = (test.0.clone(), topic.to_string());
+        std::thread::spawn(move || consume(&db, &test_brokers(), &name, seconds).unwrap())
+    }
+
+    fn live_coverage(test: &TestDatabase) -> serde_json::Value {
+        let report = crate::live::Intake::report(&test.0).unwrap();
+        serde_json::json!([report["coverage"], report["verified_boundary"]])
+    }
+
+    #[test]
+    fn a_consumer_killed_before_or_after_its_commit_stores_each_transfer_once() {
+        let test = TestDatabase::new();
+        let topic = TestTopic::new(2);
+        produce(
+            &topic.0,
+            &(1..=6u8)
+                .map(|n| signed(n, 100 + u64::from(n)))
+                .collect::<Vec<_>>(),
+        );
+        Store::open(&test.0).unwrap();
+
+        // Killed while its batch write waits on the position row: nothing is committed.
+        let mut lock = test.sql();
+        lock.batch_execute("BEGIN; LOCK TABLE kafka_offsets IN EXCLUSIVE MODE;")
+            .unwrap();
+        let mut child = spawn_consumer(&test, &topic.0);
+        std::thread::sleep(Duration::from_secs(6));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        lock.batch_execute("COMMIT;").unwrap();
+        assert_eq!(stored_positions(&test), 0);
+        assert_eq!(Store::query(&test.0, None, 100).unwrap().len(), 0);
+        // The dead member holds its partitions until the session timeout moves them.
+        let restarted = consume_in_background(&test, &topic.0, 25);
+        wait_for_positions(&test, 6);
+        assert_eq!(
+            restarted.join().unwrap()["inserted_transfers"],
+            6,
+            "the killed batch is replayed"
+        );
+
+        // Killed after its batch committed: the restart replays nothing already stored.
+        produce(
+            &topic.0,
+            &(7..=10u8)
+                .map(|n| signed(n, 100 + u64::from(n)))
+                .collect::<Vec<_>>(),
+        );
+        let mut child = spawn_consumer(&test, &topic.0);
+        wait_for_positions(&test, 10);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let after = consume_in_background(&test, &topic.0, 25);
+        // One new input proves the restart owns the partitions, so its count is not vacuous.
+        produce(&topic.0, &[signed(11, 111)]);
+        wait_for_positions(&test, 11);
+        assert_eq!(
+            after.join().unwrap()["consumed"],
+            1,
+            "committed inputs are not replayed"
+        );
+        assert_eq!(Store::query(&test.0, None, 100).unwrap().len(), 11);
+        // Delivery and stored positions never claim coverage.
+        assert_eq!(live_coverage(&test), serde_json::json!(["unknown", null]));
+    }
+
+    #[test]
+    fn a_rebalance_mid_run_stores_each_transfer_once() {
+        let test = TestDatabase::new();
+        let topic = TestTopic::new(6);
+        Store::open(&test.0).unwrap();
+        let first = {
+            let (db, name) = (test.0.clone(), topic.0.clone());
+            std::thread::spawn(move || consume(&db, &test_brokers(), &name, 16).unwrap())
+        };
+        produce(
+            &topic.0,
+            &(1..=20u8)
+                .map(|n| signed(n, 200 + u64::from(n)))
+                .collect::<Vec<_>>(),
+        );
+        std::thread::sleep(Duration::from_secs(3));
+        // A second member joins; partitions move while the first may hold a buffered batch.
+        let second = {
+            let (db, name) = (test.0.clone(), topic.0.clone());
+            std::thread::spawn(move || consume(&db, &test_brokers(), &name, 12).unwrap())
+        };
+        produce(
+            &topic.0,
+            &(21..=40u8)
+                .map(|n| signed(n, 200 + u64::from(n)))
+                .collect::<Vec<_>>(),
+        );
+        let reports = [first.join().unwrap(), second.join().unwrap()];
+        assert_eq!(Store::query(&test.0, None, 100).unwrap().len(), 40);
+        assert_eq!(stored_positions(&test), 40);
+        let consumed: u64 = reports
+            .iter()
+            .map(|r| r["consumed"].as_u64().unwrap())
+            .sum();
+        assert!(consumed >= 40, "redelivery is allowed, loss is not");
+        assert_eq!(live_coverage(&test), serde_json::json!(["unknown", null]));
+    }
+
+    #[test]
+    fn a_producer_crash_before_publish_or_before_its_cursor_is_replayed_once() {
+        use crate::storage::live::LiveLog;
+        let mint = crate::live::USDC;
+        let test = TestDatabase::new();
+        let topic = TestTopic::new(2);
+        let stream: Vec<_> = (1..=8u8).map(|n| signed(n, 100 + u64::from(n))).collect();
+        // Run 1 delivers 101-105 and stores its cursor, then crashes before publishing 106.
+        let mut producer = IntakeProducer::new(&test_brokers(), &topic.0).unwrap();
+        for tx in &stream[..5] {
+            producer
+                .send(tx.slot, &tx.encode_to_vec(), PROTO_SCHEMA)
+                .unwrap();
+        }
+        let cursor = producer.flush(Duration::from_secs(20)).unwrap().unwrap();
+        assert_eq!(cursor, 105);
+        LiveLog::open(&test.0)
+            .unwrap()
+            .advance_producer_cursor(mint, cursor as i64)
+            .unwrap();
+        // Run 2 resumes, delivers 106-108, then crashes before storing its cursor.
+        produce(&topic.0, &stream[5..]);
+        // Run 3 resumes from the cursor still stored, so the stream replays everything after it.
+        let report = crate::live::Intake::report(&test.0).unwrap();
+        let resume = report["producer_cursors"][0]["resume_from"]
+            .as_u64()
+            .unwrap();
+        assert!(resume <= 106, "the unpublished slot is replayed");
+        let replayed: Vec<_> = stream
+            .iter()
+            .filter(|tx| tx.slot >= resume)
+            .cloned()
+            .collect();
+        produce(&topic.0, &replayed);
+        let consumed = consume(&test.0, &test_brokers(), &topic.0, 6).unwrap();
+        assert_eq!(consumed["consumed"], 16, "duplicates reach the consumer");
+        assert_eq!(Store::query(&test.0, None, 100).unwrap().len(), 8);
+        assert_eq!(live_coverage(&test), serde_json::json!(["unknown", null]));
     }
 }
