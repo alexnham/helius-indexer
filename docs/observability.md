@@ -446,3 +446,21 @@ all decoded transfers. Historical coverage remains independent of selection.
 Kept-versus-excluded counts are not yet exported as a metric. A sampled runtime
 retains every raw input and skips pruning, so disk usage must be monitored for the
 lifetime of the demo.
+
+## Large sampled archive plans
+
+The standalone archive backfill wrapper preserves the bridge's frozen range,
+independent pending/verified counts and overlap proof. Its fsynced manifest
+records each batch's pessimistic byte reservation before starting the native
+worker. A batch that reports its source response bytes is then charged those bytes;
+interrupted or failed work retains the worst-case charge with unknown actual bytes.
+Charged bytes are a scheduling allowance, distinct from billing. A failed or timed-out
+native command appends its redacted stderr events to the session's `events.jsonl` and
+reports only the CLI's fixed error class.
+Cancellation, low disk and exhausted allowances stop scheduling without advancing
+coverage. Time probes are bounded, preserve null/skipped/unavailable time as
+unknown, and explicitly label the selected start as unverified temporal coverage.
+The loopback console polls while visible and separates actual sampled counts
+from historical slot evidence. No credential-bearing endpoint, raw payload or
+provider error text is added to its public status. See
+[30-day operation](30-day-backfill.md) for limits and source verification.

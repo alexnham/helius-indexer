@@ -326,5 +326,12 @@ is refused on a sampled dataset. Sampling saves transfer rows only; raw-input
 savings are not claimed, and no size or cost savings are assumed without
 measurement. This is not a time-bounded production retention policy; operators
 stop the demo and manage its disk usage. The production 37-day raw-retention
-requirement is unchanged. The first provider run is a bounded one-day range for a
-low-volume mint; a 30-day sampled backfill needs separate authorization.
+requirement is unchanged. The owner authorized a 30-day USDC sampled backfill
+using Old Faithful on 2026-11-15, superseding the initial one-day/low-volume demo
+plan. Freeze a conservative start from observed block times and the measured
+archive/finalized boundary; never derive temporal completeness from an assumed
+slot rate. The public archive supplies available history and the existing verified
+RPC bridge covers the recent tail. Persist run allowances before each batch,
+bound storage use, and keep incomplete source or time coverage visible. Reaching
+a resource limit leaves the plan resumable and incomplete; it is not permission
+to discard raw inputs, skip gaps or claim all 30 days were indexed.
