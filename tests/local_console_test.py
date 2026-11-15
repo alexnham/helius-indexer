@@ -81,6 +81,9 @@ class LocalConsole(unittest.TestCase):
             html = response.read().decode()
             self.assertIn("Coverage is unknown", html)
             self.assertIn("BigInt", html)
+            for tab in ["transfers", "pipeline", "commands", "help"]:
+                self.assertIn(f'href="#{tab}"', html)
+                self.assertIn(f'id="tab-{tab}"', html)
             self.assertIn("frame-ancestors 'none'", response.headers["Content-Security-Policy"])
         self.assertEqual(self.server.server_address[0], "127.0.0.1")
         before = CONSOLE.command(self.session, "query", self.metadata["database"], "--all-stored")
@@ -88,6 +91,34 @@ class LocalConsole(unittest.TestCase):
         self.get("/api/transfers")
         after = CONSOLE.command(self.session, "query", self.metadata["database"], "--all-stored")
         self.assertEqual(before, after)
+
+    def test_console_runs_only_listed_read_only_commands_with_validated_arguments(self):
+        db = self.metadata["database"]
+        before = CONSOLE.command(self.session, "query", db)
+        self.assertEqual(set(self.get("/api/commands")["commands"]), set(CONSOLE.COMMANDS))
+        summary = self.get("/api/command?name=summary&mint=" + CONSOLE.USDC)
+        self.assertEqual(summary["cli"], ["helius-indexer", "summary", db, CONSOLE.USDC])
+        # The windowed summary's now/cutoff/window come from the clock, so two calls can differ by a second.
+        clockless = lambda r: {k: v for k, v in r.items() if k not in ("now", "cutoff", "window")}
+        self.assertEqual(clockless(summary["result"]), clockless(CONSOLE.command(self.session, "summary", db, CONSOLE.USDC)))
+        self.assertIsInstance(summary["result"]["now"], int)
+        self.assertEqual(self.get("/api/command?name=sample-status")["result"]["policy"], "exact")
+        self.assertEqual(self.get("/api/command?name=query&mint=")["cli"], ["helius-indexer", "query", db])
+        coverage = self.get(f"/api/command?name=coverage&mint={CONSOLE.USDC}&start=1&end=2")
+        self.assertEqual(coverage["cli"][-2:], ["1", "2"])
+        for path in ["/api/command?name=prune", "/api/command?name=sample-init&mint=" + CONSOLE.USDC,
+                     "/api/command?name=summary", "/api/command?name=summary&mint=bad",
+                     "/api/command?name=coverage&mint=" + CONSOLE.USDC + "&start=1&end=-2",
+                     "/api/command?name=summary&mint=" + CONSOLE.USDC + "&extra=1",
+                     "/api/command?name=health&name=query", "/api/command?name=replay-status&job=a;rm"]:
+            with self.assertRaises(HTTPError) as error:
+                self.get(path)
+            self.assertEqual(error.exception.code, 400, path)
+        with self.assertRaises(HTTPError) as error:
+            self.get("/api/command?name=coverage&mint=" + CONSOLE.USDC + "&start=9&end=1")
+        self.assertEqual(error.exception.code, 422)
+        self.assertRegex(json.load(error.exception)["error"], r"failed: [a-z_]+;")
+        self.assertEqual(clockless(before), clockless(CONSOLE.command(self.session, "query", db)))
 
 
 if __name__ == "__main__":
