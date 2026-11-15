@@ -100,7 +100,7 @@ because the stream loop has no offline source yet (#59).
 | Producer, after publish, before its cursor is stored | The input in the topic, old cursor | The input is produced again; the consumer stores it once |
 | Consumer, during its batch write | Nothing: output and positions commit in one transaction | The batch is consumed again once the session timeout (10 s) moves the dead member's partitions |
 | Consumer, after its batch committed | Output and positions | Nothing already stored is consumed again |
-| Consumer group rebalance mid-run | A revoked member's unwritten batch is dropped | The new owner consumes from stored positions |
+| Consumer group rebalance mid-run | Stored positions; a revoked member drops any unwritten batch | The joining member consumes from stored positions |
 
 In every case each transfer is stored once and live coverage stays `unknown` with no
 verified boundary. Delivery and stored positions are processing progress, never
