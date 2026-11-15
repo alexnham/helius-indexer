@@ -58,6 +58,11 @@ budgets. Archive work stops at its allowance (4 batches per grant) until an expl
 `archive-grant`. This session layout is testing state; PostgreSQL (#35) holds the
 durable records.
 
+The console shows the archive as its own source beside live and replay: route
+revision and measurement age, uncovered intervals, archive probe failures, complete
+and pending archive slots, remaining batches and attempts by status. The replay
+source line shows the verified-through slot and archive/overlap/unknown counts.
+
 ## Restart, budgets and retention
 
 Restart retains the job's original range and consumed allowance. Live intake starts
