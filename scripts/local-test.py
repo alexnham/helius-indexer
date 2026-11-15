@@ -148,7 +148,7 @@ def readiness(session):
     return {"status": "ready", "mode": metadata.get("mode", "captured data"), "coverage": "unknown"}
 
 
-def handler_for(session, port, runtime_status=None):
+def handler_for(session, port, runtime_status=None, windowed=False):
     class Handler(BaseHTTPRequestHandler):
         def setup(self):
             super().setup()
@@ -202,7 +202,7 @@ def handler_for(session, port, runtime_status=None):
                     self.send(400, {"error": "Use one valid mint address"})
                     return
                 try:
-                    args = ["query-recent" if runtime_status else "query", database(session)] + ([mint] if mint else []) + ["--all-stored"]
+                    args = ["query-recent" if runtime_status else "query", database(session)] + ([mint] if mint else []) + ([] if windowed else ["--all-stored"])
                     self.send(200, command(session, *args))
                 except (RuntimeError, subprocess.TimeoutExpired, ValueError):
                     self.send(503, {"error": "Query failed; inspect session events.jsonl"})

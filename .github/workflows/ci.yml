@@ -47,6 +47,8 @@ jobs:
       - run: cargo clippy --offline --locked --all-targets -- -D warnings
       - run: cargo test --offline --locked
       - run: python3 -m unittest discover -s tests -p '*console_test.py'
+      - run: python3 -m unittest discover -s tests -p 'archive_*_test.py'
+      - run: node tests/archive_dashboard_test.js
   archive:
     runs-on: ubuntu-latest
     services:
