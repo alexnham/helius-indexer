@@ -29,10 +29,10 @@ services:
 
   runtime:
     profiles: [live]
-    image: ${INDEXER_CONSOLE_IMAGE:-helius-indexer-console:local}
+    image: ${INDEXER_RUNTIME_IMAGE:-helius-indexer-runtime:local}
     build:
       context: .
-      target: console
+      target: ${INDEXER_RUNTIME_TARGET:-console-archive}
     entrypoint: [python3, /app/scripts/indexer-runtime.py]
     environment:
       INDEXER_CONSOLE_PORT: ${INDEXER_RUNTIME_PORT:-8767}
@@ -45,6 +45,10 @@ services:
       INDEXER_BACKFILL_END: ${INDEXER_BACKFILL_END:-}
       INDEXER_LIVE_FROM: ${INDEXER_LIVE_FROM:-}
       INDEXER_KEEP_TRANSFERS: ${INDEXER_KEEP_TRANSFERS:-1000}
+      # Archive batches for routed older slots; needs the console-archive image target.
+      INDEXER_ARCHIVE: ${INDEXER_ARCHIVE:-1}
+      # Replace the session's copied binary with a rebuilt image's only when set to 1.
+      INDEXER_UPGRADE_BINARY: ${INDEXER_UPGRADE_BINARY:-0}
       # Unix socket on a shared volume: private to these containers, so plaintext is allowed.
       DATABASE_URL: host=/var/run/postgresql user=indexer dbname=indexer
     depends_on:

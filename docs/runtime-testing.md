@@ -1,9 +1,10 @@
 # Test live ingestion and configurable replay
 
 The opt-in `runtime` service uses PostgreSQL, live finalized LaserStream intake
-and an independent recent-history replay worker in the same native process. It
-never seeds fixtures. Old Faithful routing is pending in #31; this image does not
-perform full-window archive backfill.
+and an independent historical worker in the same native process: LaserStream
+replay for recent slots and, in the default `console-archive` image, Old Faithful
+archive batches for older routed slots (#31, #32). It never seeds fixtures or
+performs a full-window backfill.
 
 ## Start and configure
 
@@ -27,12 +28,34 @@ normal historical transaction source.
 
 The session directory is `/app/data/runtime-replay`, separate from legacy
 `/app/data/runtime`. Old directories are preserved and not silently converted.
-Existing copied CLI binaries are preserved on restart; use a fresh directory
-for this schema upgrade and back up PostgreSQL before migrating. Changing an
+Existing copied CLI binaries are preserved on restart. A rebuilt image is not
+adopted implicitly: when its binary differs from the session's copy, the runtime
+serves the session for inspection only and reports worker state
+`binary_upgrade_required`, without migrating or ingesting. To upgrade, stop the
+runtime, back up PostgreSQL (`pg_dump` of the session schema), then start once with
+`INDEXER_UPGRADE_BINARY=1`: the old copy is kept as `helius-indexer.backup-<ns>`, the
+new one replaces it atomically, and migrations run. The database schema is not
+rolled back with the binary; see the rollback note below. Changing an
 existing job's mint/range/ID is rejected. To choose a different scope, use a new
 `INDEXER_SESSION` directory and a new `INDEXER_REPLAY_JOB` (or database session).
 After upgrade, older binaries refuse schema 5; rollback restores a pre-upgrade
 backup into a separate schema with its matching binary. See [replay jobs](replay-jobs.md).
+
+## Archive routing and batches
+
+On its first cycle, and later only when replay fell out of its window or the
+archive tip was unknown (at most hourly), the runtime runs `replay-route` to
+measure replay availability and, if replay cannot serve the whole job, the archive
+tip. Each `replay-monitor` cycle then runs retry, replay, one archive batch and
+overlap reconciliation under live priority ([replay jobs](replay-jobs.md)). Set
+`INDEXER_ARCHIVE=0`, or build `INDEXER_RUNTIME_TARGET=console`, for replay only.
+
+The archive cache is `archive-cache` in the session directory (mode 0700, on the
+`runtime-data` volume). It holds downloaded archive ranges bounded by the per-batch
+limits; deleting it loses only cached downloads, never output, receipts or charged
+budgets. Archive work stops at its allowance (4 batches per grant) until an explicit
+`archive-grant`. This session layout is testing state; PostgreSQL (#35) holds the
+durable records.
 
 ## Restart, budgets and retention
 
@@ -91,4 +114,4 @@ not proof that the complete range was received.
 Use [replay job commands](replay-jobs.md) for offline retry/refill and the separate
 [archive validation](archive.md) for older data. The former independent block
 parser requires retained full block observations; filtered replay does not fabricate
-those inputs. Full archive/replay handoff remains #31/#32.
+those inputs.

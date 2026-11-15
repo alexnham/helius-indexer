@@ -159,6 +159,33 @@ class RuntimeConsole(unittest.TestCase):
             self.assertIsNone(result)
             self.assertIsNotNone(children[-1].poll())
 
+    def test_a_rebuilt_binary_is_never_used_without_an_explicit_upgrade(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            session, image = root / "session", root / "image"
+            session.mkdir()
+            image.write_bytes(b"v1")
+            self.assertEqual(RUNTIME.install_binary(session, image, False), "fresh")
+            self.assertEqual(RUNTIME.install_binary(session, image, False), "current")
+            image.write_bytes(b"v2")
+            self.assertEqual(RUNTIME.install_binary(session, image, False), "upgrade_required")
+            self.assertEqual((session / "helius-indexer").read_bytes(), b"v1")
+            self.assertEqual(RUNTIME.install_binary(session, image, True), "upgraded")
+            self.assertEqual((session / "helius-indexer").read_bytes(), b"v2")
+            backups = list(session.glob("helius-indexer.backup-*"))
+            self.assertEqual([b.read_bytes() for b in backups], [b"v1"])
+            self.assertEqual(RUNTIME.binary_state(session, image), "current")
+
+    def test_routes_once_and_re_routes_only_on_stale_window_evidence(self):
+        self.assertTrue(RUNTIME.should_route({"routing": None}))
+        fresh = {"measurement_age_seconds": 10, "archive": {"error_class": "archive_tip_unknown"}}
+        self.assertFalse(RUNTIME.should_route({"routing": fresh}))
+        quiet = {"measurement_age_seconds": 7200, "archive": {"error_class": None}}
+        self.assertFalse(RUNTIME.should_route({"routing": quiet, "attempts": [{"status": "time_limit"}]}))
+        self.assertTrue(RUNTIME.should_route({"routing": quiet, "attempts": [{"status": "outside_replay_window"}]}))
+        self.assertTrue(RUNTIME.should_route({"routing": {**quiet, "archive": {"error_class": "archive_tip_unknown"}}}))
+        self.assertFalse(RUNTIME.should_route({"routing": {"measurement_age_seconds": None, "archive": {}}}))
+
     def test_secret_file_is_not_executed(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "secret"
