@@ -93,6 +93,9 @@ pub struct Overlap {
     pub archive_mint_inputs: usize,
 }
 
+/// (archive last available, replay first available, finalized reference) of a route.
+pub type RouteBounds = (Option<u64>, Option<u64>, u64);
+
 /// Routed (start, end, kind) segments of one revision.
 pub type RouteSegments = Vec<(u64, u64, String)>;
 
@@ -366,18 +369,20 @@ impl JobLog {
         Ok(())
     }
 
-    /// Measured (archive last available, replay first available) of a route revision.
-    pub fn route_bounds(&mut self, id: &str, revision: i64) -> Result<(Option<u64>, Option<u64>)> {
+    /// Measured (archive last available, replay first available, finalized reference)
+    /// of a route revision.
+    pub fn route_bounds(&mut self, id: &str, revision: i64) -> Result<RouteBounds> {
         let r = self
             .0
             .query_one(
-                "SELECT archive_last,replay_first FROM replay_routes WHERE job=$1 AND revision=$2",
+                "SELECT archive_last,replay_first,reference_slot FROM replay_routes WHERE job=$1 AND revision=$2",
                 &[&id, &revision],
             )
             .map_err(read_failed)?;
         Ok((
             r.get::<_, Option<i64>>(0).map(|n| n as u64),
             r.get::<_, Option<i64>>(1).map(|n| n as u64),
+            r.get::<_, i64>(2) as u64,
         ))
     }
 
@@ -478,9 +483,10 @@ impl JobLog {
         self.slot_verified(mint, slot, ARCHIVE_SOURCE)
     }
 
-    /// Full-block evidence from `source` still retained for the current decoder.
+    /// Full-block evidence from `source` still retained for the current decoder: a
+    /// complete slot with its raw input kept, or a slot a later block proved skipped.
     pub fn slot_verified(&mut self, mint: &str, slot: u64, source: &str) -> Result<bool> {
-        Ok(self.0.query_one("SELECT EXISTS(SELECT 1 FROM historical_slots h JOIN historical_source_slots s ON s.mint=h.mint AND s.decoder=h.decoder AND s.slot=h.slot AND s.source_kind=$4 AND s.status IN ('complete','skipped') WHERE h.mint=$1 AND h.decoder=$2 AND h.slot=$3 AND h.status IN ('complete','skipped') AND EXISTS(SELECT 1 FROM historical_inputs i WHERE i.mint=h.mint AND i.decoder=h.decoder AND i.slot=h.slot AND i.source_kind=$4))",
+        Ok(self.0.query_one("SELECT EXISTS(SELECT 1 FROM historical_slots h JOIN historical_source_slots s ON s.mint=h.mint AND s.decoder=h.decoder AND s.slot=h.slot AND s.source_kind=$4 AND s.status IN ('complete','skipped') WHERE h.mint=$1 AND h.decoder=$2 AND h.slot=$3 AND (h.status='skipped' OR h.status='complete' AND EXISTS(SELECT 1 FROM historical_inputs i WHERE i.mint=h.mint AND i.decoder=h.decoder AND i.slot=h.slot AND i.source_kind=$4)))",
             &[&mint, &DECODER_VERSION, &(slot as i64), &source]).map_err(read_failed)?.get(0))
     }
 

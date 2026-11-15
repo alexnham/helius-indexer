@@ -290,14 +290,19 @@ fn the_gap_lane_takes_only_the_measured_interval_between_both_windows() {
     ];
     // Unfinalized slots past the reference stay unfilled; only 110..=129 is the gap.
     assert_eq!(
-        lane_segments(Lane::Gap, &segments, (Some(109), Some(130))),
+        lane_segments(Lane::Gap, &segments, (Some(109), Some(130), 500)),
         vec![(110, 129, "gap".to_owned())]
     );
     // Unknown availability on either side is never filled by RPC.
-    assert!(lane_segments(Lane::Gap, &segments, (None, Some(130))).is_empty());
-    assert!(lane_segments(Lane::Gap, &segments, (Some(109), None)).is_empty());
+    assert!(lane_segments(Lane::Gap, &segments, (None, Some(130), 500)).is_empty());
+    assert!(lane_segments(Lane::Gap, &segments, (Some(109), None, 500)).is_empty());
+    // Never past the finalized reference, even if a route reports replay beyond it.
     assert_eq!(
-        lane_segments(Lane::Archive, &segments, (Some(109), Some(130))).len(),
+        lane_segments(Lane::Gap, &segments, (Some(109), Some(130), 119)),
+        vec![(110, 119, "gap".to_owned())]
+    );
+    assert_eq!(
+        lane_segments(Lane::Archive, &segments, (Some(109), Some(130), 500)).len(),
         1
     );
 }
@@ -309,7 +314,7 @@ fn rpc_fills_the_gap_in_its_own_charged_batches_and_verifies_it() {
     let mut archive = source(100..=109);
     work(&db.0, &mut archive).unwrap();
     work(&db.0, &mut archive).unwrap();
-    let mut rpc = Rpc(source(110..=129));
+    let mut rpc = Rpc(source(110..=130));
     let mut ranges = vec![];
     loop {
         let report = fill(&db.0, &mut rpc).unwrap();
@@ -322,8 +327,9 @@ fn rpc_fills_the_gap_in_its_own_charged_batches_and_verifies_it() {
             report["end"].as_u64().unwrap(),
         ));
     }
-    assert_eq!(ranges, vec![(110, 117), (118, 125), (126, 129)]);
-    assert_eq!(rpc.0.calls, (110..=129).collect::<Vec<_>>());
+    // The last batch also fetches the replay start (130) to settle a skipped tail.
+    assert_eq!(ranges, vec![(110, 117), (118, 125), (126, 130)]);
+    assert_eq!(rpc.0.calls, (110..=130).collect::<Vec<_>>());
     let job = status(&db.0, "job").unwrap();
     assert_eq!(job["gap"]["batches_charged"], 3);
     assert_eq!(job["gap"]["batches_remaining"], 13);
@@ -389,4 +395,26 @@ fn gap_exhaustion_needs_a_gap_grant() {
     );
     lane_grant(&db.0, "job", Lane::Gap, &mut Telemetry::default()).unwrap();
     assert_eq!(fill(&db.0, &mut failing).unwrap()["status"], "incomplete");
+}
+
+#[test]
+fn a_skipped_gap_tail_is_settled_by_the_replay_start_block() {
+    let db = TestDatabase::new();
+    routed(&db.0, 109, 130);
+    // Slot 129 was skipped: block 130's parent is 128.
+    let mut blocks = source((110..=128).chain([130]));
+    let mut child: Value = serde_json::from_slice(&blocks.blocks[&130]).unwrap();
+    child["result"]["parentSlot"] = json!(128);
+    child["result"]["previousBlockhash"] = json!(bs58::encode([128u8; 32]).into_string());
+    blocks
+        .blocks
+        .insert(130, serde_json::to_vec(&child).unwrap());
+    let mut rpc = Rpc(blocks);
+    while fill(&db.0, &mut rpc).unwrap()["reason"].is_null() {}
+    let job = status(&db.0, "job").unwrap();
+    assert_eq!(job["gap"]["batches_charged"], 3);
+    assert_eq!(job["verified"]["gap_slots"], 20);
+    assert_eq!(job["verified"]["uncovered_unverified_slots"], 0);
+    // 129 failed once as a block and was then proven skipped; it is not retried.
+    assert_eq!(rpc.0.calls.iter().filter(|s| **s == 129).count(), 1);
 }

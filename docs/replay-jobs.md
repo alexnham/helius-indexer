@@ -162,7 +162,11 @@ measured replay start. `replay-gap` fills exactly that interval with RPC `getBlo
 through the shared History path, one charged batch of up to eight slots at a time,
 from `SOLANA_RPC_URL` (public mainnet RPC by default) with `INDEXER_LIVE_OPT_IN=1`.
 Slots qualify only when both the archive tip and replay start were measured; uncovered
-slots with unknown availability, or past the finalized reference, are never filled.
+slots with unknown availability, or past the finalized reference, are never filled. A
+skipped slot is proven only by a later block's parent link, so a batch that reaches the
+gap's end also fetches the replay start's block when it is finalized; that block is
+not counted as gap coverage. Verified slots include slots proven skipped, which have
+no raw input of their own.
 
 The gap lane has its own allowance (migration 10): a batch is charged before any
 request, with ceilings of 9 requests (a mainnet check plus eight blocks), 64 MiB per

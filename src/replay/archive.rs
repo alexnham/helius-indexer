@@ -7,7 +7,7 @@ use crate::{
     backfill::{BlockSource, History},
     storage::{
         Database,
-        replay::{JobLog, Lane, valid_id},
+        replay::{JobLog, Lane, RouteBounds, valid_id},
     },
     telemetry::Telemetry,
 };
@@ -15,13 +15,13 @@ use serde_json::{Value, json};
 
 const BATCH_SLOTS: u64 = 8;
 
-/// Slots of `segments` a lane may serve. The gap lane takes only uncovered slots strictly
-/// between a measured archive tip and a measured replay start; unknown availability is
-/// never filled by RPC.
+/// Slots of `segments` a lane may serve. The gap lane takes only uncovered, finalized
+/// slots strictly between a measured archive tip and a measured replay start; unknown
+/// availability is never filled by RPC.
 pub(crate) fn lane_segments(
     lane: Lane,
     segments: &[(u64, u64, String)],
-    bounds: (Option<u64>, Option<u64>),
+    bounds: RouteBounds,
 ) -> Vec<(u64, u64, String)> {
     match lane {
         Lane::Archive => segments
@@ -30,7 +30,7 @@ pub(crate) fn lane_segments(
             .cloned()
             .collect(),
         Lane::Gap => {
-            let (Some(last), Some(first)) = bounds else {
+            let (Some(last), Some(first), reference) = bounds else {
                 return vec![];
             };
             segments
@@ -39,7 +39,7 @@ pub(crate) fn lane_segments(
                 .filter_map(|s| {
                     let (a, b) = (
                         s.0.max(last.saturating_add(1)),
-                        s.1.min(first.saturating_sub(1)),
+                        s.1.min(first.saturating_sub(1)).min(reference),
                     );
                     (a <= b && first > 0).then(|| (a, b, "gap".to_owned()))
                 })
@@ -62,11 +62,19 @@ fn next_range(database: &Database, id: &str, lane: Lane) -> Result<Option<(i64, 
             .iter()
             .find(|s| s.status != "complete" && s.status != "skipped")
         {
-            return Ok(Some((
-                revision,
-                slot.slot,
-                end.min(slot.slot + BATCH_SLOTS - 1),
-            )));
+            let mut last = end.min(slot.slot + BATCH_SLOTS - 1);
+            // A skipped slot is proven only by a later block's parent link, so a batch
+            // reaching the gap's end also fetches the replay start's block (finalized only).
+            // It settles a skipped tail; it is not counted as gap coverage.
+            if lane == Lane::Gap
+                && last == end
+                && bounds.1 == Some(end + 1)
+                && end < bounds.2
+                && last - slot.slot + 1 < BATCH_SLOTS
+            {
+                last = end + 1;
+            }
+            return Ok(Some((revision, slot.slot, last)));
         }
     }
     Ok(None)
