@@ -6,6 +6,7 @@ pub mod pg;
 pub(crate) mod repair;
 pub mod replay;
 pub(crate) mod tls;
+pub mod window;
 use crate::{
     Error, Result,
     decoder::DECODER_VERSION,
@@ -13,7 +14,7 @@ use crate::{
     reconcile,
 };
 pub use pg::Database;
-use postgres::{Client, GenericClient, Transaction, fallible_iterator::FallibleIterator};
+use postgres::{Client, GenericClient, Transaction};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
 
@@ -430,54 +431,14 @@ impl Store {
         Ok(results)
     }
 
+    /// Every stored row, including unknown block time, for diagnostics and internal reports.
+    /// Rolling-window summaries are `window::window_summary`.
     pub fn summary(db: &Database, mint: &str) -> Result<serde_json::Value> {
         let mut client = db.connect()?;
-        let mut rows = client
-            .query_raw(
-                "SELECT record_json FROM transfers t WHERE mint=$1 AND NOT EXISTS(SELECT 1 FROM decoder_repairs r WHERE r.signature=t.signature AND r.status='unresolved')",
-                [&mint],
-            )
-            .map_err(read_failed)?;
-        let (mut count, mut volume, mut fees, mut unknown_fees) = (0u64, 0u128, 0u128, 0u64);
-        let mut other_decoder_transfers = 0u64;
-        let mut unknown_amounts = 0u64;
-        let mut confidential_count = 0u64;
-        while let Some(row) = rows.next().map_err(read_failed)? {
-            let transfer: Transfer = serde_json::from_str(row.get::<_, &str>(0))
-                .map_err(|_| Error("stored_record_invalid"))?;
-            if transfer.decoder_version != DECODER_VERSION {
-                other_decoder_transfers = other_decoder_transfers
-                    .checked_add(1)
-                    .ok_or(Error("aggregate_overflow"))?;
-            }
-            count = count.checked_add(1).ok_or(Error("aggregate_overflow"))?;
-            if let Some(amount) = transfer.amount_raw {
-                volume = volume
-                    .checked_add(u128::from(amount))
-                    .ok_or(Error("aggregate_overflow"))?;
-            } else {
-                unknown_amounts = unknown_amounts
-                    .checked_add(1)
-                    .ok_or(Error("aggregate_overflow"))?;
-            }
-            if transfer.confidential {
-                confidential_count = confidential_count
-                    .checked_add(1)
-                    .ok_or(Error("aggregate_overflow"))?;
-            }
-            if let Some(fee) = transfer.fee_raw {
-                fees = fees
-                    .checked_add(u128::from(fee))
-                    .ok_or(Error("aggregate_overflow"))?;
-            } else {
-                unknown_fees = unknown_fees
-                    .checked_add(1)
-                    .ok_or(Error("aggregate_overflow"))?;
-            }
-        }
-        Ok(
-            serde_json::json!({"mint":mint,"transfer_count":count,"target_decoder":DECODER_VERSION,"other_decoder_transfer_count":other_decoder_transfers,"known_volume_raw":volume.to_string(),"known_fees_raw":fees.to_string(),"unknown_fee_count":unknown_fees,"unknown_amount_count":unknown_amounts,"confidential_transfer_count":confidential_count,"coverage":"unknown","window":"all_stored"}),
-        )
+        let mut out = window::aggregate(&mut client, mint, None)?;
+        out["coverage"] = serde_json::json!("unknown");
+        out["window"] = serde_json::json!("all_stored");
+        Ok(out)
     }
 
     /// Runtime-test retention: keeps the newest `keep` transfers and drops inputs and

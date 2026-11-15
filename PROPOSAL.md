@@ -194,6 +194,8 @@ Before approving production infrastructure, produce a measured estimate covering
 
 The total acceptable monthly budget remains unresolved. Production mint selection, numerical freshness/query/recovery targets, backfill deadline, deployment topology, exact storage schemas, and technology selection must be decided using validation results. Do not present unmeasured capacity, cost, latency, or archive availability as guarantees.
 
+Unresolved: observed-empty windows. Window coverage maps a block-time window to the slot span of its known-time transfers (`src/storage/window.rs`), so a window with no such transfers has no slot span and reports `unknown` (`no_known_time_transfers_in_window`), never an observed empty range, even when history is complete. Reporting observed-empty needs a time-to-slot mapping for historical slots (for example a block time on `historical_slots`), which is a requirements change. Until decided, the surface is conservative: it never claims coverage it cannot show.
+
 ## Next review
 
 Use this proposal as the requirements baseline. The first captured-transfer slice now provides local decoding, provisional SQLite persistence, a bounded query CLI, and basic telemetry; see `README.md` for commands and limitations. Continue the approved tickets toward the representative end-to-end validation and use its evidence for production architecture and targets. No production infrastructure has been provisioned.
