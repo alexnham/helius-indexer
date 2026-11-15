@@ -98,7 +98,10 @@ class LocalConsole(unittest.TestCase):
         self.assertEqual(set(self.get("/api/commands")["commands"]), set(CONSOLE.COMMANDS))
         summary = self.get("/api/command?name=summary&mint=" + CONSOLE.USDC)
         self.assertEqual(summary["cli"], ["helius-indexer", "summary", db, CONSOLE.USDC])
-        self.assertEqual(summary["result"], CONSOLE.command(self.session, "summary", db, CONSOLE.USDC))
+        # The windowed summary's now/cutoff/window come from the clock, so two calls can differ by a second.
+        clockless = lambda r: {k: v for k, v in r.items() if k not in ("now", "cutoff", "window")}
+        self.assertEqual(clockless(summary["result"]), clockless(CONSOLE.command(self.session, "summary", db, CONSOLE.USDC)))
+        self.assertIsInstance(summary["result"]["now"], int)
         self.assertEqual(self.get("/api/command?name=sample-status")["result"]["policy"], "exact")
         self.assertEqual(self.get("/api/command?name=query&mint=")["cli"], ["helius-indexer", "query", db])
         coverage = self.get(f"/api/command?name=coverage&mint={CONSOLE.USDC}&start=1&end=2")
@@ -115,7 +118,7 @@ class LocalConsole(unittest.TestCase):
             self.get("/api/command?name=coverage&mint=" + CONSOLE.USDC + "&start=9&end=1")
         self.assertEqual(error.exception.code, 422)
         self.assertRegex(json.load(error.exception)["error"], r"failed: [a-z_]+;")
-        self.assertEqual(before, CONSOLE.command(self.session, "query", db))
+        self.assertEqual(clockless(before), clockless(CONSOLE.command(self.session, "query", db)))
 
 
 if __name__ == "__main__":
