@@ -9,6 +9,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 from urllib.request import Request, urlopen
 
 SPEC = importlib.util.spec_from_file_location("console", Path(__file__).with_name("local-test.py"))
@@ -159,9 +160,12 @@ def initialize(session, binary, database, upgrade=False):
 ROUTE_INTERVAL_SECONDS = 3600
 
 
-def should_route(status, interval=ROUTE_INTERVAL_SECONDS):
+def should_route(status, since_attempt=None, interval=ROUTE_INTERVAL_SECONDS):
     """Route once; re-measure only when replay fell out of its window or the archive tip
-    was unknown, and at most once per interval. Each revision resets overlap evidence."""
+    was unknown, and at most once per interval. Each revision resets overlap evidence.
+    `since_attempt` (seconds since the last attempt, failed or not) bounds retries."""
+    if since_attempt is not None and since_attempt < interval:
+        return False
     routing = status.get("routing")
     if not routing:
         return True
@@ -194,6 +198,10 @@ def main():
     with (session / ".runtime.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         inspect_only = os.environ.get("INDEXER_RUN", "1") == "0"
+        image = Path(os.environ.get("INDEXER_BINARY", "/usr/local/bin/helius-indexer"))
+        # A mismatched binary needs no credentials or provider calls just to refuse running.
+        if binary_state(session, image) == "upgrade_required" and os.environ.get("INDEXER_UPGRADE_BINARY") != "1":
+            inspect_only = True
         if inspect_only:
             config = json.loads((session / "session.json").read_text())
             env = {}
@@ -209,7 +217,7 @@ def main():
             cache.mkdir(exist_ok=True, mode=0o700)
             env["INDEXER_ARCHIVE_OPT_IN"] = "1"
         CONSOLE.require_database_url()
-        binary = initialize(session, Path(os.environ.get("INDEXER_BINARY", "/usr/local/bin/helius-indexer")), config["database"],
+        binary = initialize(session, image, config["database"],
                             upgrade=not inspect_only and os.environ.get("INDEXER_UPGRADE_BINARY") == "1")
         if binary == "upgrade_required":
             # Serve the existing session for inspection; run nothing with a binary it was not started with.
@@ -229,12 +237,14 @@ def main():
 
         def worker():
             # Both workers resume independently; replay budgets never reset between cycles.
-            db, resume, number, last = config["database"], config["live_from"], 0, {}
+            db, resume, number, last, routed_at = config["database"], config["live_from"], 0, {}, None
             while not stopped.is_set():
                 number += 1
                 atomic_json(session / "worker.json", {**last, "state": "running", "cycle": number, "coverage": "unknown"})
                 try:
-                    if should_route(CONSOLE.command(session, "replay-status", db, config["replay_job"])):
+                    since = None if routed_at is None else time.monotonic() - routed_at
+                    if archive and should_route(CONSOLE.command(session, "replay-status", db, config["replay_job"]), since):
+                        routed_at = time.monotonic()
                         cycle(["replay-route", db, config["replay_job"], cache], timeout=180, report_name="route.json")
                     code, result = cycle(["replay-monitor",db,config["replay_job"],resume,config["seconds"],*([cache] if archive else [])])
                     # Historical expiry/exhaustion remains visible without delaying live reconnects.
