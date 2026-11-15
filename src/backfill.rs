@@ -82,7 +82,6 @@ impl RpcSource {
             diagnostics: RpcDiagnostics::default(),
         })
     }
-    #[cfg(feature = "archive")]
     pub(crate) fn bounded(endpoint: String, deadline: Instant) -> Result<Self> {
         let mut source = Self::new(endpoint)?;
         source.deadline = Some(deadline);
@@ -191,6 +190,14 @@ pub struct SlotCoverage {
     pub attempts: u64,
     pub block_time: Option<i64>,
 }
+/// Requested range boundaries and verified (complete or skipped) slot counts.
+#[derive(Debug, Serialize)]
+pub struct Progress {
+    pub first_slot: u64,
+    pub last_slot: u64,
+    pub slots_requested: u64,
+    pub slots_completed: u64,
+}
 #[derive(Debug, Serialize)]
 pub struct Coverage {
     pub mint: String,
@@ -202,6 +209,7 @@ pub struct Coverage {
     pub slots: Vec<SlotCoverage>,
     pub pending: usize,
     pub oldest_pending_age_seconds: Option<u64>,
+    pub progress: Progress,
 }
 #[derive(Debug, Default, Serialize)]
 pub struct Metrics {
@@ -218,6 +226,8 @@ pub struct Metrics {
     pub decoded_transfers: u64,
     pub decode_failures: u64,
     pub elapsed_seconds: f64,
+    /// Successful decode attempts per elapsed second; not a benchmark result.
+    pub transactions_per_second: f64,
     pub cancelled: bool,
     /// Writes made by this run's store; transfers written exclude identical replays.
     pub storage: crate::storage::WriteStats,
@@ -236,7 +246,7 @@ impl Metrics {
             coverage.pending,
             usize::from(coverage.complete),
             self.elapsed_seconds,
-            self.decoded_transactions as f64 / self.elapsed_seconds.max(f64::EPSILON),
+            self.transactions_per_second,
             coverage
                 .oldest_pending_age_seconds
                 .map_or(String::new(), |age| format!(
@@ -246,6 +256,14 @@ impl Metrics {
         output.push_str(&format!(
             "indexer_historical_cached_blocks_total {}\n",
             self.cached_blocks
+        ));
+        let progress = &coverage.progress;
+        output.push_str(&format!(
+            "indexer_historical_range_slots_requested{{mode=\"historical\"}} {}\nindexer_historical_range_slots_completed{{mode=\"historical\"}} {}\nindexer_historical_range_first_slot{{mode=\"historical\"}} {}\nindexer_historical_range_last_slot{{mode=\"historical\"}} {}\n",
+            progress.slots_requested,
+            progress.slots_completed,
+            progress.first_slot,
+            progress.last_slot
         ));
         let mut prior_pending = false;
         let mut missing_ranges = 0;
@@ -367,12 +385,14 @@ impl History {
         let mut through = None;
         let mut oldest = None;
         let mut age_unknown = false;
+        let mut completed = 0;
         for slot in start..=end {
             let record = self.db.slot(mint, slot)?;
             let scheduled = record.is_some();
             let (status, error_class, attempts, block_time, first) =
                 record.unwrap_or(("unknown".into(), None, 0, None, now()));
             if status == "complete" || status == "skipped" {
+                completed += 1;
                 if contiguous == Some(slot) {
                     through = Some(slot);
                     contiguous = slot.checked_add(1);
@@ -409,6 +429,12 @@ impl History {
                 None
             } else {
                 oldest.map(|t| now().saturating_sub(t))
+            },
+            progress: Progress {
+                first_slot: start,
+                last_slot: end,
+                slots_requested: end - start + 1,
+                slots_completed: completed,
             },
         })
     }
@@ -616,7 +642,14 @@ impl History {
         metrics.source_diagnostics = source.diagnostics();
         metrics.storage = store.stats();
         metrics.elapsed_seconds = started.elapsed().as_secs_f64();
-        Ok((self.coverage(mint, start, end)?, metrics))
+        metrics.transactions_per_second =
+            metrics.decoded_transactions as f64 / metrics.elapsed_seconds.max(f64::EPSILON);
+        let coverage = self.coverage(mint, start, end)?;
+        // Only the re-read coverage (the durable state) can prove the whole range is complete.
+        if !metrics.cancelled && coverage.complete {
+            range_completed(&self.telemetry, mint, start, end);
+        }
+        Ok((coverage, metrics))
     }
 }
 struct BlockContext<'a> {
@@ -753,6 +786,16 @@ fn event(
     let mut event = telemetry.event(name, operation, outcome, error);
     event["slot"] = json!(slot);
     event["mint"] = json!(mint);
+    let _ = writeln!(std::io::stderr().lock(), "{event}");
+}
+
+/// Once per invocation, after every slot in the requested range is verified durable.
+fn range_completed(telemetry: &crate::telemetry::Telemetry, mint: &str, start: u64, end: u64) {
+    use std::io::Write;
+    let mut event = telemetry.event("historical_range_completed", "coverage", "success", None);
+    event["mint"] = json!(mint);
+    event["slot_start"] = json!(start);
+    event["slot_end"] = json!(end);
     let _ = writeln!(std::io::stderr().lock(), "{event}");
 }
 

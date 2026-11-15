@@ -9,6 +9,56 @@ pub const SECONDS_PER_GRANT: i64 = 60;
 pub const MESSAGES_PER_GRANT: i64 = 10_000;
 pub const BYTES_PER_GRANT: i64 = 64 * 1024 * 1024;
 pub const CONNECTIONS_PER_GRANT: i64 = 3;
+/// Archive batches per archive grant; at most 64 grants, so 256 batches per job.
+pub const ARCHIVE_BATCHES_PER_GRANT: i64 = 4;
+/// Ceilings one archive batch runs under: requests, response bytes, seconds.
+pub const ARCHIVE_BATCH_LIMITS: (i64, i64, i64) = (32, 128 * 1024 * 1024, 120);
+/// RPC gap batches per gap grant: 16 batches of 8 slots cover one 128-slot job.
+pub const GAP_BATCHES_PER_GRANT: i64 = 16;
+/// Ceilings one RPC gap batch runs under: a mainnet check plus eight 64 MiB blocks.
+pub const GAP_BATCH_LIMITS: (i64, i64, i64) = (9, 9 * 64 * 1024 * 1024, 120);
+/// History source name of full-block RPC input.
+pub const RPC_SOURCE: &str = "finalized-mainnet-rpc";
+
+/// A full-block historical worker with its own allowance and attempt log.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Lane {
+    Archive,
+    Gap,
+}
+impl Lane {
+    pub fn name(self) -> &'static str {
+        match self {
+            Lane::Archive => "archive",
+            Lane::Gap => "gap",
+        }
+    }
+    pub fn source(self) -> &'static str {
+        match self {
+            Lane::Archive => ARCHIVE_SOURCE,
+            Lane::Gap => RPC_SOURCE,
+        }
+    }
+    pub fn batches_per_grant(self) -> i64 {
+        match self {
+            Lane::Archive => ARCHIVE_BATCHES_PER_GRANT,
+            Lane::Gap => GAP_BATCHES_PER_GRANT,
+        }
+    }
+    pub fn limits(self) -> (i64, i64, i64) {
+        match self {
+            Lane::Archive => ARCHIVE_BATCH_LIMITS,
+            Lane::Gap => GAP_BATCH_LIMITS,
+        }
+    }
+    // Column names are fixed literals, never input.
+    fn columns(self) -> (&'static str, &'static str) {
+        match self {
+            Lane::Archive => ("archive_grants", "archive_batches_charged"),
+            Lane::Gap => ("gap_grants", "gap_batches_charged"),
+        }
+    }
+}
 
 pub(crate) fn valid_id(id: &str) -> Result<()> {
     if id.is_empty()
@@ -29,6 +79,25 @@ pub struct Scope {
     pub start: u64,
     pub end: u64,
 }
+
+/// Capture and history source name of Old Faithful input.
+pub const ARCHIVE_SOURCE: &str = "old-faithful-jetstreamer";
+/// Capture source name of LaserStream input.
+pub const REPLAY_SOURCE: &str = "helius-laserstream";
+
+/// One reconciliation outcome for an overlap slot.
+pub struct Overlap {
+    pub outcome: &'static str,
+    pub reason: Option<&'static str>,
+    pub replay_inputs: usize,
+    pub archive_mint_inputs: usize,
+}
+
+/// (archive last available, replay first available, finalized reference) of a route.
+pub type RouteBounds = (Option<u64>, Option<u64>, u64);
+
+/// Routed (start, end, kind) segments of one revision.
+pub type RouteSegments = Vec<(u64, u64, String)>;
 
 /// One measurement of where each slot of a job may come from.
 pub struct Route {
@@ -176,6 +245,24 @@ impl JobLog {
                     "segments":segments,"state":"routed_not_processed"})
             }
         };
+        let mut lanes = serde_json::Map::new();
+        for lane in [Lane::Archive, Lane::Gap] {
+            let (grants, charged) = lane.columns();
+            let row = tx
+                .query_one(
+                    &format!("SELECT {grants},{charged} FROM replay_jobs WHERE id=$1"),
+                    &[&id],
+                )
+                .map_err(read_failed)?;
+            let attempts: Vec<Value> = tx.query("SELECT id,route_revision,start_slot,end_slot,started_at,status,request_limit,byte_limit,second_limit,requests,response_bytes,cached_chunks FROM archive_attempts WHERE job=$1 AND lane=$2 ORDER BY id DESC LIMIT 20", &[&id, &lane.name()]).map_err(read_failed)?.into_iter()
+                .map(|a| json!({"attempt":a.get::<_,i64>(0),"route_revision":a.get::<_,i64>(1),"start":a.get::<_,i64>(2),"end":a.get::<_,i64>(3),"started_at":a.get::<_,i64>(4),"status":a.get::<_,String>(5),
+                    "limits":{"requests":a.get::<_,i64>(6),"response_bytes":a.get::<_,i64>(7),"seconds":a.get::<_,i64>(8)},
+                    "observed":{"requests":a.get::<_,Option<i64>>(9),"response_bytes":a.get::<_,Option<i64>>(10),"cached_chunks":a.get::<_,Option<i64>>(11)}})).collect();
+            let by_status: serde_json::Map<String, Value> = tx.query("SELECT status,COUNT(*),COALESCE(SUM(response_bytes),0)::BIGINT FROM archive_attempts WHERE job=$1 AND lane=$2 GROUP BY status ORDER BY status LIMIT 16", &[&id, &lane.name()]).map_err(read_failed)?.into_iter()
+                .map(|r| (r.get::<_,String>(0), json!({"attempts":r.get::<_,i64>(1),"response_bytes":r.get::<_,i64>(2)}))).collect();
+            let (g, c): (i64, i64) = (row.get(0), row.get(1));
+            lanes.insert(lane.name().into(), json!({"grants":g,"batches_charged":c,"batches_remaining":g*lane.batches_per_grant()-c,"by_status":by_status,"attempts":attempts}));
+        }
         tx.commit().map_err(read_failed)?;
         let (grants, seconds, connections, messages, bytes): (i64, i64, i64, i64, i64) =
             (r.get(5), r.get(6), r.get(7), r.get(8), r.get(9));
@@ -192,7 +279,7 @@ impl JobLog {
         };
         Ok(
             json!({"job":id,"state":state,"pending_age_seconds":now().checked_sub(r.get::<_,i64>(4)).filter(|n|*n>=0),"oldest_unresolved_age_seconds":if receipts.get::<_,i64>(2)==0 {Some(0)}else{oldest.and_then(|t|now().checked_sub(t)).filter(|n|*n>=0)},"failures":failures,"retained":{"transfer_count":retained,"coverage":"unknown"},"mint":r.get::<_,String>(0),"start":r.get::<_,i64>(1),"end":r.get::<_,i64>(2),"decoder_version":r.get::<_,String>(3),"created_at":r.get::<_,i64>(4),
-            "coverage":"unknown","verified_boundary":null,"resume_from":r.get::<_,i64>(1),"pending_interval":{"start":r.get::<_,i64>(1),"end":r.get::<_,i64>(2),"kind":"unverified"},"attempts":attempts,"routing":routing,"reason":"filtered_replay_has_no_validated_slot_completion_evidence",
+            "coverage":"unknown","verified_boundary":null,"resume_from":r.get::<_,i64>(1),"pending_interval":{"start":r.get::<_,i64>(1),"end":r.get::<_,i64>(2),"kind":"unverified"},"attempts":attempts,"routing":routing,"archive":lanes["archive"],"gap":lanes["gap"],"reason":"filtered_replay_has_no_validated_slot_completion_evidence",
             "receipts":{"unique_inputs":receipts.get::<_,i64>(0),"decoded":receipts.get::<_,i64>(1),"unresolved":receipts.get::<_,i64>(2),"raw_still_retained":receipts.get::<_,i64>(3)},
             "budget":{"grants":grants,"seconds_charged":seconds,"seconds_remaining":grants*SECONDS_PER_GRANT-seconds,"connections_used":connections,"connections_remaining":grants*CONNECTIONS_PER_GRANT-connections,"messages_used":messages,"messages_remaining":grants*MESSAGES_PER_GRANT-messages,"bytes_used":bytes,"bytes_remaining":grants*BYTES_PER_GRANT-bytes}}),
         )
@@ -238,6 +325,193 @@ impl JobLog {
         }
         tx.commit().map_err(write_failed)?;
         Ok(revision)
+    }
+
+    /// Latest routing revision and its segments, if the job was ever routed.
+    pub fn latest_route(&mut self, id: &str) -> Result<Option<(i64, RouteSegments)>> {
+        valid_id(id)?;
+        let Some(revision) = self
+            .0
+            .query_one(
+                "SELECT MAX(revision) FROM replay_routes WHERE job=$1",
+                &[&id],
+            )
+            .map_err(read_failed)?
+            .get::<_, Option<i64>>(0)
+        else {
+            return Ok(None);
+        };
+        let segments = self.0.query("SELECT start_slot,end_slot,kind FROM replay_route_segments WHERE job=$1 AND revision=$2 ORDER BY start_slot", &[&id, &revision])
+            .map_err(read_failed)?
+            .into_iter()
+            .map(|r| (r.get::<_, i64>(0) as u64, r.get::<_, i64>(1) as u64, r.get(2)))
+            .collect();
+        Ok(Some((revision, segments)))
+    }
+
+    /// Explicit refill of one lane; no other grant replenishes it.
+    pub fn lane_grant(&mut self, id: &str, lane: Lane) -> Result<()> {
+        valid_id(id)?;
+        let (grants, _) = lane.columns();
+        let n = self
+            .0
+            .execute(
+                &format!("UPDATE replay_jobs SET {grants}={grants}+1 WHERE id=$1 AND {grants}<64 AND decoder=$2"),
+                &[&id, &DECODER_VERSION],
+            )
+            .map_err(write_failed)?;
+        if n != 1 {
+            return Err(Error(match lane {
+                Lane::Archive => "archive_grant_rejected",
+                Lane::Gap => "gap_grant_rejected",
+            }));
+        }
+        Ok(())
+    }
+
+    /// Measured (archive last available, replay first available, finalized reference)
+    /// of a route revision.
+    pub fn route_bounds(&mut self, id: &str, revision: i64) -> Result<RouteBounds> {
+        let r = self
+            .0
+            .query_one(
+                "SELECT archive_last,replay_first,reference_slot FROM replay_routes WHERE job=$1 AND revision=$2",
+                &[&id, &revision],
+            )
+            .map_err(read_failed)?;
+        Ok((
+            r.get::<_, Option<i64>>(0).map(|n| n as u64),
+            r.get::<_, Option<i64>>(1).map(|n| n as u64),
+            r.get::<_, i64>(2) as u64,
+        ))
+    }
+
+    /// Charge one whole batch of a lane before any cache or network work. The
+    /// connection holding the lane's advisory lock owns the attempt until it closes.
+    pub fn reserve_batch(
+        database: &Database,
+        id: &str,
+        lane: Lane,
+        revision: i64,
+        start: u64,
+        end: u64,
+    ) -> Result<ArchiveReservation> {
+        valid_id(id)?;
+        let mut client = database.connect()?;
+        let locked: bool = client.query_one("SELECT pg_try_advisory_lock(hashtextextended(current_schema() || ':' || $2 || ':' || $1,0))", &[&id, &lane.name()]).map_err(write_failed)?.get(0);
+        if !locked {
+            return Err(Error(match lane {
+                Lane::Archive => "archive_job_busy",
+                Lane::Gap => "gap_job_busy",
+            }));
+        }
+        let mut tx = client.transaction().map_err(write_failed)?;
+        let (grants, charged) = lane.columns();
+        let n = tx.execute(&format!("UPDATE replay_jobs SET {charged}={charged}+1 WHERE id=$1 AND decoder=$2 AND {charged}<{grants}*$3"), &[&id, &DECODER_VERSION, &lane.batches_per_grant()]).map_err(write_failed)?;
+        if n != 1 {
+            return Err(Error(match lane {
+                Lane::Archive => "archive_budget_exhausted",
+                Lane::Gap => "gap_budget_exhausted",
+            }));
+        }
+        tx.execute(
+            "UPDATE archive_attempts SET status='interrupted' WHERE job=$1 AND lane=$2 AND status='running'",
+            &[&id, &lane.name()],
+        )
+        .map_err(write_failed)?;
+        let (requests, bytes, seconds) = lane.limits();
+        let attempt: i64 = tx.query_one("INSERT INTO archive_attempts(job,route_revision,start_slot,end_slot,started_at,status,request_limit,byte_limit,second_limit,lane) VALUES($1,$2,$3,$4,$5,'running',$6,$7,$8,$9) RETURNING id",
+            &[&id, &revision, &(start as i64), &(end as i64), &now(), &requests, &bytes, &seconds, &lane.name()]).map_err(write_failed)?.get(0);
+        tx.commit().map_err(write_failed)?;
+        Ok(ArchiveReservation { client, attempt })
+    }
+
+    /// Replay receipts in one slot: (base58 signature, receipt status).
+    pub fn slot_receipts(&mut self, id: &str, slot: u64) -> Result<Vec<(String, String)>> {
+        Ok(self
+            .0
+            .query(
+                "SELECT signature,status FROM replay_receipts WHERE job=$1 AND slot=$2 ORDER BY signature",
+                &[&id, &(slot as i64)],
+            )
+            .map_err(read_failed)?
+            .into_iter()
+            .map(|r| {
+                (
+                    bs58::encode(r.get::<_, Vec<u8>>(0)).into_string(),
+                    r.get(1),
+                )
+            })
+            .collect())
+    }
+
+    /// Retained per-source captures in one slot: signature -> (capture bytes, receipt status).
+    pub fn slot_captures(
+        &mut self,
+        slot: u64,
+        source: &str,
+    ) -> Result<std::collections::BTreeMap<String, (Vec<u8>, String)>> {
+        Ok(self
+            .0
+            .query(
+                "SELECT signature,capture_json,status FROM capture_inputs WHERE slot=$1 AND source=$2 AND octet_length(capture_json)<=16777216 ORDER BY signature,result_digest",
+                &[&(slot as i64), &source],
+            )
+            .map_err(read_failed)?
+            .into_iter()
+            .map(|r| (r.get(0), (r.get(1), r.get(2))))
+            .collect())
+    }
+
+    /// Decoder revision of the stored output for each signature that has one.
+    pub fn output_decoders(&mut self, signatures: &[String]) -> Result<Vec<String>> {
+        Ok(self
+            .0
+            .query(
+                "SELECT DISTINCT decoder_version FROM captures WHERE signature = ANY($1)",
+                &[&signatures],
+            )
+            .map_err(read_failed)?
+            .into_iter()
+            .map(|r| r.get(0))
+            .collect())
+    }
+
+    /// Archive full-block evidence still retained: slot complete or skipped for the
+    /// current decoder, completed by the archive source, with its raw input kept.
+    pub fn archive_slot_verified(&mut self, mint: &str, slot: u64) -> Result<bool> {
+        self.slot_verified(mint, slot, ARCHIVE_SOURCE)
+    }
+
+    /// Full-block evidence from `source` still retained for the current decoder: a
+    /// complete slot with its raw input kept, or a slot a later block proved skipped.
+    pub fn slot_verified(&mut self, mint: &str, slot: u64, source: &str) -> Result<bool> {
+        Ok(self.0.query_one("SELECT EXISTS(SELECT 1 FROM historical_slots h JOIN historical_source_slots s ON s.mint=h.mint AND s.decoder=h.decoder AND s.slot=h.slot AND s.source_kind=$4 AND s.status IN ('complete','skipped') WHERE h.mint=$1 AND h.decoder=$2 AND h.slot=$3 AND (h.status='skipped' OR h.status='complete' AND EXISTS(SELECT 1 FROM historical_inputs i WHERE i.mint=h.mint AND i.decoder=h.decoder AND i.slot=h.slot AND i.source_kind=$4)))",
+            &[&mint, &DECODER_VERSION, &(slot as i64), &source]).map_err(read_failed)?.get(0))
+    }
+
+    pub fn record_overlap(
+        &mut self,
+        id: &str,
+        revision: i64,
+        slot: u64,
+        outcome: &Overlap,
+    ) -> Result<()> {
+        let n = |v: usize| i64::try_from(v).map_err(|_| Error("stored_record_invalid"));
+        self.0.execute("INSERT INTO replay_overlap_outcomes(job,route_revision,slot,decoder,outcome,reason,replay_inputs,archive_mint_inputs,observed_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)",
+            &[&id, &revision, &(slot as i64), &DECODER_VERSION, &outcome.outcome, &outcome.reason, &n(outcome.replay_inputs)?, &n(outcome.archive_mint_inputs)?, &now()]).map_err(write_failed)?;
+        Ok(())
+    }
+
+    /// Latest outcome per slot for this route and the current decoder revision.
+    pub fn latest_overlaps(
+        &mut self,
+        id: &str,
+        revision: i64,
+    ) -> Result<std::collections::BTreeMap<u64, (String, Option<String>)>> {
+        Ok(self.0.query("SELECT DISTINCT ON (slot) slot,outcome,reason FROM replay_overlap_outcomes WHERE job=$1 AND route_revision=$2 AND decoder=$3 ORDER BY slot,id DESC",
+            &[&id, &revision, &DECODER_VERSION]).map_err(read_failed)?.into_iter()
+            .map(|r| (r.get::<_, i64>(0) as u64, (r.get(1), r.get(2)))).collect())
     }
 
     /// Explicit refill; ordinary restart never replenishes a consumed allowance.
@@ -292,6 +566,20 @@ pub struct Reservation {
     client: Client,
     job: String,
     pub attempt: i64,
+}
+
+pub struct ArchiveReservation {
+    client: Client,
+    pub attempt: i64,
+}
+impl ArchiveReservation {
+    /// Observed (requests, response bytes, cached chunks); dropping releases the lock.
+    pub fn finish(mut self, status: &str, observed: (u64, u64, u64)) -> Result<()> {
+        let n = |v: u64| i64::try_from(v).map_err(|_| Error("stored_record_invalid"));
+        self.client.execute("UPDATE archive_attempts SET status=$1,requests=$2,response_bytes=$3,cached_chunks=$4 WHERE id=$5",
+            &[&status, &n(observed.0)?, &n(observed.1)?, &n(observed.2)?, &self.attempt]).map_err(write_failed)?;
+        Ok(())
+    }
 }
 
 pub enum Retained {

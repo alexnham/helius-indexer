@@ -41,6 +41,47 @@ Coverage is based on verified processed ranges, including empty produced blocks 
 
 Provider usage reports must distinguish measured transport bytes, authoritative billed usage, and estimates. Record pricing basis, verification date, report delay, and uncertainty for projected spend. Report initial backfill costs separately from recurring operation.
 
+## Query window API and retention
+
+The rolling-window query CLI (`query`, `query-recent`, `summary`) applies the cutoff
+`now - window` from an injected clock (the CLI passes system time; tests pass a fixed
+time). Rows with `block_time >= cutoff` and `< to` are eligible; the boundary row at
+exactly the cutoff is included. Rows with unknown block time are counted in
+`null_block_time` and never listed or summed. Storage tests cover exact cutoff,
+null-time exclusion, exact sums above u64, keyset ties and coverage states against
+real PostgreSQL.
+
+Route request/error/latency metrics (`indexer_api_requests_total`,
+`indexer_api_request_duration_seconds`) are not exported yet: there is no HTTP server,
+so no route template exists to label. They are deferred to the HTTP route layer and
+will not be approximated from CLI invocations. Raw-expiration checks remain with
+the retention work and are not part of this query surface.
+
+### Query window coverage
+
+`coverage` on a window response is the coverage of the slot span of the window's
+known-block-time transfers for the mint and decoder. The span is the minimum to
+maximum slot of those rows (`slot_range`). Coverage describes only that span: it does
+not prove slots at the window edges before the first or after the last transfer were
+processed, so a clean `complete` is not a claim about the whole window.
+
+- `complete`: every slot in the span is `complete` or `skipped` in `historical_slots`.
+- `partial`: some slot in the span is missing or not complete; `missing_ranges` gives
+  bounded contiguous ranges (first 100, `missing_range_count` is exact).
+- `unknown` with `no_coverage_evidence`: transfers exist but no historical slot record
+  covers the span (for example live-only ingestion).
+- `unknown` with `no_known_time_transfers_in_window`: no known-time transfer falls in
+  the window, so there is no slot span to evaluate. This is not an observed-empty range.
+- `unknown` with `mint_required`: a mint-less listing has no per-mint coverage.
+- `unknown` with `all_stored` (`query --all-stored`, `summary --all-stored`): inspection
+  output has no window, so no coverage is computed and `coverage` is the literal
+  `"unknown"`. This is never a window coverage claim.
+
+An observed-empty window (covered, zero transfers) is not produced: deriving a slot
+span from time without transfers would need block times from historical slots, which
+this slice does not use. Coverage is one aggregate over `historical_slots` (status
+counts, covered runs and missing runs), not a per-slot loop.
+
 ## Cardinality and sensitive data
 
 Metric labels use bounded enums: component, stage, source kind, live/historical mode, operation, outcome, failure class, route template, and status class. Keep a documented label allowlist.
@@ -114,6 +155,16 @@ counts successful decode attempts divided by invocation elapsed time, including
 source/storage time, and is not a benchmark. Failed candidates are retained in
 historical raw blocks with scoped durable error/retry state. Snapshot counters
 are attempts; replay does not imply new unique query results.
+
+Range progress uses the gauges `indexer_historical_range_slots_requested`,
+`indexer_historical_range_slots_completed` (complete or skipped), and
+`indexer_historical_range_first_slot`/`last_slot`; the coverage JSON carries the
+same values as `progress`. `historical_range_completed` is emitted once per
+invocation, only when the re-read coverage of the whole requested range is complete
+and the run was not cancelled. It carries `mint`, `slot_start`, `slot_end` and the
+decoder version. The mint is the filter-set identity; no separate filter-set
+revision exists yet. The per-slot `durable_range_completed` event remains and means
+only that one slot's status was acknowledged.
 
 ## Bounded live slice status
 
@@ -338,6 +389,34 @@ and routes to `uncovered`. Each measurement emits `route_measured` with outcome
 `incomplete` when any segment is uncovered, plus revision, whether the archive was
 probed and the uncovered segment count; a failed replay measurement emits it with
 outcome `failed` and records no revision.
+
+Each archive batch emits `archive_attempt_finished` (component `replay_archive`) with
+outcome `success`, `incomplete`, `cancelled` or the error class, and the observed
+requests, response bytes and cached chunks. The status `archive` block reports
+attempts and response bytes by status, remaining batches and per-segment pending
+slots with oldest pending age; `archive_budget_granted` records an explicit grant.
+These are JSON inspection snapshots like the replay report, with no job, mint or
+slot metric labels.
+
+Each RPC gap batch emits `gap_attempt_finished` (component `replay_gap`, source
+`rpc`) with the same outcomes and observed requests and response bytes, and
+`gap_budget_granted` records an explicit gap grant. The status `gap` block mirrors
+`archive`; `verified` adds `gap_slots` and `uncovered_unverified_slots`.
+
+`replay-overlap` emits `overlap_reconciled` (component `replay_overlap`) with outcome
+`success` or `conflict` (error class `overlap_conflict`), the route revision and
+per-outcome slot counts. The report's `verified` block gives `verified_through`,
+verified archive and overlap slot counts, unknown slots, latest outcome counts and
+up to 32 conflict slots with their reason; the console shows the boundary, counts
+and conflicts. A `replay-monitor` cycle reports each step's outcome or error class.
+
+The Docker runtime's `/api/status` adds `configuration.archive` (archive batches
+enabled) and `configuration.binary` (`fresh`, `current`, `upgraded` or
+`upgrade_required`). Worker state `binary_upgrade_required` means the image binary
+differs from the session copy and nothing is ingested until an explicit upgrade.
+Route measurements append their `route_measured` events to the session's
+`events.jsonl`, and the last route report is kept as `route.json`. Readiness still
+means the process and its dependencies are available, not source completeness.
 
 The console shows remaining budgets, processing versus raw retention and unknown
 coverage, alongside live reports and actual query output. Current JSON snapshots

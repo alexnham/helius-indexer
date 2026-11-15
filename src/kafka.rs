@@ -26,10 +26,19 @@ pub fn brokers() -> Result<String> {
 
 /// shortcut: no TLS or SASL client yet, so only loopback brokers are accepted; a hosted
 /// broker also needs replication factor >= 3 and min.insync.replicas >= 2 (#36).
+/// INDEXER_KAFKA_PRIVATE_NETWORK=1 also admits named brokers on a private container
+/// network such as Compose's, which no other host can reach.
 pub fn require_loopback(brokers: &str) -> Result<()> {
+    plaintext_allowed(
+        brokers,
+        std::env::var("INDEXER_KAFKA_PRIVATE_NETWORK").as_deref() == Ok("1"),
+    )
+}
+
+fn plaintext_allowed(brokers: &str, private_network: bool) -> Result<()> {
     let loopback = |address: &str| {
         let host = address.rsplit_once(':').map_or(address, |(host, _)| host);
-        matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]")
+        private_network || matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]")
     };
     if brokers.is_empty() || !brokers.split(',').map(str::trim).all(loopback) {
         return Err(Error("kafka_tls_required"));
@@ -615,6 +624,19 @@ pub(crate) mod tests {
                 let _ = block_on(admin.delete_topics(&[&self.0], &AdminOptions::new()));
             }
         }
+    }
+
+    #[test]
+    fn private_network_opt_in_admits_named_brokers_only_when_set() {
+        assert_eq!(
+            plaintext_allowed("kafka:9092", false).unwrap_err().0,
+            "kafka_tls_required"
+        );
+        assert!(plaintext_allowed("kafka:9092", true).is_ok());
+        assert_eq!(
+            plaintext_allowed("", true).unwrap_err().0,
+            "kafka_tls_required"
+        );
     }
 
     #[test]

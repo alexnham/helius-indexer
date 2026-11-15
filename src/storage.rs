@@ -6,6 +6,7 @@ pub mod pg;
 pub(crate) mod repair;
 pub mod replay;
 pub(crate) mod tls;
+pub mod window;
 use crate::{
     Error, Result,
     decoder::DECODER_VERSION,
@@ -13,7 +14,7 @@ use crate::{
     reconcile,
 };
 pub use pg::Database;
-use postgres::{Client, GenericClient, Transaction, fallible_iterator::FallibleIterator};
+use postgres::{Client, GenericClient, Transaction};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
 
@@ -84,8 +85,10 @@ const BATCH_INPUTS: &str = "INSERT INTO capture_inputs(signature,source,result_d
                  FROM unnest($1::text[],$2::text[],$3::bytea[]) AS u(signature,source,digest)
                  JOIN captures c ON c.signature=u.signature ORDER BY c.signature
                  ON CONFLICT(signature,source,result_digest) DO UPDATE SET status=excluded.status";
-const BATCH_TRANSFERS: &str = "INSERT INTO transfers(transfer_id,signature,slot,outer_index,inner_index,mint,record_json)
-         SELECT * FROM unnest($1::text[],$2::text[],$3::bigint[],$4::int[],$5::int[],$6::text[],$7::text[])
+const BATCH_TRANSFERS: &str = "INSERT INTO transfers(transfer_id,signature,slot,outer_index,inner_index,mint,record_json,block_time,amount_raw,fee_raw)
+         SELECT u.id,u.signature,u.slot,u.outer_index,u.inner_index,u.mint,u.record,u.block_time,u.amount::numeric,u.fee::numeric
+         FROM unnest($1::text[],$2::text[],$3::bigint[],$4::int[],$5::int[],$6::text[],$7::text[],$8::bigint[],$9::text[],$10::text[])
+         AS u(id,signature,slot,outer_index,inner_index,mint,record,block_time,amount,fee)
          ON CONFLICT(slot,transfer_id) DO NOTHING RETURNING signature";
 const BATCH_ACKNOWLEDGE: &str = "UPDATE live_raw SET status=u.status FROM unnest($1::bigint[],$2::text[]) AS u(id,status) WHERE live_raw.id=u.id";
 
@@ -539,56 +542,15 @@ impl Store {
         Ok(results)
     }
 
+    /// Every stored row, including unknown block time, for diagnostics and internal reports.
+    /// Rolling-window summaries are `window::window_summary`.
     pub fn summary(db: &Database, mint: &str) -> Result<serde_json::Value> {
         let mut client = db.connect()?;
-        let mut rows = client
-            .query_raw(
-                "SELECT record_json FROM transfers t WHERE mint=$1 AND NOT EXISTS(SELECT 1 FROM decoder_repairs r WHERE r.signature=t.signature AND r.status='unresolved')",
-                [&mint],
-            )
-            .map_err(read_failed)?;
-        let (mut count, mut volume, mut fees, mut unknown_fees) = (0u64, 0u128, 0u128, 0u64);
-        let mut other_decoder_transfers = 0u64;
-        let mut unknown_amounts = 0u64;
-        let mut confidential_count = 0u64;
-        while let Some(row) = rows.next().map_err(read_failed)? {
-            let transfer: Transfer = serde_json::from_str(row.get::<_, &str>(0))
-                .map_err(|_| Error("stored_record_invalid"))?;
-            if transfer.decoder_version != DECODER_VERSION {
-                other_decoder_transfers = other_decoder_transfers
-                    .checked_add(1)
-                    .ok_or(Error("aggregate_overflow"))?;
-            }
-            count = count.checked_add(1).ok_or(Error("aggregate_overflow"))?;
-            if let Some(amount) = transfer.amount_raw {
-                volume = volume
-                    .checked_add(u128::from(amount))
-                    .ok_or(Error("aggregate_overflow"))?;
-            } else {
-                unknown_amounts = unknown_amounts
-                    .checked_add(1)
-                    .ok_or(Error("aggregate_overflow"))?;
-            }
-            if transfer.confidential {
-                confidential_count = confidential_count
-                    .checked_add(1)
-                    .ok_or(Error("aggregate_overflow"))?;
-            }
-            if let Some(fee) = transfer.fee_raw {
-                fees = fees
-                    .checked_add(u128::from(fee))
-                    .ok_or(Error("aggregate_overflow"))?;
-            } else {
-                unknown_fees = unknown_fees
-                    .checked_add(1)
-                    .ok_or(Error("aggregate_overflow"))?;
-            }
-        }
-        drop(rows);
-        let sampling = Self::sampling(db)?;
-        Ok(
-            serde_json::json!({"sampling":sampling,"mint":mint,"transfer_count":count,"target_decoder":DECODER_VERSION,"other_decoder_transfer_count":other_decoder_transfers,"known_volume_raw":volume.to_string(),"known_fees_raw":fees.to_string(),"unknown_fee_count":unknown_fees,"unknown_amount_count":unknown_amounts,"confidential_transfer_count":confidential_count,"coverage":"unknown","window":"all_stored"}),
-        )
+        let mut out = window::aggregate(&mut client, mint, None)?;
+        out["coverage"] = serde_json::json!("unknown");
+        out["window"] = serde_json::json!("all_stored");
+        out["sampling"] = Self::sampling(db)?;
+        Ok(out)
     }
 
     /// Runtime-test retention: keeps the newest `keep` transfers and drops inputs and
@@ -847,6 +809,9 @@ fn insert_transfer_rows(
         Vec::new(),
         Vec::new(),
         Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
     );
     for (signature, transfer) in rows {
         columns.0.push(transfer.transfer_id.as_str());
@@ -860,11 +825,15 @@ fn insert_transfer_rows(
         columns
             .6
             .push(serde_json::to_string(transfer).unwrap_or_default());
+        columns.7.push(transfer.block_time);
+        columns.8.push(transfer.amount_raw.map(|n| n.to_string()));
+        columns.9.push(transfer.fee_raw.map(|n| n.to_string()));
     }
     for row in tx.query(
         statement,
         &[
             &columns.0, &columns.1, &columns.2, &columns.3, &columns.4, &columns.5, &columns.6,
+            &columns.7, &columns.8, &columns.9,
         ],
     )? {
         *counts.entry(row.get::<_, String>(0)).or_insert(0) += 1;
@@ -998,9 +967,11 @@ fn reconcile_repeat(
     if prior_status == "decoded" || prior_status == "failed_transaction" {
         for merged in updates {
             let text = serde_json::to_string(&merged).map_err(|_| Error("serialization_failed"))?;
+            let amount = merged.amount_raw.map(|n| n.to_string());
+            let fee = merged.fee_raw.map(|n| n.to_string());
             tx.execute(
-                "UPDATE transfers SET record_json=$1 WHERE signature=$2 AND transfer_id=$3",
-                &[&text, &signature, &merged.transfer_id],
+                "UPDATE transfers SET record_json=$1,block_time=$2,amount_raw=$3::text::numeric,fee_raw=$4::text::numeric WHERE signature=$5 AND transfer_id=$6",
+                &[&text, &merged.block_time, &amount, &fee, &signature, &merged.transfer_id],
             )
             .map_err(write_failed)?;
         }
@@ -1041,6 +1012,7 @@ pub(crate) fn insert_transfers(
         Vec::new(),
         Vec::new(),
     );
+    let (mut block_times, mut amounts, mut fees) = (Vec::new(), Vec::new(), Vec::new());
     let sampling = Sampling::from_tx(tx)?;
     for transfer in transfers.iter().filter(|t| sampling.accepts(t)) {
         ids.push(transfer.transfer_id.as_str());
@@ -1054,14 +1026,18 @@ pub(crate) fn insert_transfers(
         });
         mints.push(transfer.mint.as_str());
         records.push(serde_json::to_string(transfer).map_err(|_| Error("serialization_failed"))?);
+        block_times.push(transfer.block_time);
+        amounts.push(transfer.amount_raw.map(|n| n.to_string()));
+        fees.push(transfer.fee_raw.map(|n| n.to_string()));
     }
     let inserted = tx
         .execute(
-            "INSERT INTO transfers(transfer_id,signature,slot,outer_index,inner_index,mint,record_json)
-             SELECT id,$2,slot,outer_index,inner_index,mint,record FROM unnest($1::text[],$3::bigint[],$4::int[],$5::int[],$6::text[],$7::text[])
-             AS u(id,slot,outer_index,inner_index,mint,record)
+            "INSERT INTO transfers(transfer_id,signature,slot,outer_index,inner_index,mint,record_json,block_time,amount_raw,fee_raw)
+             SELECT id,$2,slot,outer_index,inner_index,mint,record,block_time,amount::numeric,fee::numeric
+             FROM unnest($1::text[],$3::bigint[],$4::int[],$5::int[],$6::text[],$7::text[],$8::bigint[],$9::text[],$10::text[])
+             AS u(id,slot,outer_index,inner_index,mint,record,block_time,amount,fee)
              ON CONFLICT(slot,transfer_id) DO NOTHING",
-            &[&ids, &signature, &slots, &outer, &inner, &mints, &records],
+            &[&ids, &signature, &slots, &outer, &inner, &mints, &records, &block_times, &amounts, &fees],
         )
         .map_err(write_failed)?;
     Ok(inserted as usize)

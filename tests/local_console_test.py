@@ -86,10 +86,10 @@ class LocalConsole(unittest.TestCase):
                 self.assertIn(f'id="tab-{tab}"', html)
             self.assertIn("frame-ancestors 'none'", response.headers["Content-Security-Policy"])
         self.assertEqual(self.server.server_address[0], "127.0.0.1")
-        before = CONSOLE.command(self.session, "query", self.metadata["database"])
+        before = CONSOLE.command(self.session, "query", self.metadata["database"], "--all-stored")
         self.get("/api/session")
         self.get("/api/transfers")
-        after = CONSOLE.command(self.session, "query", self.metadata["database"])
+        after = CONSOLE.command(self.session, "query", self.metadata["database"], "--all-stored")
         self.assertEqual(before, after)
 
     def test_console_runs_only_listed_read_only_commands_with_validated_arguments(self):

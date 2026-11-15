@@ -46,10 +46,10 @@ Main uses versions 2/3 for Kafka; the unpublished replay prototypes used those
 numbers for different tables. Migration 4 supplies any missing Kafka tables and
 retains existing replay tables. Migration 5 adds missing input provenance without
 resetting scope, receipts or charged budgets. This supports both main and the
-version 2/3 replay prototypes; migration 6 adds append-only routing tables; the current schema version is 6. Raw rows referenced by replay receipts are classified as replay;
+version 2/3 replay prototypes; migrations 6, 7, 9 and 10 add routing, archive attempts, overlap outcomes and the gap lane (8 adds transfer columns, 11 the sampling policy); the current schema version is 11. Raw rows referenced by replay receipts are classified as replay;
 missing historical attempt/hash/acknowledgment provenance stays null. Back up the
 session using PostgreSQL tooling before upgrading. Earlier binaries reject newer
-schema versions (the current version is 6); rolling back requires restoring the
+schema versions (the current version is 11); rolling back requires restoring the
 pre-upgrade backup into a separate session and using its matching binary. Do not manually decrement the migration
 version or delete receipts to make an older binary open an upgraded session.
 The new tables currently have no deletion/TTL policy; job receipt retention will
@@ -66,9 +66,17 @@ helius-indexer replay-retry SESSION recent
 # Explicit provider opt-in and HELIUS_API_KEY are required for these two commands:
 INDEXER_LIVE_OPT_IN=1 helius-indexer replay-route SESSION recent CACHE
 INDEXER_LIVE_OPT_IN=1 helius-indexer replay SESSION recent 60
-INDEXER_LIVE_OPT_IN=1 helius-indexer replay-monitor SESSION recent LIVE_FROM 60
+INDEXER_LIVE_OPT_IN=1 helius-indexer replay-monitor SESSION recent LIVE_FROM 60 [CACHE]
+# Offline: reconcile routed overlap slots from retained archive and replay input
+helius-indexer replay-overlap SESSION recent
+# Archive feature, INDEXER_ARCHIVE_OPT_IN=1: one charged batch of routed archive slots
+INDEXER_ARCHIVE_OPT_IN=1 helius-indexer replay-archive SESSION recent CACHE
 # Explicitly replenish an exhausted allowance; never done automatically:
 helius-indexer replay-grant SESSION recent
+helius-indexer archive-grant SESSION recent
+# RPC getBlock fill of the measured archive-to-replay gap, and its explicit refill:
+INDEXER_LIVE_OPT_IN=1 helius-indexer replay-gap SESSION recent
+helius-indexer gap-grant SESSION recent
 ```
 
 The first test range is 50 slots. Creation accepts at most the existing 128-slot
@@ -117,10 +125,101 @@ routes cover small windows only.
 Migration 6 is additive; an older binary refuses the newer schema, so roll back as
 above by restoring the pre-upgrade backup.
 
+## Archive batches
+
+`replay-archive` takes the latest route revision and processes the first up to
+eight incomplete slots of its `archive` or `overlap` segments, within one segment,
+through the shared History path: retained raw input, shared decoder and storage,
+and per-slot `complete`/`skipped`/`unknown` status from full blocks. A job with no
+route is refused; a job whose route has no pending archive slots charges nothing.
+
+Archive work has its own allowance (migration 7), separate from replay's. Before
+any cache or network work, one transaction charges a whole batch and records a
+`running` attempt with the ceilings it runs under: 32 requests, 128 MiB of
+response bodies and 120 seconds, the existing per-batch limits. A grant allows four
+batches; `archive-grant` adds one grant, up to 64, so a job can run at most 256
+batches. `replay-grant` never replenishes archive work. A batch served entirely
+from cache is still charged. Observed requests, response bytes and cached chunks
+are written when the batch ends (finished, incomplete, cancelled or an error
+class); they are diagnostics, not provider billing. A crash keeps the charge and
+leaves the attempt `running` until the next batch marks it `interrupted`. A
+PostgreSQL advisory lock allows one archive worker per job; it is released when
+the worker's connection closes, including on a crash. `BACKFILL_CANCEL_FILE` or the
+120-second limit stops between slots.
+
+Status adds an `archive` block: grants, batches charged and remaining, attempts and
+response bytes by status, the last 20 attempts, and per routed archive/overlap
+segment the complete, skipped and pending slot counts with oldest pending age.
+Replay segments get no counts. Full-block slot status for an overlap segment is
+archive evidence only until `replay-overlap` reconciles it (below). Migration 7 is
+additive; roll back as above.
+
+## Archive-to-replay gap fill
+
+Old Faithful publishes an epoch after it ends, and replay reaches back only so far,
+so a route can have an `uncovered` interval between the measured archive tip and the
+measured replay start. `replay-gap` fills exactly that interval with RPC `getBlock`
+through the shared History path, one charged batch of up to eight slots at a time,
+from `SOLANA_RPC_URL` (public mainnet RPC by default) with `INDEXER_LIVE_OPT_IN=1`.
+Slots qualify only when both the archive tip and replay start were measured; uncovered
+slots with unknown availability, or past the finalized reference, are never filled. A
+skipped slot is proven only by a later block's parent link, so a batch that reaches the
+gap's end also fetches the replay start's block when it is finalized; that block is
+not counted as gap coverage. Verified slots include slots proven skipped, which have
+no raw input of their own.
+
+The gap lane has its own allowance (migration 10): a batch is charged before any
+request, with ceilings of 9 requests (a mainnet check plus eight blocks), 64 MiB per
+block response and 120 seconds. A grant allows 16 batches, enough for a whole
+128-slot job; `gap-grant` adds one, up to 64. Replay and archive grants never refill
+it. Attempts share the archive attempt log, marked by lane, and an advisory lock
+allows one gap worker per job, independent of the archive worker. `replay-monitor`
+runs one gap batch per cycle automatically after the archive batch.
+
+Status adds a `gap` block like `archive`. In `verified`, RPC-filled gap slots count
+as `gap_slots` when their full-block evidence is retained, and
+`uncovered_unverified_slots` counts uncovered slots still unverified. Migration 10 is
+additive; roll back as above.
+
+## Overlap reconciliation and verified slots
+
+`replay-overlap` makes no provider request. For each slot of the latest route's
+`overlap` segments it compares retained archive and replay captures through the
+shared reconciler and decoder, and appends an outcome (migration 9) tied to the
+route and decoder revision:
+
+| Outcome | Meaning |
+| --- | --- |
+| `consistent` | Every replay-delivered signature is in the archive block with identical decoded transfers (identity, raw amounts, fees, confidentiality, instruction positions); block time is compared only when both sides have it. |
+| `replay_omission` | As above, and the archive block has mint transactions replay never delivered. Archive is authoritative on membership. |
+| `conflict` | `replay_not_in_archive` (a replay signature missing from a complete archive block) or `effects_differ`. Fails closed and stays visible. |
+| `pending` | The archive slot is incomplete, a replay input is unresolved or no longer retained, or the stored output's decoder revision differs. |
+
+"Mint transaction" uses the replay filter's predicate: the mint is a static or loaded
+account key, or the mint of a pre/post token balance.
+
+The report's `verified` block derives verified slots under the latest route:
+`archive` slots whose full-block status is complete or skipped with raw archive
+input still retained, and `overlap` slots whose latest outcome is `consistent` or
+`replay_omission` and whose archive evidence is still retained. Replay-only and
+uncovered slots stay unknown, because filtered replay cannot prove a slot complete.
+`verified_through` is the contiguous verified boundary from the job start and never
+crosses an unverified slot. A new route revision or decoder revision stops earlier
+outcomes from counting. Pruning removes the archive slot evidence, so verified slots
+fall back to unknown while outcome receipts remain. The job-level `coverage` field
+stays `unknown`; read `verified` for slot evidence.
+
+`replay-monitor` runs one historical cycle beside live intake under the shared
+live-priority gate: retained retry, a replay attempt when the route has replay or
+overlap slots (or the job has no route), one archive batch when the binary has the
+archive feature and CACHE is given, then overlap reconciliation. A failed or
+exhausted step is reported and the next step still runs; none can stop live intake.
+Migration 9 is additive; roll back as above.
+
 ## Scope still pending
 
-Automatic archive routing, independently verified replay range coverage, full
-30-day retention, Kafka, distributed leases and production benchmarking remain
+Provider-measured overlap, replay coverage outside archive overlap, full 30-day
+retention, Kafka, distributed leases and production benchmarking remain
 separate work. Budget exhaustion requires an explicit grant; current replay
 contract cannot infer which quiet filtered slots were empty. Repeated inclusive
 replay can cost provider traffic even when storage deduplicates it.

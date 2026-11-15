@@ -46,9 +46,12 @@ visible, bounded action rather than an automatic unbounded scan.
 
 Expect that gap routinely, not as an exception: archives publish at epoch end
 plus a delay, while replay holds roughly 48 hours, so for part of each epoch
-neither source supplies the interval between them. **Unresolved decision:** whether
-a bounded RPC fill of exactly that measured interval may run automatically, or
-always needs an operator action. Until decided, it needs the operator action.
+neither source supplies the interval between them. **Decided 2026-11-15 (#84):** a
+bounded RPC `getBlock` fill of exactly that measured interval runs automatically,
+within its own per-job allowance. Only slots strictly between a measured archive
+tip and a measured replay start qualify; unknown availability is never filled by
+RPC, and refills after the allowance are explicit (`gap-grant`). See
+[replay jobs](replay-jobs.md).
 
 Schedule the oldest replayable pending interval first, ahead of archive work.
 Replay availability only moves forward; archive availability does not expire.
@@ -182,7 +185,9 @@ prerequisites before presenting Docker support as ready.
 ## Current implementation and migration
 
 The recent-only runtime now uses frozen PostgreSQL replay jobs with independent
-live and historical workers. Archive routing and the full handoff remain pending. The existing archive/
+live and historical workers. Issue #31 adds measured archive/replay routing, charged
+archive batches and overlap reconciliation to those jobs ([replay jobs](replay-jobs.md));
+Docker wiring of that path is #32. The existing archive/
 RPC bridge validates full-block evidence and remains useful for optional checks.
 The unfinished uncommitted runtime experiment using RPC as the normal recent
 source was removed from build paths; a local ignored copy is retained for reference.

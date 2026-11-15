@@ -82,12 +82,12 @@ class RuntimeConsole(unittest.TestCase):
             db = config["database"]
             RUNTIME.initialize(session, binary, db)
             RUNTIME.atomic_json(session / "session.json", config)
-            self.assertEqual(RUNTIME.CONSOLE.command(session, "query", db)["transfers"], [])
+            self.assertEqual(RUNTIME.CONSOLE.command(session, "query", db, "--all-stored")["transfers"], [])
             capture = ROOT / "tests/fixtures/mainnet-transfer.json"
             RUNTIME.CONSOLE.command(session, "ingest", db, capture)
-            before = RUNTIME.CONSOLE.command(session, "query-recent", db)
+            before = RUNTIME.CONSOLE.command(session, "query-recent", db, "--all-stored")
             RUNTIME.initialize(session, Path("missing-image-binary"), db)
-            self.assertEqual(before, RUNTIME.CONSOLE.command(session, "query-recent", db))
+            self.assertEqual(before, RUNTIME.CONSOLE.command(session, "query-recent", db, "--all-stored"))
             server = RUNTIME.CONSOLE.HTTPServer(("127.0.0.1", 0), RUNTIME.CONSOLE.BaseHTTPRequestHandler)
             server.RequestHandlerClass = RUNTIME.CONSOLE.handler_for(session, server.server_port,
                 runtime_status=lambda: {"worker": {"state": "finished"}, "coverage": "unknown"})
@@ -137,7 +137,7 @@ class RuntimeConsole(unittest.TestCase):
             capture = json.loads(fixture.read_text())
             slot = capture["result"]["slot"]
             # Stored rows come from the Rust decoder; the blocks feed the independent parser.
-            stored = [row for row in RUNTIME.CONSOLE.command(session, "query", db, comparison.MINT)["transfers"]]
+            stored = [row for row in RUNTIME.CONSOLE.command(session, "query", db, comparison.MINT, "--all-stored")["transfers"]]
             blocks = [{"slot": slot + index, "response": {"result": {"transactions": [capture["result"]] if index == 0 else []}}}
                       for index in range(16)]
             output = io.StringIO()
@@ -179,6 +179,42 @@ class RuntimeConsole(unittest.TestCase):
             self.assertNotEqual(code, 0)
             self.assertIsNone(result)
             self.assertIsNotNone(children[-1].poll())
+
+    def test_a_rebuilt_binary_is_never_used_without_an_explicit_upgrade(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            session, image = root / "session", root / "image"
+            session.mkdir()
+            image.write_bytes(b"v1")
+            self.assertEqual(RUNTIME.install_binary(session, image, False), "fresh")
+            self.assertEqual(RUNTIME.install_binary(session, image, False), "current")
+            image.write_bytes(b"v2")
+            self.assertEqual(RUNTIME.install_binary(session, image, False), "upgrade_required")
+            self.assertEqual((session / "helius-indexer").read_bytes(), b"v1")
+            self.assertEqual(RUNTIME.install_binary(session, image, True), "upgraded")
+            self.assertEqual((session / "helius-indexer").read_bytes(), b"v2")
+            backups = list(session.glob("helius-indexer.backup-*"))
+            self.assertEqual([b.read_bytes() for b in backups], [b"v1"])
+            self.assertEqual(RUNTIME.binary_state(session, image), "current")
+
+    def test_routes_once_and_re_routes_only_on_stale_window_evidence(self):
+        self.assertTrue(RUNTIME.should_route({"routing": None}))
+        fresh = {"measurement_age_seconds": 10, "archive": {"error_class": "archive_tip_unknown"}}
+        self.assertFalse(RUNTIME.should_route({"routing": fresh}))
+        quiet = {"measurement_age_seconds": 7200, "archive": {"error_class": None}}
+        self.assertFalse(RUNTIME.should_route({"routing": quiet, "attempts": [{"status": "time_limit"}]}))
+        self.assertTrue(RUNTIME.should_route({"routing": quiet, "attempts": [{"status": "outside_replay_window"}]}))
+        self.assertTrue(RUNTIME.should_route({"routing": {**quiet, "archive": {"error_class": "archive_tip_unknown"}}}))
+        self.assertFalse(RUNTIME.should_route({"routing": {"measurement_age_seconds": None, "archive": {}}}))
+        # Uncovered slots between the archive tip and replay are re-measured hourly.
+        gap = {**quiet, "segments": [{"start": 1, "end": 9, "kind": "archive"}, {"start": 10, "end": 19, "kind": "uncovered"}]}
+        self.assertTrue(RUNTIME.should_route({"routing": gap, "verified": {"uncovered_unverified_slots": 10}}))
+        self.assertFalse(RUNTIME.should_route({"routing": {**gap, "measurement_age_seconds": 60}, "verified": {"uncovered_unverified_slots": 10}}))
+        # Once RPC has filled the gap, it no longer forces a re-route.
+        self.assertFalse(RUNTIME.should_route({"routing": gap, "verified": {"uncovered_unverified_slots": 0}}))
+        # A recent attempt, even a failed one that recorded nothing, defers the next.
+        self.assertFalse(RUNTIME.should_route({"routing": None}, since_attempt=60))
+        self.assertTrue(RUNTIME.should_route({"routing": None}, since_attempt=3600))
 
     def test_secret_file_is_not_executed(self):
         with tempfile.TemporaryDirectory() as directory:

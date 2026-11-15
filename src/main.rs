@@ -2,7 +2,10 @@ use helius_indexer::{
     Error, Result,
     backfill::{History, RpcSource},
     decoder::{self, MAX_CAPTURE_BYTES},
-    storage::{Database, Store},
+    storage::{
+        Database, Store,
+        window::{self, Window},
+    },
     telemetry::Telemetry,
 };
 use serde_json::json;
@@ -12,10 +15,10 @@ use std::{
     io::{Read, Write},
     path::Path,
     process::ExitCode,
-    time::Instant,
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
-const USAGE: &str = "usage: DATABASE_URL=postgres://... helius-indexer COMMAND, where SESSION is a schema name (^[a-z][a-z0-9_]*$), not a file path: replay-create SESSION JOB MINT START END | replay-status/replay-retry/replay-grant SESSION JOB | replay-route SESSION JOB CACHE | replay SESSION JOB SECONDS | replay-monitor SESSION JOB LIVE_FROM SECONDS | health SESSION | migrate SESSION | sample-init SESSION MINT PERCENT | sample-status SESSION | consume SESSION SECONDS (uses INDEXER_KAFKA_BROKERS) | comparison-input SESSION MINT [--sample] | monitor SESSION MINT LIVE_FROM START END SECONDS | query-recent SESSION [MINT] | ingest SESSION CAPTURE [--metrics FILE] | query SESSION [MINT] | backfill SESSION MINT START END [--metrics FILE] | coverage SESSION MINT START END | live SESSION FROM_SLOT SECONDS [MINT] | prune SESSION KEEP | live-status SESSION | live-retry SESSION | summary SESSION MINT | overlap SESSION START END SECONDS | repair SESSION START END | repair-status SESSION START END | repair-history-archive SESSION MINT START END | repair-history SESSION MINT START END | [feature archive] archive/archive-replay/archive-overlap SESSION CACHE MINT START END | bridge-plan SESSION CACHE MINT START | bridge SESSION CACHE MINT START | bridge-status SESSION MINT START | bridge-live SESSION CACHE START SECONDS | archive-overlap-replay SESSION MINT START END | archive-tip CACHE | archive-live SESSION CACHE START END SECONDS";
+const USAGE: &str = "usage: DATABASE_URL=postgres://... helius-indexer COMMAND, where SESSION is a schema name (^[a-z][a-z0-9_]*$), not a file path: replay-create SESSION JOB MINT START END | replay-status/replay-retry/replay-grant SESSION JOB | replay-route SESSION JOB CACHE | archive-grant SESSION JOB | replay-gap SESSION JOB | gap-grant SESSION JOB | replay SESSION JOB SECONDS | replay-monitor SESSION JOB LIVE_FROM SECONDS [CACHE] | replay-overlap SESSION JOB | health SESSION | migrate SESSION | sample-init SESSION MINT PERCENT | sample-status SESSION | consume SESSION SECONDS (uses INDEXER_KAFKA_BROKERS) | comparison-input SESSION MINT [--sample] | monitor SESSION MINT LIVE_FROM START END SECONDS | query-recent SESSION [MINT] [WINDOW] [--limit N] [--cursor C] | ingest SESSION CAPTURE [--metrics FILE] | query SESSION [MINT] [WINDOW] [--limit N] [--cursor C] | backfill SESSION MINT START END [--metrics FILE] | coverage SESSION MINT START END | live SESSION FROM_SLOT SECONDS [MINT] | prune SESSION KEEP | live-status SESSION | live-retry SESSION | summary SESSION MINT [WINDOW] | overlap SESSION START END SECONDS | repair SESSION START END | repair-status SESSION START END | repair-history-archive SESSION MINT START END | repair-history SESSION MINT START END | [feature archive] replay-archive SESSION JOB CACHE | archive/archive-replay/archive-overlap SESSION CACHE MINT START END | bridge-plan SESSION CACHE MINT START | bridge SESSION CACHE MINT START | bridge-status SESSION MINT START | bridge-live SESSION CACHE START SECONDS | archive-overlap-replay SESSION MINT START END | archive-tip CACHE | archive-live SESSION CACHE START END SECONDS";
 
 fn ingest(db: &str, input: &str, telemetry: &mut Telemetry) -> Result<serde_json::Value> {
     let started = Instant::now();
@@ -91,13 +94,38 @@ fn run(args: &[String], telemetry: &mut Telemetry) -> Result<serde_json::Value> 
                 telemetry,
             )
         }
+        #[cfg(feature = "archive")]
+        [command, session, id, cache] if command == "replay-archive" => {
+            helius_indexer::replay::archive::run(
+                &Database::from_env(session)?,
+                id,
+                Path::new(cache),
+                telemetry,
+            )
+        }
+        [command, session, id] if command == "replay-gap" => {
+            helius_indexer::replay::archive::gap(&Database::from_env(session)?, id, telemetry)
+        }
+        [command, session, id] if command == "gap-grant" => {
+            helius_indexer::replay::archive::lane_grant(
+                &Database::from_env(session)?,
+                id,
+                helius_indexer::storage::replay::Lane::Gap,
+                telemetry,
+            )
+        }
+        [command, session, id] if command == "archive-grant" => {
+            helius_indexer::replay::archive::grant(&Database::from_env(session)?, id, telemetry)
+        }
         [command, session, id] if command == "replay-grant" => {
             helius_indexer::replay::grant(&Database::from_env(session)?, id, telemetry)
         }
         [command, session, id] if command == "replay-retry" => {
             helius_indexer::replay::retry(&Database::from_env(session)?, id, telemetry)
         }
-        [command, session, id, from, seconds] if command == "replay-monitor" => {
+        [command, session, id, from, seconds, rest @ ..]
+            if command == "replay-monitor" && rest.len() <= 1 =>
+        {
             helius_indexer::replay::monitor(
                 &Database::from_env(session)?,
                 id,
@@ -105,8 +133,12 @@ fn run(args: &[String], telemetry: &mut Telemetry) -> Result<serde_json::Value> 
                 seconds
                     .parse()
                     .map_err(|_| Error("invalid_replay_bounds"))?,
+                rest.first().map(Path::new),
                 telemetry,
             )
+        }
+        [command, session, id] if command == "replay-overlap" => {
+            helius_indexer::replay::overlap::reconcile(&Database::from_env(session)?, id, telemetry)
         }
         [command, session, id, seconds] if command == "replay" => helius_indexer::replay::run(
             &Database::from_env(session)?,
@@ -264,8 +296,6 @@ fn run(args: &[String], telemetry: &mut Telemetry) -> Result<serde_json::Value> 
                 telemetry,
             )
         }
-        [command, db] if command == "query-recent" => query_recent(db, None),
-        [command, db, mint] if command == "query-recent" => query_recent(db, Some(mint)),
         [command, db, mint, percent] if command == "sample-init" => Store::init_sample(
             &Database::from_env(db)?,
             mint,
@@ -293,8 +323,10 @@ fn run(args: &[String], telemetry: &mut Telemetry) -> Result<serde_json::Value> 
         [command, db, mint, flag] if command == "comparison-input" && flag == "--sample" => {
             Store::comparison_input(&Database::from_env(db)?, mint, 16)
         }
-        [command, db, mint] if command == "summary" => {
-            Store::summary(&Database::from_env(db)?, mint)
+        [command, rest @ ..]
+            if matches!(command.as_str(), "query" | "query-recent" | "summary") =>
+        {
+            windowed(command, rest)
         }
         [command, db, start, end, seconds] if command == "overlap" => {
             helius_indexer::coordinator::run(
@@ -387,25 +419,113 @@ fn run(args: &[String], telemetry: &mut Telemetry) -> Result<serde_json::Value> 
         [command, db, input, flag, _] if command == "ingest" && flag == "--metrics" => {
             ingest(db, input, telemetry)
         }
-        [command, db] if command == "query" => query(db, None),
-        [command, db, mint] if command == "query" => query(db, Some(mint)),
         _ => Err(Error(USAGE)),
     }
 }
 
-fn query(db: &str, mint: Option<&str>) -> Result<serde_json::Value> {
-    let transfers = Store::query(&Database::from_env(db)?, mint, 1000)?;
-    Ok(
-        json!({"sampling":Store::sampling(&Database::from_env(db)?)?,"coverage":"unknown","limit":1000,"transfers":transfers,"live":helius_indexer::live::Intake::report(&Database::from_env(db)?)?}),
-    )
+/// `query`, `query-recent` and `summary` take positionals, then `--window-seconds N` or
+/// `--from T --to T` (block times, `[from, to)`), plus `--limit N` and `--cursor C` for listings.
+/// `--all-stored` is local inspection of every retained row (pre-window output shape); it
+/// excludes the window flags and is not a served API mode.
+fn windowed(command: &str, args: &[String]) -> Result<serde_json::Value> {
+    let mut positional = Vec::new();
+    let (mut seconds, mut from, mut to, mut limit, mut cursor) = (None, None, None, None, None);
+    let mut all_stored = false;
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        let Some(flag) = arg.strip_prefix("--") else {
+            positional.push(arg.as_str());
+            continue;
+        };
+        if flag == "all-stored" {
+            all_stored = true;
+            continue;
+        }
+        let value = rest.next().ok_or(Error(USAGE))?;
+        match flag {
+            "window-seconds" => seconds = Some(value.parse().map_err(|_| Error("invalid_window"))?),
+            "from" => from = Some(value.parse().map_err(|_| Error("invalid_window"))?),
+            "to" => to = Some(value.parse().map_err(|_| Error("invalid_window"))?),
+            "limit" => limit = Some(value.parse().map_err(|_| Error("invalid_query_limit"))?),
+            "cursor" => cursor = Some(value.as_str()),
+            _ => return Err(Error(USAGE)),
+        }
+    }
+    if all_stored && (seconds.is_some() || from.is_some() || to.is_some() || cursor.is_some()) {
+        return Err(Error("all_stored_excludes_window_and_cursor"));
+    }
+    let explicit = match (from, to) {
+        (Some(from), Some(to)) => Some((from, to)),
+        (None, None) => None,
+        _ => return Err(Error("invalid_window")),
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_secs()).ok())
+        .ok_or(Error("clock_failed"))?;
+    let window = Window::resolve(now, seconds, explicit)?;
+    let [session, mint @ ..] = positional.as_slice() else {
+        return Err(Error(USAGE));
+    };
+    let database = Database::from_env(session)?;
+    if all_stored {
+        return stored(command, &database, mint, limit.unwrap_or(1000));
+    }
+    if command == "summary" {
+        let [mint] = mint else {
+            return Err(Error(USAGE));
+        };
+        let mut out = window::window_summary(&database, mint, window)?;
+        out["sampling"] = Store::sampling(&database)?;
+        return Ok(out);
+    }
+    if mint.len() > 1 {
+        return Err(Error(USAGE));
+    }
+    let mut out = window::listing(
+        &database,
+        mint.first().copied(),
+        window,
+        command == "query-recent",
+        limit.unwrap_or(1000),
+        cursor,
+    )?;
+    out["live"] = helius_indexer::live::Intake::report(&database)?;
+    out["sampling"] = Store::sampling(&database)?;
+    Ok(out)
 }
 
-fn query_recent(db: &str, mint: Option<&str>) -> Result<serde_json::Value> {
-    Ok(
-        json!({"sampling":Store::sampling(&Database::from_env(db)?)?,"coverage":"unknown","limit":1000,"order":"newest_first",
-        "transfers":Store::query_recent(&Database::from_env(db)?, mint, 1000)?,
-        "live":helius_indexer::live::Intake::report(&Database::from_env(db)?)?}),
-    )
+/// Pre-window output over every stored row, including unknown block time: no clock, cutoff,
+/// window, pagination or coverage object. `summary` is `Store::summary`'s all-stored aggregate.
+fn stored(
+    command: &str,
+    database: &Database,
+    mint: &[&str],
+    limit: usize,
+) -> Result<serde_json::Value> {
+    if command == "summary" {
+        let [mint] = mint else {
+            return Err(Error(USAGE));
+        };
+        return Store::summary(database, mint);
+    }
+    if mint.len() > 1 {
+        return Err(Error(USAGE));
+    }
+    let mint = mint.first().copied();
+    let recent = command == "query-recent";
+    let transfers = if recent {
+        Store::query_recent(database, mint, limit)?
+    } else {
+        Store::query(database, mint, limit)?
+    };
+    let mut out = json!({"sampling":Store::sampling(database)?,"coverage":"unknown","limit":limit,"transfers":transfers,
+        "live":helius_indexer::live::Intake::report(database)?});
+    if recent {
+        out["order"] = json!("newest_first");
+    }
+    Ok(out)
 }
 
 fn main() -> ExitCode {

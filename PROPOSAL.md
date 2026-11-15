@@ -82,6 +82,14 @@ LaserStream replay is documented as roughly 48 hours and honors mint filtering. 
 
 Every user query applies an explicit block-time cutoff for the rolling 30-day window. Database TTL handles eventual physical cleanup and does not define query eligibility.
 
+Block-time policy (reviewed 2026-11-14):
+
+- A transfer with unknown (null) block time never appears in a time-filtered listing and never silently counts in a window.
+- Time-filtered responses report such transfers as an explicit `null_block_time` count. Aggregates state that they cover known-time rows only.
+- There is no slot-derived time fallback. Unknown time stays unknown until history or reconciliation supplies it.
+- The server computes each cutoff from an injected clock and returns the cutoff in the response.
+- Requirements change (2026-11-14): the 30-day window is the default for the CLI `query`, `query-recent` and `summary`. The `--all-stored` flag is an explicit exception: it is a local captured-data inspection mode over every retained row, including rows up to 37 days old and rows with unknown block time, and returns the pre-window output shape with `coverage: "unknown"`. It is not query-eligible, must not be exposed by any served API, and a served API must default to the window.
+
 Provisionally retain matched raw transactions for 37 days: 30 days of query history plus a seven-day repair margin. Compressed object storage is the candidate raw store. Preserve instructions, inner instructions, relevant execution metadata, source provenance, and schema/version information needed to repeat decoding. Size and validate this policy before production.
 
 The initial API provides:
@@ -187,6 +195,8 @@ Before approving production infrastructure, produce a measured estimate covering
 
 The total acceptable monthly budget remains unresolved. Production mint selection, numerical freshness/query/recovery targets, backfill deadline, deployment topology, exact storage schemas, and technology selection must be decided using validation results. Do not present unmeasured capacity, cost, latency, or archive availability as guarantees.
 
+Unresolved: observed-empty windows. Window coverage maps a block-time window to the slot span of its known-time transfers (`src/storage/window.rs`), so a window with no such transfers has no slot span and reports `unknown` (`no_known_time_transfers_in_window`), never an observed empty range, even when history is complete. Reporting observed-empty needs a time-to-slot mapping for historical slots (for example a block time on `historical_slots`), which is a requirements change. Until decided, the surface is conservative: it never claims coverage it cannot show.
+
 ## Next review
 
 Use this proposal as the requirements baseline. The first captured-transfer slice now provides local decoding, provisional SQLite persistence, a bounded query CLI, and basic telemetry; see `README.md` for commands and limitations. Continue the approved tickets toward the representative end-to-end validation and use its evidence for production architecture and targets. No production infrastructure has been provisioned.
@@ -283,7 +293,10 @@ Durable historical jobs must retain their requested scope and processing state
 across restarts and live cycles. Preserve live priority. Keep processing receipts
 separate from verified coverage and from data still retained after the approved
 local 1,000-transfer cap. Filtered replay receipt or a later observed slot alone
-must not advance verified slot coverage. The current first-cycle RPC Docker
+must not advance verified slot coverage. The routine interval between the archive
+tip and the replay window is filled automatically by bounded RPC `getBlock`, and only
+for that measured interval, within a per-job allowance (decided 2026-11-15, #84).
+The current first-cycle RPC Docker
 implementation does not satisfy this target. Follow the staged
 [corrected backfill plan](docs/backfill-replan.md); a full-window run and paid
 infrastructure remain separately authorized actions.

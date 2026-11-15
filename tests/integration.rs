@@ -341,7 +341,8 @@ fn cli_process_restart_metrics_replay_and_redaction() {
     let result: Value = serde_json::from_slice(&ingest.stdout).unwrap();
     assert_eq!(result["inserted"], 1);
     assert_eq!(result["coverage"], "unknown");
-    let query = cli(&["query", db.session()]);
+    // Fixture block time is fixed (2026-11-11); the default window would age it out.
+    let query = cli(&["query", db.session(), "--all-stored"]);
     assert!(query.status.success());
     let rows: Value = serde_json::from_slice(&query.stdout).unwrap();
     assert_eq!(rows["transfers"][0]["amount_raw"], "42");

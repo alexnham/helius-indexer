@@ -2,6 +2,8 @@
 
 Verified 2026-11-11 (America/Toronto). This slice selects bounded finalized JSON-RPC
 `getBlock` as a fallback, without selecting production archive infrastructure.
+Historical note: statements about bridges below describe 2026-11-11 only. A bounded
+bridge check was recorded later in [source boundary](source-boundary.md) (2026-11-12).
 
 ## Archive findings
 
@@ -47,8 +49,8 @@ responses leave coverage unknown. Successful zero-transaction blocks establish
 observed empty coverage. A finalized child's direct parent link supplies skip
 evidence for intermediate slots; RPC errors alone never establish skipped slots.
 
-A viable archive/recent bridge must exhibit a real shared finalized range with
-matching block identities and decodable execution metadata. No bridge has been
+As of this 2026-11-11 verification, a viable archive/recent bridge had to exhibit a real shared finalized range with
+matching block identities and decodable execution metadata. No bridge had been
 measured: archive tip, RPC history depth, sustainable throughput, transport usage,
 provider cost and actual archive format compatibility remain unverified. RPC
 providers may prune history, rate-limit requests or reject version 1; these cases
@@ -56,8 +58,8 @@ remain unknown and retryable. The public endpoint needs no new credentials, but
 is not a production historical availability commitment. One public-mainnet smoke request for slot 468265447 succeeded using this CLI
 (with one genesis-hash check). The report retained 3,565,284 response bytes and
 left coverage unknown because the shared decoder rejected Token-2022 candidates.
-A separate SQLite comparison matched both previously captured transfer records
-exactly. This is a functional check with a correlated public RPC source, not an
+A separate comparison against the then-SQLite store matched both previously captured
+transfer records exactly. This is a functional check with a correlated public RPC source, not an
 independent completeness reconciliation, throughput benchmark, historical-depth
 or bridge guarantee. No paid provider or full backfill was used.
 

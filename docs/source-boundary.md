@@ -2,7 +2,7 @@
 
 The optional archive feature now includes a resumable bounded coordinator for
 issue #17. It freezes a measured archive tip and a finalized RPC reference into
-an additive SQLite plan, then routes older positions to the archive and newer
+an additive PostgreSQL plan in the session schema, then routes older positions to the archive and newer
 positions to RPC. It never infers historical completeness from filtered live
 transactions. This is a finite validation scheduler, not an unattended production
 30-day job.
@@ -13,12 +13,14 @@ Build as described in [archive validation](archive.md), using Rust 1.98.1+:
 
 ```sh
 export INDEXER_ARCHIVE_OPT_IN=1
+# DATABASE_URL names the PostgreSQL server; SESSION is a schema name, not a file path.
+export DATABASE_URL=postgres://...
 # START must be at or before the measured archive tip.
-target/debug/helius-indexer bridge-plan data/bridge.sqlite data/archive MINT START
+target/debug/helius-indexer bridge-plan SESSION data/archive MINT START
 # One bounded batch; repeat explicitly to resume.
-target/debug/helius-indexer bridge data/bridge.sqlite data/archive MINT START
+target/debug/helius-indexer bridge SESSION data/archive MINT START
 # Offline diagnostic; does not fetch, move boundaries or acknowledge coverage.
-target/debug/helius-indexer bridge-status data/bridge.sqlite MINT START
+target/debug/helius-indexer bridge-status SESSION MINT START
 ```
 
 Plans are keyed by mint, decoder revision and requested start. They retain the
@@ -69,7 +71,7 @@ The status report returns the contiguous boundary, pending position count,
 missing interval count, next pending scheduling position, original plan age and
 up to 32 unfinished intervals split into archive/RPC portions. Larger reports set
 `ranges_truncated`; counts include all intervals. Sparse durable completion is
-streamed from SQLite rather than expanding a multi-million-position vector.
+streamed from PostgreSQL rather than expanding a multi-million-position vector.
 The separate live-tail object begins at the frozen reference plus one and always
 reports unknown coverage. The storage summary retains its existing all-stored
 scope; historical completion here applies only to the frozen plan.
@@ -85,8 +87,8 @@ not retry within the batch. Per-request deadlines are at most 20 seconds and
 shrink to the remaining historical network budget: 120 seconds, or the shorter
 live duration. CPU decoding and durable writes may finish after that network
 budget; this is not a hard wall-clock process kill. `BACKFILL_CANCEL_FILE` is
-checked between scheduling/transaction operations. Gate waits, SQLite's existing
-five-second busy timeout, and decoder work retain their existing limits.
+checked between scheduling/transaction operations. It does not interrupt a
+PostgreSQL operation, gate wait or decoder call already in progress.
 
 Planning is a separate bounded tip probe; a batch never repeats it. Cached raw
 ranges and receipts follow the [archive integrity/replay contract](archive.md).
@@ -95,15 +97,16 @@ proof remain separate durable state. Restart reuses verified work and retries
 unresolved work without duplicate query output. No perpetual retry loop, full
 backfill, database service or paid infrastructure is introduced.
 
-The migration adds `bridge_plans` and `bridge_overlap_proofs`; existing transfer
-rows are unchanged. Older binaries ignore these tables and cannot enforce these
-boundary proofs. Back up the SQLite database before downgrading. Existing
+The schema adds `bridge_plans` and `bridge_overlap_proofs` (initial PostgreSQL
+migration); existing transfer rows are unchanged. Older binaries ignore these
+tables and cannot enforce these boundary proofs. Back up the session schema before
+downgrading. Existing
 synthetic multi-block test headers were corrected to link their parent hashes;
 no captured on-chain transaction fixture changed.
 
 ## Verification
 
-Deterministic offline tests use real SQLite and the sanitized captured transfer.
+Deterministic offline tests use real PostgreSQL and the sanitized captured transfer.
 They exercise both routing portions, exact duplicate-free output, empty produced
 blocks, a 16-position skipped run, rotating work after cancellation, failed RPC
 and contradictory overlap/parent data, a trigger-injected crash after output but
@@ -119,7 +122,11 @@ Archive availability is observed, not inferred from the documented publication
 expectation; finalized full blocks supply historical completion evidence, while
 filtered stream delivery alone does not close the live tail.
 
-### Local and bounded mainnet evidence (2026-11-12)
+### Local and bounded mainnet evidence (2026-11-12, SQLite-era)
+
+Historical record: this run used the SQLite-era store and file arguments
+(`data/bridge.sqlite`, `coverage DB ...`). Those arguments are no longer accepted;
+the commands above use `SESSION` on PostgreSQL. The measurements are not rerun.
 
 On local Apple Silicon with Rust 1.99, formatting and Clippy passed for both
 feature configurations. Full offline suites passed 74 default and 95 archive
@@ -128,7 +135,7 @@ Commands used `--offline --locked`; Clippy used `--all-targets -- -D warnings`.
 Development/test debug information and incremental compilation were disabled.
 
 A bounded public-provider check used a fresh ignored SQLite database/cache and
-USDC. A tip probe selected archive slot 468287999. `bridge-plan ... 468287999`
+USDC, as recorded at the time. A tip probe selected archive slot 468287999. `bridge-plan ... 468287999`
 froze finalized reference 468643125 at block time 1794511860, with a measured
 355,126-slot / 76,362-second freshness gap. Planning reused one cached CAR chunk,
 made three archive requests and read 1,536 response-body bytes. The preceding tip
@@ -152,7 +159,7 @@ a claim that this archive tip is fully decodable. The smaller successful shared
 range in [archive validation](archive.md) remains the positive mainnet overlap
 example. Fixing unsupported authority changes and validating a production
 scheduler/continuous boundary extension remain separate work. Inspect specific
-bounded gaps with the existing `coverage DB MINT START END` command.
+bounded gaps with the existing `coverage SESSION MINT START END` command.
 
 ### Explicit corroborated readiness
 

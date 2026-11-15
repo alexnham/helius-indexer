@@ -411,6 +411,147 @@ fn telemetry_distinguishes_unscheduled_age_from_an_observed_empty_backlog() {
 }
 
 #[test]
+fn range_progress_and_rate_fields_describe_complete_and_incomplete_ranges() {
+    let (_dir, path) = db();
+    let slot = fixture()["result"]["slot"].as_u64().unwrap();
+    let mut full = source(vec![
+        (
+            slot,
+            block(slot, slot - 1, vec![fixture()["result"].clone()]),
+        ),
+        (slot + 1, block(slot + 1, slot, vec![])),
+    ]);
+    let (coverage, metrics) = History::open(&path)
+        .unwrap()
+        .run(&mint(), slot, slot + 1, &mut full, || false)
+        .unwrap();
+    assert!(coverage.complete);
+    assert_eq!(coverage.progress.slots_requested, 2);
+    assert_eq!(coverage.progress.slots_completed, 2);
+    assert_eq!(coverage.progress.first_slot, slot);
+    assert_eq!(coverage.progress.last_slot, slot + 1);
+    let json = serde_json::to_value(&metrics).unwrap();
+    assert_eq!(json["decoded_transactions"], 1);
+    assert!(json["transactions_per_second"].as_f64().unwrap() >= 0.0);
+    assert_eq!(
+        serde_json::to_value(&coverage).unwrap()["progress"]["slots_completed"],
+        2
+    );
+    let text = metrics.prometheus(&coverage);
+    for line in [
+        "indexer_historical_range_slots_requested{mode=\"historical\"} 2".to_string(),
+        "indexer_historical_range_slots_completed{mode=\"historical\"} 2".into(),
+        format!("indexer_historical_range_first_slot{{mode=\"historical\"}} {slot}"),
+        format!(
+            "indexer_historical_range_last_slot{{mode=\"historical\"}} {}",
+            slot + 1
+        ),
+        "indexer_historical_transactions_per_second ".into(),
+    ] {
+        assert!(text.contains(&line), "{line}");
+    }
+
+    let (_dir, path) = db();
+    let mut partial = source(vec![(
+        slot,
+        block(slot, slot - 1, vec![fixture()["result"].clone()]),
+    )]);
+    let (coverage, _) = History::open(&path)
+        .unwrap()
+        .run(&mint(), slot, slot + 1, &mut partial, || false)
+        .unwrap();
+    assert!(!coverage.complete);
+    assert_eq!(coverage.progress.slots_requested, 2);
+    assert_eq!(coverage.progress.slots_completed, 1);
+    assert!(
+        metrics
+            .prometheus(&coverage)
+            .contains("indexer_historical_range_slots_completed{mode=\"historical\"} 1")
+    );
+}
+
+#[test]
+#[ignore = "subprocess helper for range completion event tests"]
+fn historical_range_event_child() {
+    let session = std::env::var("INDEXER_TEST_EVENT_DB").unwrap();
+    let path = &Database::new(TestDatabase::url(), &session).unwrap();
+    let phase = std::env::var("INDEXER_TEST_EVENT_PHASE").unwrap();
+    let slot = fixture()["result"]["slot"].as_u64().unwrap();
+    let mut source = source(vec![
+        (
+            slot,
+            block(slot, slot - 1, vec![fixture()["result"].clone()]),
+        ),
+        (slot + 1, block(slot + 1, slot, vec![])),
+    ]);
+    if phase == "incomplete" {
+        source.blocks.remove(&(slot + 1));
+    }
+    // The cancel check runs at the top of each slot and once per transaction; the third call is slot+1.
+    let checks = Cell::new(0);
+    let result = History::open(path)
+        .unwrap()
+        .run(&mint(), slot, slot + 1, &mut source, || {
+            checks.set(checks.get() + 1);
+            phase == "cancel" && checks.get() > 2
+        });
+    if phase == "failure" {
+        assert!(result.is_err());
+    } else {
+        result.unwrap();
+    }
+    std::process::exit(0);
+}
+
+#[test]
+fn range_completion_event_is_emitted_once_only_after_the_whole_range_is_durable() {
+    let slot = fixture()["result"]["slot"].as_u64().unwrap();
+    for phase in ["success", "cancel", "incomplete", "failure"] {
+        let (_dir, path) = db();
+        History::open(&path).unwrap();
+        if phase == "failure" {
+            // The first verified-slot acknowledgment fails, so run returns an error.
+            sql(
+                &path,
+                "CREATE OR REPLACE FUNCTION fail() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RAISE EXCEPTION 'injected'; END$$; CREATE TRIGGER fail_ack BEFORE UPDATE OF status ON historical_slots FOR EACH ROW WHEN (NEW.status='complete') EXECUTE FUNCTION fail();",
+            );
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "historical_range_event_child", "--ignored"])
+            .env("INDEXER_TEST_EVENT_DB", path.session())
+            .env("INDEXER_TEST_EVENT_PHASE", phase)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(output.status.success(), "{phase}: {stderr}");
+        let completed: Vec<&str> = stderr
+            .lines()
+            .filter(|line| line.contains("\"event\":\"historical_range_completed\""))
+            .collect();
+        if phase != "success" {
+            assert!(completed.is_empty(), "{phase}: {stderr}");
+            continue;
+        }
+        assert_eq!(completed.len(), 1);
+        let event: Value = serde_json::from_str(completed[0]).unwrap();
+        assert_eq!(event["outcome"], "success");
+        assert_eq!(event["mode"], "historical");
+        assert_eq!(event["mint"], mint());
+        assert_eq!(event["slot_start"], slot);
+        assert_eq!(event["slot_end"], slot + 1);
+        assert_eq!(event["decoder_version"], decoder::DECODER_VERSION);
+        // The per-slot durable_range_completed event is unchanged: one per acknowledged slot.
+        assert_eq!(
+            stderr
+                .lines()
+                .filter(|line| line.contains("\"event\":\"durable_range_completed\""))
+                .count(),
+            2
+        );
+    }
+}
+
+#[test]
 fn malformed_earlier_response_cannot_break_valid_child_skip_evidence() {
     let (_dir, path) = db();
     let mut source = source(vec![

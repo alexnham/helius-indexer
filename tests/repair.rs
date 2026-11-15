@@ -36,7 +36,7 @@ fn seed(path: &Database, value: &Value) {
 }
 fn insert(db: &mut Client, row: &Transfer) {
     db.execute(
-        "INSERT INTO transfers VALUES($1,$2,$3,$4,$5,$6,$7)",
+        "INSERT INTO transfers(transfer_id,signature,slot,outer_index,inner_index,mint,record_json,block_time,amount_raw,fee_raw) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::text::numeric,$10::text::numeric)",
         &[
             &row.transfer_id,
             &row.signature,
@@ -45,6 +45,9 @@ fn insert(db: &mut Client, row: &Transfer) {
             &(row.inner_instruction_index.map_or(-1, |n| n as i32)),
             &row.mint,
             &(serde_json::to_string(row).unwrap()),
+            &row.block_time,
+            &row.amount_raw.map(|n| n.to_string()),
+            &row.fee_raw.map(|n| n.to_string()),
         ],
     )
     .unwrap();
@@ -75,7 +78,7 @@ fn correction_adds_changes_and_removes_full_transaction_output_without_new_input
         &[&correct[0].transfer_id],
     )
     .unwrap();
-    db.execute("UPDATE transfers SET mint='old-wrong-mint',record_json=jsonb_set(jsonb_set(jsonb_set(record_json::jsonb,'{mint}',to_jsonb('old-wrong-mint'::text)),'{amount_raw}',to_jsonb('999'::text)),'{fee_raw}',to_jsonb('7'::text))::text", &[]).unwrap();
+    db.execute("UPDATE transfers SET mint='old-wrong-mint',amount_raw=999,fee_raw=7,record_json=jsonb_set(jsonb_set(jsonb_set(record_json::jsonb,'{mint}',to_jsonb('old-wrong-mint'::text)),'{amount_raw}',to_jsonb('999'::text)),'{fee_raw}',to_jsonb('7'::text))::text", &[]).unwrap();
     let mut false_row = correct[0].clone();
     false_row.transfer_id.push_str(":false");
     false_row.amount_raw = Some(123);
@@ -88,6 +91,31 @@ fn correction_adds_changes_and_removes_full_transaction_output_without_new_input
     assert_eq!(result["corrected"], 1);
     assert_eq!(result["progress"]["repair_complete"], true);
     assert_eq!(rows(path), sorted(correct.clone()));
+    // Columns follow the corrected record, not the stale values seeded above.
+    type Columns = Vec<(String, Option<String>, Option<String>, Option<i64>)>;
+    let mut columns: Columns = db
+        .query(
+            "SELECT transfer_id,amount_raw::text,fee_raw::text,block_time FROM transfers",
+            &[],
+        )
+        .unwrap()
+        .iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3)))
+        .collect();
+    columns.sort();
+    let mut expected_columns: Columns = correct
+        .iter()
+        .map(|t| {
+            (
+                t.transfer_id.clone(),
+                t.amount_raw.map(|n| n.to_string()),
+                t.fee_raw.map(|n| n.to_string()),
+                t.block_time,
+            )
+        })
+        .collect();
+    expected_columns.sort();
+    assert_eq!(columns, expected_columns);
     assert_eq!(
         Store::summary(path, "old-wrong-mint").unwrap()["transfer_count"],
         0

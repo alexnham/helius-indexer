@@ -27,3 +27,13 @@ EXPOSE 8765
 HEALTHCHECK --interval=10s --timeout=5s --start-period=60s --retries=3 \
     CMD python3 -c "import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:'+os.environ['INDEXER_CONSOLE_PORT']+'/healthz',timeout=3).read()"
 ENTRYPOINT ["python3","/app/scripts/local-test.py","--binary","/usr/local/bin/helius-indexer","--persistent-session","/app/data/session","--bind","0.0.0.0"]
+
+# Archive-enabled runtime: the same image with the Old Faithful adapter compiled in.
+# Building it needs the C/C++ compiler and cmake already in the build stage.
+FROM build AS build-archive
+RUN --mount=type=cache,id=helius-indexer-console-registry-v1,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=helius-indexer-console-git-v1,target=/usr/local/cargo/git \
+    cargo build --release --locked --features archive
+
+FROM console AS console-archive
+COPY --from=build-archive /build/target/release/helius-indexer /usr/local/bin/helius-indexer
