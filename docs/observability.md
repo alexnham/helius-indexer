@@ -364,6 +364,14 @@ verified archive and overlap slot counts, unknown slots, latest outcome counts a
 up to 32 conflict slots with their reason; the console shows the boundary, counts
 and conflicts. A `replay-monitor` cycle reports each step's outcome or error class.
 
+The Docker runtime's `/api/status` adds `configuration.archive` (archive batches
+enabled) and `configuration.binary` (`fresh`, `current`, `upgraded` or
+`upgrade_required`). Worker state `binary_upgrade_required` means the image binary
+differs from the session copy and nothing is ingested until an explicit upgrade.
+Route measurements append their `route_measured` events to the session's
+`events.jsonl`, and the last route report is kept as `route.json`. Readiness still
+means the process and its dependencies are available, not source completeness.
+
 The console shows remaining budgets, processing versus raw retention and unknown
 coverage, alongside live reports and actual query output. Current JSON snapshots
 are inspection telemetry, not a production continuous exporter or alert system.
