@@ -19,6 +19,18 @@ os.environ.setdefault("DATABASE_URL", os.environ.get(
     "INDEXER_TEST_DATABASE_URL", "postgres://indexer:indexer@127.0.0.1:55432/indexer"))
 
 
+class CommandTimeout(unittest.TestCase):
+    def test_timed_out_command_keeps_its_diagnostics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            session = Path(directory)
+            binary = session / "helius-indexer"
+            binary.write_text('#!/bin/sh\necho \'{"event":"slow_query"}\' >&2\nexec sleep 30\n')
+            binary.chmod(0o700)
+            with self.assertRaises(CONSOLE.subprocess.TimeoutExpired):
+                CONSOLE.command(session, "query", timeout=2)
+            self.assertIn(b'"event":"slow_query"', (session / "events.jsonl").read_bytes())
+
+
 class LocalConsole(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

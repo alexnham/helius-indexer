@@ -54,10 +54,15 @@ def database(session):
 
 def command(session, *args, timeout=30):
     with (session / "events.jsonl").open("ab") as log:
-        result = subprocess.run(
-            [str(session / "helius-indexer"), *map(str, args)],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, check=False,
-        )
+        try:
+            result = subprocess.run(
+                [str(session / "helius-indexer"), *map(str, args)],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, check=False,
+            )
+        except subprocess.TimeoutExpired as error:
+            # Keep the killed command's diagnostics; they are the only evidence of the timeout.
+            log.write(error.stderr or b"")
+            raise
         log.write(result.stderr)
     if result.returncode:
         # Error classes are fixed identifiers from the CLI, never inputs or credentials.
