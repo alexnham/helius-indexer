@@ -339,6 +339,14 @@ and routes to `uncovered`. Each measurement emits `route_measured` with outcome
 probed and the uncovered segment count; a failed replay measurement emits it with
 outcome `failed` and records no revision.
 
+Each archive batch emits `archive_attempt_finished` (component `replay_archive`) with
+outcome `success`, `incomplete`, `cancelled` or the error class, and the observed
+requests, response bytes and cached chunks. The status `archive` block reports
+attempts and response bytes by status, remaining batches and per-segment pending
+slots with oldest pending age; `archive_budget_granted` records an explicit grant.
+These are JSON inspection snapshots like the replay report, with no job, mint or
+slot metric labels.
+
 The console shows remaining budgets, processing versus raw retention and unknown
 coverage, alongside live reports and actual query output. Current JSON snapshots
 are inspection telemetry, not a production continuous exporter or alert system.

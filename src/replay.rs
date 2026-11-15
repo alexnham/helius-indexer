@@ -15,6 +15,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::time::{Duration, Instant};
 
+pub mod archive;
 pub mod route;
 
 pub fn create(database: &Database, id: &str, mint: &str, start: u64, end: u64) -> Result<Value> {
@@ -26,7 +27,9 @@ pub fn create(database: &Database, id: &str, mint: &str, start: u64, end: u64) -
 }
 pub fn status(database: &Database, id: &str) -> Result<Value> {
     valid_id(id)?;
-    JobLog::open(database)?.status(id)
+    let mut report = JobLog::open(database)?.status(id)?;
+    report["archive"]["slot_status"] = archive::segment_status(database, id)?;
+    Ok(report)
 }
 pub fn grant(database: &Database, id: &str, telemetry: &mut Telemetry) -> Result<Value> {
     valid_id(id)?;
