@@ -89,6 +89,31 @@ class LocalConsole(unittest.TestCase):
         after = CONSOLE.command(self.session, "query", self.metadata["database"])
         self.assertEqual(before, after)
 
+    def test_console_runs_only_listed_read_only_commands_with_validated_arguments(self):
+        db = self.metadata["database"]
+        before = CONSOLE.command(self.session, "query", db)
+        self.assertEqual(set(self.get("/api/commands")["commands"]), set(CONSOLE.COMMANDS))
+        summary = self.get("/api/command?name=summary&mint=" + CONSOLE.USDC)
+        self.assertEqual(summary["cli"], ["helius-indexer", "summary", db, CONSOLE.USDC])
+        self.assertEqual(summary["result"], CONSOLE.command(self.session, "summary", db, CONSOLE.USDC))
+        self.assertEqual(self.get("/api/command?name=sample-status")["result"]["policy"], "exact")
+        self.assertEqual(self.get("/api/command?name=query&mint=")["cli"], ["helius-indexer", "query", db])
+        coverage = self.get(f"/api/command?name=coverage&mint={CONSOLE.USDC}&start=1&end=2")
+        self.assertEqual(coverage["cli"][-2:], ["1", "2"])
+        for path in ["/api/command?name=prune", "/api/command?name=sample-init&mint=" + CONSOLE.USDC,
+                     "/api/command?name=summary", "/api/command?name=summary&mint=bad",
+                     "/api/command?name=coverage&mint=" + CONSOLE.USDC + "&start=1&end=-2",
+                     "/api/command?name=summary&mint=" + CONSOLE.USDC + "&extra=1",
+                     "/api/command?name=health&name=query", "/api/command?name=replay-status&job=a;rm"]:
+            with self.assertRaises(HTTPError) as error:
+                self.get(path)
+            self.assertEqual(error.exception.code, 400, path)
+        with self.assertRaises(HTTPError) as error:
+            self.get("/api/command?name=coverage&mint=" + CONSOLE.USDC + "&start=9&end=1")
+        self.assertEqual(error.exception.code, 422)
+        self.assertRegex(json.load(error.exception)["error"], r"failed: [a-z_]+;")
+        self.assertEqual(before, CONSOLE.command(self.session, "query", db))
+
 
 if __name__ == "__main__":
     unittest.main()

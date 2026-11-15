@@ -23,7 +23,11 @@ seeds 303 unique transfers from 50 captures, checks replay, and keeps all test
 data in a fresh ignored session. No provider credentials or Docker needed.
 See [the local testing guide](docs/local-testing.md) for prerequisites, checks,
 restart instructions and current limits. This is a read-only captured-data test
-console; live and 30-day coverage remain unverified.
+console; live and 30-day coverage remain unverified. Its **Run a read-only
+command** panel runs `health`, `sample-status`, `live-status`, `summary`, `query`,
+`query-recent`, `coverage`, `repair-status` and `replay-status` against the
+session and shows the equivalent CLI line; commands that write or call a provider
+stay CLI-only.
 
 
 Offline validation slice for a Solana token transfer index. It decodes compiled

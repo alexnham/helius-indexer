@@ -22,6 +22,15 @@ from urllib.parse import parse_qs, urlsplit
 ROOT = Path(__file__).resolve().parent.parent
 USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 MINT = re.compile(r"[1-9A-HJ-NP-Za-km-z]{32,44}\Z")
+# Read-only CLI commands the console may run; each takes the session database first.
+# Optional parameters end in "?". Commands that write or call a provider stay CLI-only.
+COMMANDS = {
+    "health": [], "sample-status": [], "live-status": [],
+    "summary": ["mint"], "query": ["mint?"], "query-recent": ["mint?"],
+    "coverage": ["mint", "start", "end"], "repair-status": ["start", "end"], "replay-status": ["job"],
+}
+PARAMETER = {"mint": lambda v: valid_mint(v), "start": lambda v: re.fullmatch(r"\d{1,18}", v),
+             "end": lambda v: re.fullmatch(r"\d{1,18}", v), "job": lambda v: re.fullmatch(r"[A-Za-z0-9_-]{1,64}", v)}
 
 
 def valid_mint(value):
@@ -47,10 +56,14 @@ def command(session, *args, timeout=30):
     with (session / "events.jsonl").open("ab") as log:
         result = subprocess.run(
             [str(session / "helius-indexer"), *map(str, args)],
-            stdout=subprocess.PIPE, stderr=log, timeout=timeout, check=False,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, check=False,
         )
+        log.write(result.stderr)
     if result.returncode:
-        raise RuntimeError("Indexer command failed; inspect the session events.jsonl")
+        # Error classes are fixed identifiers from the CLI, never inputs or credentials.
+        classes = re.findall(rb'"error_class":"([a-z0-9_]{1,64})"', result.stderr)
+        detail = ": " + classes[-1].decode() if classes else ""
+        raise RuntimeError(f"Indexer command failed{detail}; inspect the session events.jsonl")
     return json.loads(result.stdout)
 
 
@@ -188,6 +201,44 @@ def handler_for(session, port, runtime_status=None):
                     self.send(200, command(session, *args))
                 except (RuntimeError, subprocess.TimeoutExpired, ValueError):
                     self.send(503, {"error": "Query failed; inspect session events.jsonl"})
+            elif url.path == "/api/commands":
+                self.send(200, {"commands": COMMANDS})
+            elif url.path == "/api/command":
+                try:
+                    query = parse_qs(url.query, keep_blank_values=True, max_num_fields=8)
+                except ValueError:
+                    self.send(400, {"error": "Too many query fields"})
+                    return
+                name = query.pop("name", [""])
+                spec = COMMANDS.get(name[0]) if len(name) == 1 else None
+                if spec is None:
+                    self.send(400, {"error": "Choose a listed read-only command"})
+                    return
+                fields = {p.rstrip("?") for p in spec}
+                values = {k: v[0] for k, v in query.items() if v != [""]}
+                if set(query) - fields or any(len(v) > 1 for v in query.values()):
+                    self.send(400, {"error": "Unexpected parameters"})
+                    return
+                args = []
+                for parameter in spec:
+                    field = parameter.rstrip("?")
+                    if field not in values:
+                        if parameter.endswith("?"):
+                            continue
+                        self.send(400, {"error": f"Missing {field}"})
+                        return
+                    if not PARAMETER[field](values[field]):
+                        self.send(400, {"error": f"Invalid {field}"})
+                        return
+                    args.append(values[field])
+                try:
+                    db = database(session)
+                    self.send(200, {"cli": ["helius-indexer", name[0], db, *args],
+                                    "result": command(session, name[0], db, *args)})
+                except RuntimeError as error:
+                    self.send(422, {"error": str(error)})
+                except (subprocess.TimeoutExpired, ValueError, OSError):
+                    self.send(503, {"error": "Command unavailable; inspect session events.jsonl"})
             else:
                 self.send(404, {"error": "Not found"})
 
