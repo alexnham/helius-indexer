@@ -1,0 +1,6 @@
+{
+  "slots_per_batch": 8,
+  "max_batches": 100,
+  "max_reserved_bytes": 2147483648,
+  "min_free_bytes": 10737418240
+}

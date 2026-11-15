@@ -28,7 +28,10 @@ elif cmd=="bridge":
  if os.environ.get("FAKE_SLEEP"): time.sleep(10)
  if os.environ.get("FAKE_FAIL"): print(os.environ.get("SOLANA_RPC_URL","secret"),file=sys.stderr); print('{"event":"command_failed","error_class":"rpc_rate_limited"}',file=sys.stderr); sys.exit(3)
  if os.environ.get("FAKE_CANCEL"): Path(os.environ["BACKFILL_CANCEL_FILE"]).touch()
+ s["slots_per_batch"]=os.environ.get("INDEXER_BRIDGE_BATCH_SLOTS")
  s["pending"]=max(0,s["pending"]-1); s["batches"]+=1; p.write_text(json.dumps(s)); r=report()
+ r["batch_limits"]={"unique_slots":int(os.environ.get("INDEXER_BRIDGE_BATCH_SLOTS","8"))}
+ if os.environ.get("FAKE_OLD_BINARY"): r.pop("batch_limits")
  r["source_diagnostics"]={"archive":{"response_body_bytes":5},"rpc":{"response_body_bytes_read":7}}
  print(json.dumps(r))
 elif cmd=="summary": print(json.dumps({"transfer_count":3}))
@@ -60,6 +63,39 @@ class ArchiveBackfillTests(unittest.TestCase):
 
     def manifest(self):
         return json.loads((self.directory / "archive-backfill.json").read_text())
+
+    def test_config_drives_native_batch_size_reservation_and_cli_precedence(self):
+        config = self.root / "backfill.json"
+        reserve = 128 * 1024**2 + 1001 * 64 * 1024**2
+        config.write_text(json.dumps({"slots_per_batch": 1000, "max_batches": 5,
+                                      "max_reserved_bytes": reserve, "min_free_bytes": 0}))
+        self.assertEqual(app.main(["run", *self.common, "--config", str(config),
+                                   "--max-batches", "1"]), 0)
+        self.assertEqual(json.loads(self.state.read_text())["slots_per_batch"], "1000")
+        manifest = self.manifest()
+        self.assertEqual(manifest["run_config"]["max_batches"], 1)
+        self.assertEqual(manifest["budget"]["per_batch_reserved_bytes"], reserve)
+        self.assertEqual(manifest["total_batches"], 1)
+
+    def test_old_frozen_binary_cannot_silently_ignore_larger_batches(self):
+        os.environ["FAKE_OLD_BINARY"] = "1"
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(app.main(["run", *self.common, "--slots-per-batch", "9",
+                                       "--max-batches", "1", "--min-free-bytes", "0"]), 2)
+        self.assertEqual(self.manifest()["stop_reason"], "child_failed")
+        self.assertEqual(self.manifest()["budget"]["unknown_actual_batches"], 1)
+
+    def test_invalid_config_stops_before_provider_or_reservation(self):
+        config = self.root / "backfill.json"
+        for value in ({"slots_per_batch": True}, {"unknown": 1}, [],
+                      {"slots_per_batch": 0}, {"slots_per_batch": 10001},
+                      {"slots_per_batch": 1000, "max_reserved_bytes": app.BATCH_RESERVE}):
+            with self.subTest(value=value), contextlib.redirect_stderr(io.StringIO()):
+                config.write_text(json.dumps(value))
+                self.assertEqual(app.main(["run", *self.common, "--config", str(config),
+                                           "--max-batches", "1"]), 2)
+                self.assertEqual(json.loads(self.state.read_text())["batches"], 0)
+                self.assertEqual(self.manifest()["budget"]["reserved_bytes"], 0)
 
     def test_measured_batches_are_charged_actual_bytes_and_status_is_read_only(self):
         # One worst-case reservation plus one measured batch: room for exactly two batches.
