@@ -77,14 +77,14 @@ def seed(session, binary, database):
         path.write_text(json.dumps(capture))
         files.append(path)
         command(session, "ingest", database, path)
-    before = command(session, "query", database)
+    before = command(session, "query", database, "--all-stored")
     if len(before["transfers"]) >= before["limit"]:
         raise RuntimeError("Demo reached the query limit; choose a smaller seed corpus")
     for path in files:
         result = command(session, "ingest", database, path)
         if result["inserted"] != 0:
             raise RuntimeError("Fixture replay unexpectedly inserted a transfer")
-    after = command(session, "query", database)
+    after = command(session, "query", database, "--all-stored")
     if before != after or after["coverage"] != "unknown":
         raise RuntimeError("Replay changed query results or coverage disclosure")
     mints = sorted({row["mint"] for row in after["transfers"]})
@@ -184,7 +184,7 @@ def handler_for(session, port, runtime_status=None):
                     self.send(400, {"error": "Use one valid mint address"})
                     return
                 try:
-                    args = ["query-recent" if runtime_status else "query", database(session)] + ([mint] if mint else [])
+                    args = ["query-recent" if runtime_status else "query", database(session)] + ([mint] if mint else []) + ["--all-stored"]
                     self.send(200, command(session, *args))
                 except (RuntimeError, subprocess.TimeoutExpired, ValueError):
                     self.send(503, {"error": "Query failed; inspect session events.jsonl"})
@@ -236,7 +236,7 @@ def main():
 def serve(session, metadata, args):
     print(f"Ready: {metadata['transfer_count']} unique transfers / {metadata['fixture_count']} captures. Replay verified.")
     print(f"Session: {session}")
-    print(f"CLI (with DATABASE_URL set): {session / 'helius-indexer'} query {metadata['database']}")
+    print(f"CLI (with DATABASE_URL set): {session / 'helius-indexer'} query {metadata['database']} --all-stored")
     if args.seed_only:
         return
     server = HTTPServer((args.bind, args.port), handler_for(session, args.port))

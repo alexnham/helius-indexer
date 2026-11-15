@@ -197,7 +197,7 @@ def main():
                     stopped.wait(30)  # bounded backoff before reconnecting
         def status():
             return {"worker": json.loads((session / "worker.json").read_text()), "configuration": config,
-                    "summary": CONSOLE.command(session, "summary", config["database"], config["mint"]),
+                    "summary": CONSOLE.command(session, "summary", config["database"], config["mint"], "--all-stored"),
                     "live": CONSOLE.command(session, "live-status", config["database"]),
                     "historical": CONSOLE.command(session, "replay-status", config["database"], config["replay_job"]) if config.get("replay_job") else CONSOLE.command(session,"coverage",config["database"],config["mint"],config["slot_start"],config["slot_end"])}
         port = integer(os.environ, "INDEXER_CONSOLE_PORT", 8767, 1024, 65535)

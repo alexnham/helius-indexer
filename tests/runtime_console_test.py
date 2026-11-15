@@ -80,12 +80,12 @@ class RuntimeConsole(unittest.TestCase):
             db = config["database"]
             RUNTIME.initialize(session, binary, db)
             RUNTIME.atomic_json(session / "session.json", config)
-            self.assertEqual(RUNTIME.CONSOLE.command(session, "query", db)["transfers"], [])
+            self.assertEqual(RUNTIME.CONSOLE.command(session, "query", db, "--all-stored")["transfers"], [])
             capture = ROOT / "tests/fixtures/mainnet-transfer.json"
             RUNTIME.CONSOLE.command(session, "ingest", db, capture)
-            before = RUNTIME.CONSOLE.command(session, "query-recent", db)
+            before = RUNTIME.CONSOLE.command(session, "query-recent", db, "--all-stored")
             RUNTIME.initialize(session, Path("missing-image-binary"), db)
-            self.assertEqual(before, RUNTIME.CONSOLE.command(session, "query-recent", db))
+            self.assertEqual(before, RUNTIME.CONSOLE.command(session, "query-recent", db, "--all-stored"))
             server = RUNTIME.CONSOLE.HTTPServer(("127.0.0.1", 0), RUNTIME.CONSOLE.BaseHTTPRequestHandler)
             server.RequestHandlerClass = RUNTIME.CONSOLE.handler_for(session, server.server_port,
                 runtime_status=lambda: {"worker": {"state": "finished"}, "coverage": "unknown"})
@@ -116,7 +116,7 @@ class RuntimeConsole(unittest.TestCase):
             capture = json.loads(fixture.read_text())
             slot = capture["result"]["slot"]
             # Stored rows come from the Rust decoder; the blocks feed the independent parser.
-            stored = [row for row in RUNTIME.CONSOLE.command(session, "query", db, comparison.MINT)["transfers"]]
+            stored = [row for row in RUNTIME.CONSOLE.command(session, "query", db, comparison.MINT, "--all-stored")["transfers"]]
             blocks = [{"slot": slot + index, "response": {"result": {"transactions": [capture["result"]] if index == 0 else []}}}
                       for index in range(16)]
             output = io.StringIO()

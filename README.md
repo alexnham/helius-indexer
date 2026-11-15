@@ -79,8 +79,17 @@ helius-indexer ingest DB CAPTURE [--metrics NEW_FILE]
 helius-indexer query DB [MINT] [WINDOW] [--limit N] [--cursor C]
 helius-indexer query-recent DB [MINT] [WINDOW] [--limit N] [--cursor C]
 helius-indexer summary DB MINT [WINDOW]
+helius-indexer query DB [MINT] --all-stored     (inspection only; see below)
+helius-indexer query-recent DB [MINT] --all-stored
+helius-indexer summary DB MINT --all-stored
 WINDOW = --window-seconds N | --from T --to T   (block times, [from, to))
 ```
+
+`--all-stored` is local inspection of captured data, not a query mode: it returns
+every retained row, including rows older than the 30-day window (up to 37 days old)
+and rows with unknown block time, with the pre-window output shape and
+`coverage: "unknown"`. It cannot be combined with `WINDOW` or `--cursor`. Served APIs
+must not expose it; the local console and smoke scripts use it.
 
 `query` and `query-recent` open existing storage read-only and return up to
 `--limit` records (1 to 1,000, default 1,000), sorted by slot, signature, outer

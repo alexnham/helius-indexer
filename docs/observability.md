@@ -73,6 +73,9 @@ processed, so a clean `complete` is not a claim about the whole window.
 - `unknown` with `no_known_time_transfers_in_window`: no known-time transfer falls in
   the window, so there is no slot span to evaluate. This is not an observed-empty range.
 - `unknown` with `mint_required`: a mint-less listing has no per-mint coverage.
+- `unknown` with `all_stored` (`query --all-stored`, `summary --all-stored`): inspection
+  output has no window, so no coverage is computed and `coverage` is the literal
+  `"unknown"`. This is never a window coverage claim.
 
 An observed-empty window (covered, zero transfers) is not produced: deriving a slot
 span from time without transfers would need block times from historical slots, which
