@@ -34,6 +34,19 @@ pub struct Scope {
     pub end: u64,
 }
 
+/// Capture and history source name of Old Faithful input.
+pub const ARCHIVE_SOURCE: &str = "old-faithful-jetstreamer";
+/// Capture source name of LaserStream input.
+pub const REPLAY_SOURCE: &str = "helius-laserstream";
+
+/// One reconciliation outcome for an overlap slot.
+pub struct Overlap {
+    pub outcome: &'static str,
+    pub reason: Option<&'static str>,
+    pub replay_inputs: usize,
+    pub archive_mint_inputs: usize,
+}
+
 /// Routed (start, end, kind) segments of one revision.
 pub type RouteSegments = Vec<(u64, u64, String)>;
 
@@ -330,6 +343,88 @@ impl JobLog {
             &[&id, &revision, &(start as i64), &(end as i64), &now(), &requests, &bytes, &seconds]).map_err(write_failed)?.get(0);
         tx.commit().map_err(write_failed)?;
         Ok(ArchiveReservation { client, attempt })
+    }
+
+    /// Replay receipts in one slot: (base58 signature, receipt status).
+    pub fn slot_receipts(&mut self, id: &str, slot: u64) -> Result<Vec<(String, String)>> {
+        Ok(self
+            .0
+            .query(
+                "SELECT signature,status FROM replay_receipts WHERE job=$1 AND slot=$2 ORDER BY signature",
+                &[&id, &(slot as i64)],
+            )
+            .map_err(read_failed)?
+            .into_iter()
+            .map(|r| {
+                (
+                    bs58::encode(r.get::<_, Vec<u8>>(0)).into_string(),
+                    r.get(1),
+                )
+            })
+            .collect())
+    }
+
+    /// Retained per-source captures in one slot: signature -> (capture bytes, receipt status).
+    pub fn slot_captures(
+        &mut self,
+        slot: u64,
+        source: &str,
+    ) -> Result<std::collections::BTreeMap<String, (Vec<u8>, String)>> {
+        Ok(self
+            .0
+            .query(
+                "SELECT signature,capture_json,status FROM capture_inputs WHERE slot=$1 AND source=$2 AND octet_length(capture_json)<=16777216 ORDER BY signature,result_digest",
+                &[&(slot as i64), &source],
+            )
+            .map_err(read_failed)?
+            .into_iter()
+            .map(|r| (r.get(0), (r.get(1), r.get(2))))
+            .collect())
+    }
+
+    /// Decoder revision of the stored output for each signature that has one.
+    pub fn output_decoders(&mut self, signatures: &[String]) -> Result<Vec<String>> {
+        Ok(self
+            .0
+            .query(
+                "SELECT DISTINCT decoder_version FROM captures WHERE signature = ANY($1)",
+                &[&signatures],
+            )
+            .map_err(read_failed)?
+            .into_iter()
+            .map(|r| r.get(0))
+            .collect())
+    }
+
+    /// Archive full-block evidence still retained: slot complete or skipped for the
+    /// current decoder, completed by the archive source, with its raw input kept.
+    pub fn archive_slot_verified(&mut self, mint: &str, slot: u64) -> Result<bool> {
+        Ok(self.0.query_one("SELECT EXISTS(SELECT 1 FROM historical_slots h JOIN historical_source_slots s ON s.mint=h.mint AND s.decoder=h.decoder AND s.slot=h.slot AND s.source_kind=$4 AND s.status IN ('complete','skipped') WHERE h.mint=$1 AND h.decoder=$2 AND h.slot=$3 AND h.status IN ('complete','skipped') AND EXISTS(SELECT 1 FROM historical_inputs i WHERE i.mint=h.mint AND i.decoder=h.decoder AND i.slot=h.slot AND i.source_kind=$4))",
+            &[&mint, &DECODER_VERSION, &(slot as i64), &ARCHIVE_SOURCE]).map_err(read_failed)?.get(0))
+    }
+
+    pub fn record_overlap(
+        &mut self,
+        id: &str,
+        revision: i64,
+        slot: u64,
+        outcome: &Overlap,
+    ) -> Result<()> {
+        let n = |v: usize| i64::try_from(v).map_err(|_| Error("stored_record_invalid"));
+        self.0.execute("INSERT INTO replay_overlap_outcomes(job,route_revision,slot,decoder,outcome,reason,replay_inputs,archive_mint_inputs,observed_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)",
+            &[&id, &revision, &(slot as i64), &DECODER_VERSION, &outcome.outcome, &outcome.reason, &n(outcome.replay_inputs)?, &n(outcome.archive_mint_inputs)?, &now()]).map_err(write_failed)?;
+        Ok(())
+    }
+
+    /// Latest outcome per slot for this route and the current decoder revision.
+    pub fn latest_overlaps(
+        &mut self,
+        id: &str,
+        revision: i64,
+    ) -> Result<std::collections::BTreeMap<u64, (String, Option<String>)>> {
+        Ok(self.0.query("SELECT DISTINCT ON (slot) slot,outcome,reason FROM replay_overlap_outcomes WHERE job=$1 AND route_revision=$2 AND decoder=$3 ORDER BY slot,id DESC",
+            &[&id, &revision, &DECODER_VERSION]).map_err(read_failed)?.into_iter()
+            .map(|r| (r.get::<_, i64>(0) as u64, (r.get(1), r.get(2)))).collect())
     }
 
     /// Explicit refill; ordinary restart never replenishes a consumed allowance.

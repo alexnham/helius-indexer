@@ -9,6 +9,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 from urllib.request import Request, urlopen
 
 SPEC = importlib.util.spec_from_file_location("console", Path(__file__).with_name("local-test.py"))
@@ -113,17 +114,67 @@ def resume_slot(live, mint):
     return live.get("last_received_slot")
 
 
-def initialize(session, binary, database):
-    import shutil
-    session.mkdir(parents=True, exist_ok=True, mode=0o700)
+def digest(path):
+    import hashlib
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def binary_state(session, binary):
+    """The session keeps the binary it first copied; a rebuilt image never replaces it implicitly."""
     target = session / "helius-indexer"
     if not target.exists():
+        return "fresh"
+    # Without an image binary to compare, the session's copy is the one to run.
+    if not Path(binary).exists():
+        return "current"
+    return "current" if digest(target) == digest(binary) else "upgrade_required"
+
+
+def install_binary(session, binary, upgrade):
+    """Copy on first start; replace a different copy only on explicit request, keeping a backup."""
+    import shutil
+    import time
+    state = binary_state(session, binary)
+    target = session / "helius-indexer"
+    if state == "upgrade_required" and not upgrade:
+        return state
+    if state == "upgrade_required":
+        shutil.copy2(target, session / ("helius-indexer.backup-" + str(time.time_ns())))
+    if state != "current":
         temporary = session / ".binary.tmp"
         shutil.copyfile(binary, temporary)
         temporary.chmod(0o700)
         temporary.replace(target)
-    # Recovery runs behind live-priority admission inside the native paired worker.
-    CONSOLE.command(session, "migrate", database)
+    return "upgraded" if state == "upgrade_required" else state
+
+
+def initialize(session, binary, database, upgrade=False):
+    session.mkdir(parents=True, exist_ok=True, mode=0o700)
+    state = install_binary(session, binary, upgrade)
+    if state != "upgrade_required":
+        # Recovery runs behind live-priority admission inside the native paired worker.
+        CONSOLE.command(session, "migrate", database)
+    return state
+
+
+ROUTE_INTERVAL_SECONDS = 3600
+
+
+def should_route(status, since_attempt=None, interval=ROUTE_INTERVAL_SECONDS):
+    """Route once; re-measure only when replay fell out of its window or the archive tip
+    was unknown, and at most once per interval. Each revision resets overlap evidence.
+    `since_attempt` (seconds since the last attempt, failed or not) bounds retries."""
+    if since_attempt is not None and since_attempt < interval:
+        return False
+    routing = status.get("routing")
+    if not routing:
+        return True
+    age = routing.get("measurement_age_seconds")
+    if age is None or age < interval:
+        return False
+    attempts = status.get("attempts") or []
+    return (bool(attempts) and attempts[0].get("status") == "outside_replay_window") \
+        or (routing.get("archive") or {}).get("error_class") is not None
 
 
 def execute_cycle(session, args, env, timeout, on_start, report_name="report.json"):
@@ -147,6 +198,10 @@ def main():
     with (session / ".runtime.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         inspect_only = os.environ.get("INDEXER_RUN", "1") == "0"
+        image = Path(os.environ.get("INDEXER_BINARY", "/usr/local/bin/helius-indexer"))
+        # A mismatched binary needs no credentials or provider calls just to refuse running.
+        if binary_state(session, image) == "upgrade_required" and os.environ.get("INDEXER_UPGRADE_BINARY") != "1":
+            inspect_only = True
         if inspect_only:
             config = json.loads((session / "session.json").read_text())
             env = {}
@@ -156,8 +211,18 @@ def main():
             endpoint = "https://mainnet.helius-rpc.com/?api-key=" + key
             config = resume_configuration(session, os.environ, finalized_tip(endpoint))
             env = {**os.environ, "HELIUS_API_KEY": key, "INDEXER_LIVE_OPT_IN": "1", "SOLANA_RPC_URL": endpoint}
+        archive = not inspect_only and os.environ.get("INDEXER_ARCHIVE", "0") == "1"
+        cache = session / "archive-cache"
+        if archive:
+            cache.mkdir(exist_ok=True, mode=0o700)
+            env["INDEXER_ARCHIVE_OPT_IN"] = "1"
         CONSOLE.require_database_url()
-        initialize(session, Path(os.environ.get("INDEXER_BINARY", "/usr/local/bin/helius-indexer")), config["database"])
+        binary = initialize(session, image, config["database"],
+                            upgrade=not inspect_only and os.environ.get("INDEXER_UPGRADE_BINARY") == "1")
+        if binary == "upgrade_required":
+            # Serve the existing session for inspection; run nothing with a binary it was not started with.
+            inspect_only = True
+            atomic_json(session / "worker.json", {"state": "binary_upgrade_required", "coverage": "unknown"})
         if not inspect_only:
             CONSOLE.command(session,"replay-create",config["database"],config["replay_job"],config["mint"],config["slot_start"],config["slot_end"])
             atomic_json(session / "session.json", config)
@@ -172,12 +237,16 @@ def main():
 
         def worker():
             # Both workers resume independently; replay budgets never reset between cycles.
-            db, resume, number, last = config["database"], config["live_from"], 0, {}
+            db, resume, number, last, routed_at = config["database"], config["live_from"], 0, {}, None
             while not stopped.is_set():
                 number += 1
                 atomic_json(session / "worker.json", {**last, "state": "running", "cycle": number, "coverage": "unknown"})
                 try:
-                    code, result = cycle(["replay-monitor",db,config["replay_job"],resume,config["seconds"]])
+                    since = None if routed_at is None else time.monotonic() - routed_at
+                    if archive and should_route(CONSOLE.command(session, "replay-status", db, config["replay_job"]), since):
+                        routed_at = time.monotonic()
+                        cycle(["replay-route", db, config["replay_job"], cache], timeout=180, report_name="route.json")
+                    code, result = cycle(["replay-monitor",db,config["replay_job"],resume,config["seconds"],*([cache] if archive else [])])
                     # Historical expiry/exhaustion remains visible without delaying live reconnects.
                     failed=not result or code!=0 or result.get("live",{}).get("outcome")=="failed"
                     # A large first prune measured ~30 s; a timeout rolls the prune back.
@@ -196,7 +265,7 @@ def main():
                 if failed:
                     stopped.wait(30)  # bounded backoff before reconnecting
         def status():
-            return {"worker": json.loads((session / "worker.json").read_text()), "configuration": config,
+            return {"worker": json.loads((session / "worker.json").read_text()), "configuration": {**config, "archive": archive, "binary": binary},
                     "summary": CONSOLE.command(session, "summary", config["database"], config["mint"], "--all-stored"),
                     "live": CONSOLE.command(session, "live-status", config["database"]),
                     "historical": CONSOLE.command(session, "replay-status", config["database"], config["replay_job"]) if config.get("replay_job") else CONSOLE.command(session,"coverage",config["database"],config["mint"],config["slot_start"],config["slot_end"])}

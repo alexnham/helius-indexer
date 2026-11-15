@@ -182,7 +182,9 @@ prerequisites before presenting Docker support as ready.
 ## Current implementation and migration
 
 The recent-only runtime now uses frozen PostgreSQL replay jobs with independent
-live and historical workers. Archive routing and the full handoff remain pending. The existing archive/
+live and historical workers. Issue #31 adds measured archive/replay routing, charged
+archive batches and overlap reconciliation to those jobs ([replay jobs](replay-jobs.md));
+Docker wiring of that path is #32. The existing archive/
 RPC bridge validates full-block evidence and remains useful for optional checks.
 The unfinished uncommitted runtime experiment using RPC as the normal recent
 source was removed from build paths; a local ignored copy is retained for reference.
