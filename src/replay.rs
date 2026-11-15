@@ -15,6 +15,8 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::time::{Duration, Instant};
 
+pub mod route;
+
 pub fn create(database: &Database, id: &str, mint: &str, start: u64, end: u64) -> Result<Value> {
     valid_id(id)?;
     crate::backfill::scope(mint, start, end)?;

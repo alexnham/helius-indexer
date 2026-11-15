@@ -329,6 +329,16 @@ component with bounded failure classes. Retrying retained input makes no provide
 request. Telemetry writes remain best-effort and cannot undo durable input/output.
 No mint/slot/signature metric labels are added.
 
+Source routing (#31) appends a revision per measurement. The report's `routing`
+block shows the latest revision, measurement age, replay first-available and
+finalized reference, whether the archive was probed and its last available slot
+or failure class, and the routed segments (`archive`, `replay`, `overlap`,
+`uncovered`) marked `routed_not_processed`. Unknown availability appears as null
+and routes to `uncovered`. Each measurement emits `route_measured` with outcome
+`incomplete` when any segment is uncovered, plus revision, whether the archive was
+probed and the uncovered segment count; a failed replay measurement emits it with
+outcome `failed` and records no revision.
+
 The console shows remaining budgets, processing versus raw retention and unknown
 coverage, alongside live reports and actual query output. Current JSON snapshots
 are inspection telemetry, not a production continuous exporter or alert system.

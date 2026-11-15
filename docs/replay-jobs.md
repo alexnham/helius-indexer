@@ -5,7 +5,7 @@ The native commands and provider-backed runtime now use the same bounded
 LaserStream intake, shared decoder and PostgreSQL storage. The runtime starts
 live intake before historical work, then schedules one replay worker independently
 within the same process and write-admission gate. Recent backfill no longer uses
-getBlock scans. Old Faithful routing remains issue #31.
+getBlock scans. Old Faithful routing is issue #31; its first slice measures and records routes.
 
 ## Durable boundaries
 
@@ -46,10 +46,10 @@ Main uses versions 2/3 for Kafka; the unpublished replay prototypes used those
 numbers for different tables. Migration 4 supplies any missing Kafka tables and
 retains existing replay tables. Migration 5 adds missing input provenance without
 resetting scope, receipts or charged budgets. This supports both main and the
-version 2/3 replay prototypes; the current schema version is 5. Raw rows referenced by replay receipts are classified as replay;
+version 2/3 replay prototypes; migration 6 adds append-only routing tables; the current schema version is 6. Raw rows referenced by replay receipts are classified as replay;
 missing historical attempt/hash/acknowledgment provenance stays null. Back up the
 session using PostgreSQL tooling before upgrading. Earlier binaries reject newer
-schema versions (the current version is 5); rolling back requires restoring the
+schema versions (the current version is 6); rolling back requires restoring the
 pre-upgrade backup into a separate session and using its matching binary. Do not manually decrement the migration
 version or delete receipts to make an older binary open an upgraded session.
 The new tables currently have no deletion/TTL policy; job receipt retention will
@@ -64,6 +64,7 @@ helius-indexer replay-create SESSION recent MINT START END
 helius-indexer replay-status SESSION recent
 helius-indexer replay-retry SESSION recent
 # Explicit provider opt-in and HELIUS_API_KEY are required for these two commands:
+INDEXER_LIVE_OPT_IN=1 helius-indexer replay-route SESSION recent CACHE
 INDEXER_LIVE_OPT_IN=1 helius-indexer replay SESSION recent 60
 INDEXER_LIVE_OPT_IN=1 helius-indexer replay-monitor SESSION recent LIVE_FROM 60
 # Explicitly replenish an exhausted allowance; never done automatically:
@@ -91,6 +92,30 @@ counts, queryable transfer count in scope, and remaining budgets. Retained trans
 count does not prove complete slots. Live raw-input counters exclude replay input.
 The console's `/api/status` exposes this report and `/api/transfers` queries actual
 retained output.
+
+## Source routing
+
+`replay-route` measures actual replay availability (`SubscribeReplayInfo`) and the
+finalized reference, then probes the Old Faithful archive tip only when replay
+cannot serve the whole job, so a recent-only job does no archive work. Without the
+`archive` feature, or when the probe fails or the tip is not exact, the archive
+side is unknown. The command needs replay credentials; with
+`INDEXER_LIVE_OPT_IN=1` and the archive feature it may also make the bounded
+`archive-tip` requests (at most four epoch probes under the default archive limits, plus a finalized reference from `SOLANA_RPC_URL`) using CACHE.
+
+Each measurement appends a revision (migration 6): replay first-available, reference
+slot, archive probe result and segments. Archive serves slots up to its last
+available slot, replay serves first-available through the reference, both is
+`overlap`, and neither is `uncovered`. Nothing is hard-coded about archive lag or
+replay retention. Earlier revisions are kept so later evidence can be tied to the
+revision it was routed under. Routes are not progress or coverage: the `replay`
+worker still serves only ranges inside the replay window, archive segments are not
+yet processed, and overlap is a routed kind, not reconciled evidence. Those are the
+next slices of #31. The 128-slot job bound still applies, so mixed and overlapping
+routes cover small windows only.
+
+Migration 6 is additive; an older binary refuses the newer schema, so roll back as
+above by restoring the pre-upgrade backup.
 
 ## Scope still pending
 
