@@ -17,6 +17,12 @@ docker compose --profile live up --build -d runtime
 # Open http://127.0.0.1:8767
 ```
 
+The `live` profile also starts Kafka and a `consumer` service. Live input is
+published to Kafka (`kafka:9092` on the private Compose network, plaintext under
+`INDEXER_KAFKA_PRIVATE_NETWORK=1`) and the consumer writes it to the same PostgreSQL
+session; historical replay keeps writing directly. Outside that opt-in, brokers
+must still be loopback. Check consumer progress with `docker compose logs consumer`.
+
 Defaults are USDC, 60-second live cycles, an initial frozen 50-slot finalized
 range and job ID `recent`. Set `INDEXER_MINT`, `INDEXER_BACKFILL_SLOTS` or explicit
 `INDEXER_BACKFILL_START` / `INDEXER_BACKFILL_END` before first startup. Each scope
