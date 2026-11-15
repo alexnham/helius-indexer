@@ -30,6 +30,16 @@ pub struct Scope {
     pub end: u64,
 }
 
+/// One measurement of where each slot of a job may come from.
+pub struct Route {
+    pub replay_first: Option<u64>,
+    pub reference: u64,
+    pub archive_probed: bool,
+    pub archive_last: Option<u64>,
+    pub archive_error: Option<&'static str>,
+    pub segments: Vec<(u64, u64, &'static str)>,
+}
+
 pub struct Pending {
     pub signature: Vec<u8>,
     pub hash: Vec<u8>,
@@ -153,6 +163,19 @@ impl JobLog {
         let failures:Vec<Value>=tx.query("SELECT status,COUNT(*) FROM replay_receipts WHERE job=$1 AND status NOT IN ('pending','decoded') GROUP BY status ORDER BY status LIMIT 16", &[&id]).map_err(read_failed)?.into_iter().map(|r|json!({"error_class":r.get::<_,String>(0),"inputs":r.get::<_,i64>(1)})).collect();
         let oldest:Option<i64>=tx.query_one("SELECT MIN(first_received) FROM replay_receipts WHERE job=$1 AND status<>'decoded'", &[&id]).map_err(read_failed)?.get(0);
         let retained:i64=tx.query_one("SELECT COUNT(*) FROM transfers t WHERE mint=$1 AND slot BETWEEN $2 AND $3 AND NOT EXISTS(SELECT 1 FROM decoder_repairs r WHERE r.signature=t.signature AND r.status='unresolved')", &[&r.get::<_,String>(0),&r.get::<_,i64>(1),&r.get::<_,i64>(2)]).map_err(read_failed)?.get(0);
+        let routing = match tx.query_opt("SELECT revision,observed_at,replay_first,reference_slot,archive_probed,archive_last,archive_error FROM replay_routes WHERE job=$1 ORDER BY revision DESC LIMIT 1", &[&id]).map_err(read_failed)? {
+            None => Value::Null,
+            Some(route) => {
+                let revision: i64 = route.get(0);
+                let segments: Vec<Value> = tx.query("SELECT start_slot,end_slot,kind FROM replay_route_segments WHERE job=$1 AND revision=$2 ORDER BY start_slot", &[&id,&revision]).map_err(read_failed)?.into_iter()
+                    .map(|s| json!({"start":s.get::<_,i64>(0),"end":s.get::<_,i64>(1),"kind":s.get::<_,String>(2)})).collect();
+                let observed: i64 = route.get(1);
+                json!({"revision":revision,"observed_at":observed,"measurement_age_seconds":now().checked_sub(observed).filter(|n|*n>=0),
+                    "replay_first_available":route.get::<_,Option<i64>>(2),"reference_slot":route.get::<_,i64>(3),
+                    "archive":{"probed":route.get::<_,bool>(4),"last_available":route.get::<_,Option<i64>>(5),"error_class":route.get::<_,Option<String>>(6)},
+                    "segments":segments,"state":"routed_not_processed"})
+            }
+        };
         tx.commit().map_err(read_failed)?;
         let (grants, seconds, connections, messages, bytes): (i64, i64, i64, i64, i64) =
             (r.get(5), r.get(6), r.get(7), r.get(8), r.get(9));
@@ -169,10 +192,52 @@ impl JobLog {
         };
         Ok(
             json!({"job":id,"state":state,"pending_age_seconds":now().checked_sub(r.get::<_,i64>(4)).filter(|n|*n>=0),"oldest_unresolved_age_seconds":if receipts.get::<_,i64>(2)==0 {Some(0)}else{oldest.and_then(|t|now().checked_sub(t)).filter(|n|*n>=0)},"failures":failures,"retained":{"transfer_count":retained,"coverage":"unknown"},"mint":r.get::<_,String>(0),"start":r.get::<_,i64>(1),"end":r.get::<_,i64>(2),"decoder_version":r.get::<_,String>(3),"created_at":r.get::<_,i64>(4),
-            "coverage":"unknown","verified_boundary":null,"resume_from":r.get::<_,i64>(1),"pending_interval":{"start":r.get::<_,i64>(1),"end":r.get::<_,i64>(2),"kind":"unverified"},"attempts":attempts,"reason":"filtered_replay_has_no_validated_slot_completion_evidence",
+            "coverage":"unknown","verified_boundary":null,"resume_from":r.get::<_,i64>(1),"pending_interval":{"start":r.get::<_,i64>(1),"end":r.get::<_,i64>(2),"kind":"unverified"},"attempts":attempts,"routing":routing,"reason":"filtered_replay_has_no_validated_slot_completion_evidence",
             "receipts":{"unique_inputs":receipts.get::<_,i64>(0),"decoded":receipts.get::<_,i64>(1),"unresolved":receipts.get::<_,i64>(2),"raw_still_retained":receipts.get::<_,i64>(3)},
             "budget":{"grants":grants,"seconds_charged":seconds,"seconds_remaining":grants*SECONDS_PER_GRANT-seconds,"connections_used":connections,"connections_remaining":grants*CONNECTIONS_PER_GRANT-connections,"messages_used":messages,"messages_remaining":grants*MESSAGES_PER_GRANT-messages,"bytes_used":bytes,"bytes_remaining":grants*BYTES_PER_GRANT-bytes}}),
         )
+    }
+
+    /// Append the next routing revision; earlier revisions and their segments stay.
+    pub fn record_route(&mut self, id: &str, route: &Route) -> Result<i64> {
+        valid_id(id)?;
+        let slot = |n: u64| i64::try_from(n).map_err(|_| Error("unsupported_slot"));
+        let opt = |n: Option<u64>| n.map(slot).transpose();
+        let mut tx = self.0.transaction().map_err(write_failed)?;
+        // Serialize revisions per job; the row lock lasts until commit.
+        tx.query_opt("SELECT 1 FROM replay_jobs WHERE id=$1 FOR UPDATE", &[&id])
+            .map_err(write_failed)?
+            .ok_or(Error("replay_job_missing"))?;
+        let revision: i64 = tx
+            .query_one(
+                "SELECT COALESCE(MAX(revision),0)+1 FROM replay_routes WHERE job=$1",
+                &[&id],
+            )
+            .map_err(read_failed)?
+            .get(0);
+        tx.execute(
+            "INSERT INTO replay_routes VALUES($1,$2,$3,$4,$5,$6,$7,$8)",
+            &[
+                &id,
+                &revision,
+                &now(),
+                &opt(route.replay_first)?,
+                &slot(route.reference)?,
+                &route.archive_probed,
+                &opt(route.archive_last)?,
+                &route.archive_error,
+            ],
+        )
+        .map_err(write_failed)?;
+        for (start, end, kind) in &route.segments {
+            tx.execute(
+                "INSERT INTO replay_route_segments VALUES($1,$2,$3,$4,$5)",
+                &[&id, &revision, &slot(*start)?, &slot(*end)?, kind],
+            )
+            .map_err(write_failed)?;
+        }
+        tx.commit().map_err(write_failed)?;
+        Ok(revision)
     }
 
     /// Explicit refill; ordinary restart never replenishes a consumed allowance.
