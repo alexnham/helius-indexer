@@ -142,6 +142,75 @@ def persistent_session(path, binary):
         yield session, metadata
 
 
+EVENT_TAIL_BYTES = 256 * 1024
+EVENT_LIMIT = 100
+# One record per slot or stage attempt; the feed shows transitions, not hot-path volume.
+NOISY_EVENTS = {"stage_completed", "durable_range_completed"}
+EVENT_CATEGORIES = ("live", "backfill", "storage", "errors")
+ENUM = re.compile(r"[a-z0-9_]{1,64}\Z")
+BASE58 = re.compile(r"[1-9A-HJ-NP-Za-km-z]{32,88}\Z")
+
+
+def event_categories(event):
+    mode, name, component = event.get("mode"), event.get("event", ""), event.get("component", "")
+    found = []
+    if mode == "live":
+        found.append("live")
+    if mode in {"historical", "recovery", "repair", "validation"}:
+        found.append("backfill")
+    if mode == "retention" or component == "storage" or "storage" in name or "prune" in name:
+        found.append("storage")
+    if event.get("severity") == "error":
+        found.append("errors")
+    return found
+
+
+def sanitize_event(event):
+    # Keep scalars only; strings must be enum identifiers or base58 chain values, so URLs,
+    # credentials and free-form provider text never reach the page.
+    clean = {}
+    for key, value in event.items():
+        if not ENUM.fullmatch(key):
+            continue
+        if value is None or isinstance(value, (bool, int, float)):
+            clean[key] = value
+        elif isinstance(value, str) and (ENUM.fullmatch(value) or BASE58.fullmatch(value)):
+            clean[key] = value
+    return clean
+
+
+def recent_events(session, category=None):
+    """Newest-first meaningful events from the tail of the session's events.jsonl."""
+    path = session / "events.jsonl"
+    try:
+        with path.open("rb") as log:
+            size = log.seek(0, os.SEEK_END)
+            log.seek(max(0, size - EVENT_TAIL_BYTES))
+            lines = log.read().splitlines()
+    except FileNotFoundError:
+        return {"events": [], "available": False, "truncated": False, "unparsed_lines": 0, "limit": EVENT_LIMIT}
+    if size > EVENT_TAIL_BYTES:
+        lines = lines[1:]  # the first line may start mid-record
+    events, unparsed = [], 0
+    for line in reversed(lines):
+        try:
+            event = json.loads(line)
+        except ValueError:
+            unparsed += 1
+            continue
+        if not isinstance(event, dict) or not isinstance(event.get("event"), str) or event["event"] in NOISY_EVENTS:
+            continue
+        clean = sanitize_event(event)
+        clean["categories"] = event_categories(clean)
+        if category and category not in clean["categories"]:
+            continue
+        if len(events) == EVENT_LIMIT:
+            break
+        events.append(clean)
+    return {"events": events, "available": True, "truncated": size > EVENT_TAIL_BYTES,
+            "unparsed_lines": unparsed, "limit": EVENT_LIMIT, "tail_bytes": EVENT_TAIL_BYTES}
+
+
 def readiness(session):
     metadata = json.loads((session / "session.json").read_text())
     command(session, "health", metadata["database"], timeout=3)
@@ -206,6 +275,20 @@ def handler_for(session, port, runtime_status=None, windowed=False):
                     self.send(200, command(session, *args))
                 except (RuntimeError, subprocess.TimeoutExpired, ValueError):
                     self.send(503, {"error": "Query failed; inspect session events.jsonl"})
+            elif url.path == "/api/events":
+                try:
+                    query = parse_qs(url.query, keep_blank_values=True, max_num_fields=2)
+                except ValueError:
+                    self.send(400, {"error": "Too many query fields"})
+                    return
+                category = query.get("category", [""])
+                if set(query) - {"category"} or len(category) > 1 or category[0] not in ("", *EVENT_CATEGORIES):
+                    self.send(400, {"error": "Use one category: " + ", ".join(EVENT_CATEGORIES)})
+                    return
+                try:
+                    self.send(200, recent_events(session, category[0] or None))
+                except OSError:
+                    self.send(503, {"error": "Events unavailable"})
             elif url.path == "/api/commands":
                 self.send(200, {"commands": COMMANDS})
             elif url.path == "/api/command":

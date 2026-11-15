@@ -71,6 +71,18 @@ revision and measurement age, uncovered intervals, archive probe failures, compl
 and pending archive slots, remaining batches and attempts by status. The replay
 source line shows the verified-through slot and archive/overlap/unknown counts.
 
+The Pipeline tab's **Live health** panel shows the mint, worker state and cycle, the
+latest received slot, the finalized reference and its age, the received-slot distance
+to that reference, the live input rate over the stated window, unresolved inputs,
+replay margin and the dataset's sampling. Received-slot distance is not verified lag;
+verified freshness and slot gap stay unknown because no live slot is verified complete.
+
+The **Events** tab lists the newest 100 meaningful events (connection, backfill,
+restart, storage and error transitions) from the last 256 KiB of the session's
+`events.jsonl`, filtered by live, backfill, storage or errors. Per-slot and per-stage
+records are omitted. The runtime appends `runtime_started` on each start and
+`worker_retrying` before its backoff. Transfer rows link to Solana Explorer (mainnet).
+
 ## Restart, budgets and retention
 
 Restart retains the job's original range and consumed allowance. Live intake starts

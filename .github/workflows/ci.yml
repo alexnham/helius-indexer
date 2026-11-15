@@ -49,6 +49,7 @@ jobs:
       - run: python3 -m unittest discover -s tests -p '*console_test.py'
       - run: python3 -m unittest tests.archive_window_test tests.archive_backfill_test
       - run: node tests/archive_dashboard_test.js
+      - run: node tests/live_dashboard_test.js
   archive:
     runs-on: ubuntu-latest
     services:
