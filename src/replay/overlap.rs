@@ -6,7 +6,7 @@ use crate::{
     reconcile,
     storage::{
         Database,
-        replay::{ARCHIVE_SOURCE, JobLog, Overlap, REPLAY_SOURCE, valid_id},
+        replay::{ARCHIVE_SOURCE, JobLog, Lane, Overlap, REPLAY_SOURCE, RPC_SOURCE, valid_id},
     },
     telemetry::Telemetry,
 };
@@ -174,11 +174,14 @@ pub(crate) fn verified(database: &Database, id: &str) -> Result<Value> {
     let scope = log.scope(id)?;
     let Some((revision, segments)) = log.latest_route(id)? else {
         return Ok(
-            json!({"route_revision":null,"verified_through":null,"archive_slots":0,"overlap_slots":0,"unknown_slots":scope.end-scope.start+1}),
+            json!({"route_revision":null,"verified_through":null,"archive_slots":0,"overlap_slots":0,"gap_slots":0,"unknown_slots":scope.end-scope.start+1,"uncovered_unverified_slots":0}),
         );
     };
     let outcomes = log.latest_overlaps(id, revision)?;
-    let (mut archive, mut overlap, mut through, mut contiguous) = (0u64, 0u64, None, true);
+    let gap = super::archive::lane_segments(Lane::Gap, &segments, log.route_bounds(id, revision)?);
+    let in_gap = |slot: u64| gap.iter().any(|g| g.0 <= slot && slot <= g.1);
+    let (mut archive, mut overlap, mut rpc, mut uncovered) = (0u64, 0u64, 0u64, 0u64);
+    let (mut through, mut contiguous) = (None, true);
     let mut conflicts = Vec::new();
     for (start, end, kind) in &segments {
         for slot in *start..=*end {
@@ -192,11 +195,15 @@ pub(crate) fn verified(database: &Database, id: &str) -> Result<Value> {
                     o.is_some_and(|o| o.0 == "consistent" || o.0 == "replay_omission")
                         && log.archive_slot_verified(&scope.mint, slot)?
                 }
+                // Only the measured archive-to-replay gap is filled by RPC full blocks.
+                "uncovered" => in_gap(slot) && log.slot_verified(&scope.mint, slot, RPC_SOURCE)?,
                 _ => false,
             };
             match (ok, kind.as_str()) {
                 (true, "archive") => archive += 1,
-                (true, _) => overlap += 1,
+                (true, "overlap") => overlap += 1,
+                (true, _) => rpc += 1,
+                (false, "uncovered") => uncovered += 1,
                 _ => {}
             }
             contiguous &= ok;
@@ -211,7 +218,8 @@ pub(crate) fn verified(database: &Database, id: &str) -> Result<Value> {
     }
     Ok(
         json!({"route_revision":revision,"decoder_version":decoder::DECODER_VERSION,"verified_through":through,
-        "archive_slots":archive,"overlap_slots":overlap,"unknown_slots":scope.end-scope.start+1-archive-overlap,
+        "archive_slots":archive,"overlap_slots":overlap,"gap_slots":rpc,"unknown_slots":scope.end-scope.start+1-archive-overlap-rpc,
+        "uncovered_unverified_slots":uncovered,
         "overlap_outcomes":counts,"conflicts":conflicts}),
     )
 }

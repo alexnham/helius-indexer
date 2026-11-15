@@ -82,7 +82,6 @@ impl RpcSource {
             diagnostics: RpcDiagnostics::default(),
         })
     }
-    #[cfg(feature = "archive")]
     pub(crate) fn bounded(endpoint: String, deadline: Instant) -> Result<Self> {
         let mut source = Self::new(endpoint)?;
         source.deadline = Some(deadline);

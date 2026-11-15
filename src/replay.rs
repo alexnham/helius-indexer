@@ -182,7 +182,8 @@ pub(crate) fn cycle<'a>(steps: Vec<Step<'a>>) -> Value {
 
 /// Historical worker of one monitor cycle, under the shared live-priority gate:
 /// retained retry, then replay when the route has replayable slots, then one archive
-/// batch (archive builds with a cache), then offline overlap reconciliation.
+/// batch (archive builds with a cache), one RPC batch of the measured archive-to-replay
+/// gap, then offline overlap reconciliation.
 fn historical_cycle(
     database: &Database,
     id: &str,
@@ -216,6 +217,14 @@ fn historical_cycle(
     }
     #[cfg(not(feature = "archive"))]
     let _ = cache;
+    // The measured archive-to-replay gap is filled automatically, within its own allowance.
+    {
+        let gate = std::sync::Arc::clone(&gate);
+        steps.push((
+            "gap",
+            Box::new(move || archive::gap_admitted(database, id, gate, &mut Telemetry::default())),
+        ));
+    }
     steps.push((
         "overlap",
         Box::new(|| {

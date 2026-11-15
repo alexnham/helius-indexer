@@ -18,7 +18,7 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
-const USAGE: &str = "usage: DATABASE_URL=postgres://... helius-indexer COMMAND, where SESSION is a schema name (^[a-z][a-z0-9_]*$), not a file path: replay-create SESSION JOB MINT START END | replay-status/replay-retry/replay-grant SESSION JOB | replay-route SESSION JOB CACHE | archive-grant SESSION JOB | replay SESSION JOB SECONDS | replay-monitor SESSION JOB LIVE_FROM SECONDS [CACHE] | replay-overlap SESSION JOB | health SESSION | migrate SESSION | consume SESSION SECONDS (uses INDEXER_KAFKA_BROKERS) | comparison-input SESSION MINT [--sample] | monitor SESSION MINT LIVE_FROM START END SECONDS | query-recent SESSION [MINT] [WINDOW] [--limit N] [--cursor C] | ingest SESSION CAPTURE [--metrics FILE] | query SESSION [MINT] [WINDOW] [--limit N] [--cursor C] | backfill SESSION MINT START END [--metrics FILE] | coverage SESSION MINT START END | live SESSION FROM_SLOT SECONDS [MINT] | prune SESSION KEEP | live-status SESSION | live-retry SESSION | summary SESSION MINT [WINDOW] | overlap SESSION START END SECONDS | repair SESSION START END | repair-status SESSION START END | repair-history-archive SESSION MINT START END | repair-history SESSION MINT START END | [feature archive] replay-archive SESSION JOB CACHE | archive/archive-replay/archive-overlap SESSION CACHE MINT START END | bridge-plan SESSION CACHE MINT START | bridge SESSION CACHE MINT START | bridge-status SESSION MINT START | bridge-live SESSION CACHE START SECONDS | archive-overlap-replay SESSION MINT START END | archive-tip CACHE | archive-live SESSION CACHE START END SECONDS";
+const USAGE: &str = "usage: DATABASE_URL=postgres://... helius-indexer COMMAND, where SESSION is a schema name (^[a-z][a-z0-9_]*$), not a file path: replay-create SESSION JOB MINT START END | replay-status/replay-retry/replay-grant SESSION JOB | replay-route SESSION JOB CACHE | archive-grant SESSION JOB | replay-gap SESSION JOB | gap-grant SESSION JOB | replay SESSION JOB SECONDS | replay-monitor SESSION JOB LIVE_FROM SECONDS [CACHE] | replay-overlap SESSION JOB | health SESSION | migrate SESSION | consume SESSION SECONDS (uses INDEXER_KAFKA_BROKERS) | comparison-input SESSION MINT [--sample] | monitor SESSION MINT LIVE_FROM START END SECONDS | query-recent SESSION [MINT] [WINDOW] [--limit N] [--cursor C] | ingest SESSION CAPTURE [--metrics FILE] | query SESSION [MINT] [WINDOW] [--limit N] [--cursor C] | backfill SESSION MINT START END [--metrics FILE] | coverage SESSION MINT START END | live SESSION FROM_SLOT SECONDS [MINT] | prune SESSION KEEP | live-status SESSION | live-retry SESSION | summary SESSION MINT [WINDOW] | overlap SESSION START END SECONDS | repair SESSION START END | repair-status SESSION START END | repair-history-archive SESSION MINT START END | repair-history SESSION MINT START END | [feature archive] replay-archive SESSION JOB CACHE | archive/archive-replay/archive-overlap SESSION CACHE MINT START END | bridge-plan SESSION CACHE MINT START | bridge SESSION CACHE MINT START | bridge-status SESSION MINT START | bridge-live SESSION CACHE START SECONDS | archive-overlap-replay SESSION MINT START END | archive-tip CACHE | archive-live SESSION CACHE START END SECONDS";
 
 fn ingest(db: &str, input: &str, telemetry: &mut Telemetry) -> Result<serde_json::Value> {
     let started = Instant::now();
@@ -100,6 +100,17 @@ fn run(args: &[String], telemetry: &mut Telemetry) -> Result<serde_json::Value> 
                 &Database::from_env(session)?,
                 id,
                 Path::new(cache),
+                telemetry,
+            )
+        }
+        [command, session, id] if command == "replay-gap" => {
+            helius_indexer::replay::archive::gap(&Database::from_env(session)?, id, telemetry)
+        }
+        [command, session, id] if command == "gap-grant" => {
+            helius_indexer::replay::archive::lane_grant(
+                &Database::from_env(session)?,
+                id,
+                helius_indexer::storage::replay::Lane::Gap,
                 telemetry,
             )
         }

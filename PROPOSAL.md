@@ -293,7 +293,10 @@ Durable historical jobs must retain their requested scope and processing state
 across restarts and live cycles. Preserve live priority. Keep processing receipts
 separate from verified coverage and from data still retained after the approved
 local 1,000-transfer cap. Filtered replay receipt or a later observed slot alone
-must not advance verified slot coverage. The current first-cycle RPC Docker
+must not advance verified slot coverage. The routine interval between the archive
+tip and the replay window is filled automatically by bounded RPC `getBlock`, and only
+for that measured interval, within a per-job allowance (decided 2026-11-15, #84).
+The current first-cycle RPC Docker
 implementation does not satisfy this target. Follow the staged
 [corrected backfill plan](docs/backfill-replan.md); a full-window run and paid
 infrastructure remain separately authorized actions.

@@ -162,7 +162,8 @@ ROUTE_INTERVAL_SECONDS = 3600
 
 def should_route(status, since_attempt=None, interval=ROUTE_INTERVAL_SECONDS):
     """Route once; re-measure only when replay fell out of its window, the archive tip was
-    unknown, or slots are still uncovered (a later archive epoch may now serve them), and
+    unknown, or uncovered slots are still unverified (a later archive epoch may now serve
+    them; an RPC-filled gap no longer needs one), and
     at most once per interval. Each revision resets overlap evidence.
     `since_attempt` (seconds since the last attempt, failed or not) bounds retries."""
     if since_attempt is not None and since_attempt < interval:
@@ -176,7 +177,7 @@ def should_route(status, since_attempt=None, interval=ROUTE_INTERVAL_SECONDS):
     attempts = status.get("attempts") or []
     return (bool(attempts) and attempts[0].get("status") == "outside_replay_window") \
         or (routing.get("archive") or {}).get("error_class") is not None \
-        or any(segment.get("kind") == "uncovered" for segment in routing.get("segments") or [])
+        or (status.get("verified") or {}).get("uncovered_unverified_slots", 0) > 0
 
 
 def execute_cycle(session, args, env, timeout, on_start, report_name="report.json"):
