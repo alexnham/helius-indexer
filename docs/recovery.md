@@ -1,14 +1,16 @@
-# Recovery with the provisional SQLite pipeline
+# Recovery with the provisional PostgreSQL pipeline
 
-Restore live intake before repairing retained work. Preserve the SQLite database
-and its WAL/SHM files together; use SQLite's backup API or stop writers for a
-consistent copy. Do not copy only a live database's main file or delete raw input
-because a cursor has advanced. There is no external publication broker in this
-validation pipeline: committed SQLite raw input is the durable handoff.
+Restore live intake before repairing retained work. Preserve the session schema
+with a consistent PostgreSQL snapshot taken while writers are stopped (for example
+`pg_dump --schema=SESSION`). Do not delete raw input because a cursor has advanced.
+Committed PostgreSQL raw input (`live_raw`) is the durable handoff that `live-retry`
+and historical repair read. With `INDEXER_KAFKA_BROKERS` configured, live input is
+also published to Kafka; the producer cursor follows delivery confirmation, and the
+topic does not replace the PostgreSQL raw records.
 
 ## First response
 
-1. Inspect `live-status DB` and `coverage DB MINT START END`. A run left `running`
+1. Inspect `live-status SESSION` and `coverage SESSION MINT START END`. A run left `running`
    after process exit is unfinished. Check the observed reference/replay ages,
    requested start, replay margin, unresolved age, and historical holes. None of
    these establishes verified live coverage by itself.
@@ -17,11 +19,11 @@ validation pipeline: committed SQLite raw input is the durable handoff.
    live-priority write admission. These network commands remain opt-in. If replay
    no longer contains a gap, preserve it as unknown and recover through retained
    raw inputs or a verified historical source; never advance past it to look healthy.
-3. Run `live-retry DB` to process at most 100 unresolved retained protobuf records
+3. Run `live-retry SESSION` to process at most 100 unresolved retained protobuf records
    without a network. Repeat bounded batches as needed while observing reports.
-   This is manual repair. A separately launched retry process relies on SQLite
-   locking/busy timeouts; it does not inherit the combined coordinator's write
-   priority. Avoid parallel retry operators.
+   This is manual repair. A separately launched retry process relies on PostgreSQL
+   transaction locking; it does not inherit the combined coordinator's in-process
+   write gate. Avoid parallel retry operators.
 4. Rerun a bounded historical range. Completed/skipped slots are bypassed. Raw
    blocks retained before cancellation or interrupted acknowledgments can be
    reused. Other source/decode failures may refetch; raw persistence is not a
@@ -73,14 +75,14 @@ Offline tests launch child processes which exit without Rust destructors:
   not move the checkpoint across unfinished work.
 - After historical completion: restart skips finished work and keeps queries stable.
 
-Existing SQLite failure-injection tests additionally cover failed raw writes,
-transaction rollback, and failed coverage acknowledgments. A closed diagnostics
+PostgreSQL trigger-injected tests in `tests/backfill.rs` additionally cover failed
+raw writes and failed coverage acknowledgments. A closed diagnostics
 pipe is exercised in a child process; retry still commits its transfers. There
 is no exporter queue to exhaust. A stalled synchronous stderr reader can still
 block logging; no asynchronous telemetry delivery or latency guarantee is claimed.
 
 These checks do not simulate power loss, storage hardware corruption, SIGKILL
-inside SQLite's own commit code, or production failover. This is a partial slice
+inside PostgreSQL's own commit code, or production failover. This is a partial slice
 of ticket #5. A real provider replay-boundary outage recovery, independent source
 bridge (#17), automated repair supervision, and continuously refreshed recovery
 monitoring remain open. Decoder revision replacement is handled by the explicit

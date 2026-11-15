@@ -115,6 +115,16 @@ source/storage time, and is not a benchmark. Failed candidates are retained in
 historical raw blocks with scoped durable error/retry state. Snapshot counters
 are attempts; replay does not imply new unique query results.
 
+Range progress uses the gauges `indexer_historical_range_slots_requested`,
+`indexer_historical_range_slots_completed` (complete or skipped), and
+`indexer_historical_range_first_slot`/`last_slot`; the coverage JSON carries the
+same values as `progress`. `historical_range_completed` is emitted once per
+invocation, only when the re-read coverage of the whole requested range is complete
+and the run was not cancelled. It carries `mint`, `slot_start`, `slot_end` and the
+decoder version. The mint is the filter-set identity; no separate filter-set
+revision exists yet. The per-slot `durable_range_completed` event remains and means
+only that one slot's status was acknowledged.
+
 ## Bounded live slice status
 
 The opt-in LaserStream command now emits connection/retry/end/failure events and
