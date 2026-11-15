@@ -357,6 +357,13 @@ slots with oldest pending age; `archive_budget_granted` records an explicit gran
 These are JSON inspection snapshots like the replay report, with no job, mint or
 slot metric labels.
 
+`replay-overlap` emits `overlap_reconciled` (component `replay_overlap`) with outcome
+`success` or `conflict` (error class `overlap_conflict`), the route revision and
+per-outcome slot counts. The report's `verified` block gives `verified_through`,
+verified archive and overlap slot counts, unknown slots, latest outcome counts and
+up to 32 conflict slots with their reason; the console shows the boundary, counts
+and conflicts. A `replay-monitor` cycle reports each step's outcome or error class.
+
 The console shows remaining budgets, processing versus raw retention and unknown
 coverage, alongside live reports and actual query output. Current JSON snapshots
 are inspection telemetry, not a production continuous exporter or alert system.

@@ -69,6 +69,7 @@ pub(crate) fn segment_status(database: &Database, id: &str) -> Result<Value> {
 pub(crate) fn batch<S: BlockSource>(
     database: &Database,
     id: &str,
+    gate: std::sync::Arc<crate::coordinator::WriteGate>,
     source: &mut S,
     observed: impl Fn(&S) -> (u64, u64, u64),
     cancelled: impl Fn() -> bool,
@@ -82,17 +83,25 @@ pub(crate) fn batch<S: BlockSource>(
             json!({"attempt":null,"reason":"no_pending_archive_slots","job":super::status(database, id)?}),
         );
     };
-    let reservation = JobLog::archive_reserve(database, id, revision, start, end)?;
+    let reservation = {
+        let _permit = gate.historical()?;
+        JobLog::archive_reserve(database, id, revision, start, end)?
+    };
     let attempt = reservation.attempt;
-    let result = History::open(database)
-        .and_then(|mut history| history.run(&mint, start, end, source, &cancelled));
+    let result = History::open(database).and_then(|mut history| {
+        history.set_gate(std::sync::Arc::clone(&gate));
+        history.run(&mint, start, end, source, &cancelled)
+    });
     let status = match &result {
         Err(e) => e.0,
         Ok((_, metrics)) if metrics.cancelled => "cancelled",
         Ok((coverage, _)) if coverage.complete => "finished",
         Ok(_) => "incomplete",
     };
-    reservation.finish(status, observed(source))?;
+    {
+        let _permit = gate.historical()?;
+        reservation.finish(status, observed(source))?;
+    }
     let mut event = telemetry.event(
         "archive_attempt_finished",
         "archive",
@@ -124,6 +133,18 @@ pub fn run(
     cache: &std::path::Path,
     telemetry: &mut Telemetry,
 ) -> Result<Value> {
+    run_admitted(database, id, cache, Default::default(), telemetry)
+}
+
+/// One archive batch whose writes yield to live intake through `gate`.
+#[cfg(feature = "archive")]
+pub(crate) fn run_admitted(
+    database: &Database,
+    id: &str,
+    cache: &std::path::Path,
+    gate: std::sync::Arc<crate::coordinator::WriteGate>,
+    telemetry: &mut Telemetry,
+) -> Result<Value> {
     use crate::{archive, storage::replay::ARCHIVE_BATCH_LIMITS};
     use std::time::{Duration, Instant};
     let (requests, bytes, seconds) = ARCHIVE_BATCH_LIMITS;
@@ -141,6 +162,7 @@ pub fn run(
     batch(
         database,
         id,
+        gate,
         &mut source,
         |s| {
             (

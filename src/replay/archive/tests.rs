@@ -61,6 +61,7 @@ fn work(db: &Database, source: &mut Source) -> Result<Value> {
     batch(
         db,
         "job",
+        Default::default(),
         source,
         |_| (1, 2, 3),
         || false,
@@ -208,6 +209,7 @@ fn cancellation_and_overlap_segments() {
     let report = batch(
         &db.0,
         "job",
+        Default::default(),
         &mut ok,
         |_| (0, 0, 0),
         || true,
