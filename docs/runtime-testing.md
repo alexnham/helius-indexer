@@ -50,12 +50,13 @@ backup into a separate schema with its matching binary. See [replay jobs](replay
 ## Archive routing and batches
 
 With archive enabled, on its first cycle and later only when replay fell out of its
-window, the archive tip was unknown, or the route still has uncovered slots (a newly
+window, the archive tip was unknown, or uncovered slots are still unverified (a newly
 published archive epoch may now serve them), the runtime runs `replay-route` to
 measure replay availability and, if replay cannot serve the whole job, the archive
 tip. Attempts, including failed ones, are at most hourly. A rebuilt binary is
 detected before any credential read or provider call. Each `replay-monitor` cycle then runs retry, replay, one archive batch and
-overlap reconciliation under live priority ([replay jobs](replay-jobs.md)). Set
+an RPC fill of the measured archive-to-replay gap, then overlap reconciliation
+under live priority ([replay jobs](replay-jobs.md)). Set
 `INDEXER_ARCHIVE=0`, or build `INDEXER_RUNTIME_TARGET=console`, for replay only.
 
 The archive cache is `archive-cache` in the session directory (mode 0700, on the

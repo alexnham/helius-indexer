@@ -19,6 +19,7 @@ pub(crate) const MIGRATIONS: &[(i32, &str)] = &[
         include_str!("migrations/0008_transfer_block_time_amounts.sql"),
     ),
     (9, include_str!("migrations/0009_replay_overlap.sql")),
+    (10, include_str!("migrations/0010_gap_fill.sql")),
 ];
 
 /// Connection errors are reduced to a class: driver messages can echo the URL or credentials.

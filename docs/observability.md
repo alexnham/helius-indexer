@@ -398,6 +398,11 @@ slots with oldest pending age; `archive_budget_granted` records an explicit gran
 These are JSON inspection snapshots like the replay report, with no job, mint or
 slot metric labels.
 
+Each RPC gap batch emits `gap_attempt_finished` (component `replay_gap`, source
+`rpc`) with the same outcomes and observed requests and response bytes, and
+`gap_budget_granted` records an explicit gap grant. The status `gap` block mirrors
+`archive`; `verified` adds `gap_slots` and `uncovered_unverified_slots`.
+
 `replay-overlap` emits `overlap_reconciled` (component `replay_overlap`) with outcome
 `success` or `conflict` (error class `overlap_conflict`), the route revision and
 per-outcome slot counts. The report's `verified` block gives `verified_through`,

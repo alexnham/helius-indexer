@@ -46,10 +46,10 @@ Main uses versions 2/3 for Kafka; the unpublished replay prototypes used those
 numbers for different tables. Migration 4 supplies any missing Kafka tables and
 retains existing replay tables. Migration 5 adds missing input provenance without
 resetting scope, receipts or charged budgets. This supports both main and the
-version 2/3 replay prototypes; migrations 6, 7 and 9 add routing, archive attempts and overlap outcomes (8 adds transfer columns); the current schema version is 9. Raw rows referenced by replay receipts are classified as replay;
+version 2/3 replay prototypes; migrations 6, 7, 9 and 10 add routing, archive attempts, overlap outcomes and the gap lane (8 adds transfer columns); the current schema version is 10. Raw rows referenced by replay receipts are classified as replay;
 missing historical attempt/hash/acknowledgment provenance stays null. Back up the
 session using PostgreSQL tooling before upgrading. Earlier binaries reject newer
-schema versions (the current version is 9); rolling back requires restoring the
+schema versions (the current version is 10); rolling back requires restoring the
 pre-upgrade backup into a separate session and using its matching binary. Do not manually decrement the migration
 version or delete receipts to make an older binary open an upgraded session.
 The new tables currently have no deletion/TTL policy; job receipt retention will
@@ -74,6 +74,9 @@ INDEXER_ARCHIVE_OPT_IN=1 helius-indexer replay-archive SESSION recent CACHE
 # Explicitly replenish an exhausted allowance; never done automatically:
 helius-indexer replay-grant SESSION recent
 helius-indexer archive-grant SESSION recent
+# RPC getBlock fill of the measured archive-to-replay gap, and its explicit refill:
+INDEXER_LIVE_OPT_IN=1 helius-indexer replay-gap SESSION recent
+helius-indexer gap-grant SESSION recent
 ```
 
 The first test range is 50 slots. Creation accepts at most the existing 128-slot
@@ -149,6 +152,29 @@ response bytes by status, the last 20 attempts, and per routed archive/overlap
 segment the complete, skipped and pending slot counts with oldest pending age.
 Replay segments get no counts. Full-block slot status for an overlap segment is
 archive evidence only until `replay-overlap` reconciles it (below). Migration 7 is
+additive; roll back as above.
+
+## Archive-to-replay gap fill
+
+Old Faithful publishes an epoch after it ends, and replay reaches back only so far,
+so a route can have an `uncovered` interval between the measured archive tip and the
+measured replay start. `replay-gap` fills exactly that interval with RPC `getBlock`
+through the shared History path, one charged batch of up to eight slots at a time,
+from `SOLANA_RPC_URL` (public mainnet RPC by default) with `INDEXER_LIVE_OPT_IN=1`.
+Slots qualify only when both the archive tip and replay start were measured; uncovered
+slots with unknown availability, or past the finalized reference, are never filled.
+
+The gap lane has its own allowance (migration 10): a batch is charged before any
+request, with ceilings of 9 requests (a mainnet check plus eight blocks), 64 MiB per
+block response and 120 seconds. A grant allows 16 batches, enough for a whole
+128-slot job; `gap-grant` adds one, up to 64. Replay and archive grants never refill
+it. Attempts share the archive attempt log, marked by lane, and an advisory lock
+allows one gap worker per job, independent of the archive worker. `replay-monitor`
+runs one gap batch per cycle automatically after the archive batch.
+
+Status adds a `gap` block like `archive`. In `verified`, RPC-filled gap slots count
+as `gap_slots` when their full-block evidence is retained, and
+`uncovered_unverified_slots` counts uncovered slots still unverified. Migration 10 is
 additive; roll back as above.
 
 ## Overlap reconciliation and verified slots
