@@ -45,6 +45,7 @@ services:
       INDEXER_BACKFILL_END: ${INDEXER_BACKFILL_END:-}
       INDEXER_LIVE_FROM: ${INDEXER_LIVE_FROM:-}
       INDEXER_KEEP_TRANSFERS: ${INDEXER_KEEP_TRANSFERS:-1000}
+      INDEXER_SAMPLE: ${INDEXER_SAMPLE:-0}
       # Unix socket on a shared volume: private to these containers, so plaintext is allowed.
       DATABASE_URL: host=/var/run/postgresql user=indexer dbname=indexer
     depends_on:

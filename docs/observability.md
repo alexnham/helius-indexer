@@ -356,3 +356,14 @@ receipts and charged allowances, and cannot advance the live producer cursor.
 The runtime resumes Kafka from the stored `resume_from`, never its maximum raw
 slot. Deterministic tests exercise direct batch acknowledgment and Kafka publication
 alongside a replay receipt using real local PostgreSQL/Kafka, without provider calls.
+
+## Sampled demo datasets
+
+A sampled dataset (#72) exposes its immutable policy, inclusion fraction and mint
+through `sample-status` and in `query`, `query-recent` and `summary` output, with
+actual retained counts and no extrapolation. Existing input, decode and coverage
+signals are unchanged; storage write counts describe retained sampled rows, not
+all decoded transfers. Historical coverage remains independent of selection.
+Kept-versus-excluded counts are not yet exported as a metric. A sampled runtime
+retains every raw input and skips pruning, so disk usage must be monitored for the
+lifetime of the demo.

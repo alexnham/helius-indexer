@@ -287,3 +287,29 @@ must not advance verified slot coverage. The current first-cycle RPC Docker
 implementation does not satisfy this target. Follow the staged
 [corrected backfill plan](docs/backfill-replan.md); a full-window run and paid
 infrastructure remain separately authorized actions.
+
+## Isolated 10% demo dataset
+
+An explicitly initialized, single-mint demo dataset may retain a deterministic
+10% sample of decoded transfers (#72). Its versioned policy
+(`sha256-transfer-id-v1`: keep a transfer when the first 8 bytes of
+SHA-256(`transfer_id`), read big-endian, are below ⌊2⁶⁴/10⌋) and mint are immutable
+dataset metadata, fixed before any input is admitted. Ordinary datasets remain
+exact. Selection depends only on stable transfer identity, so live, history,
+retries and decoder corrections decide identically. Listings and aggregates carry
+the policy and report actual sampled counts; no extrapolated totals are shown, and
+unknown amounts, fees and confidential values stay unknown. Source coverage is
+reported independently of sampling, and the sample describes only the coverage
+actually established. It does not satisfy the exact 30-day index (#70) or reduce
+provider traffic or decoder work.
+
+For this demo, retain all fetched raw inputs, including those whose decoded
+transfers are excluded, for the lifetime of the isolated dataset. Corrections
+redecode retained inputs; after the dataset is deleted, recovery requires a
+suitable historical provider or backup and is not guaranteed. Count-based pruning
+is refused on a sampled dataset. Sampling saves transfer rows only; raw-input
+savings are not claimed, and no size or cost savings are assumed without
+measurement. This is not a time-bounded production retention policy; operators
+stop the demo and manage its disk usage. The production 37-day raw-retention
+requirement is unchanged. The first provider run is a bounded one-day range for a
+low-volume mint; a 30-day sampled backfill needs separate authorization.
