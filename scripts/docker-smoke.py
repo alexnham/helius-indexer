@@ -15,7 +15,8 @@ PORT = os.environ.get("INDEXER_CONSOLE_PORT", "8766")
 
 def compose(*args):
     return subprocess.run(
-        ["docker", "compose", "-f", str(ROOT / "compose.yaml"), "-p", PROJECT, *args],
+        ["docker", "compose", "-f", str(ROOT / "compose.yaml"), "-p", PROJECT,
+         "--profile", "test", *args],
         cwd=ROOT, env={**os.environ, "INDEXER_CONSOLE_PORT": PORT,
                        # Avoids a development database already published on the default port.
                        "INDEXER_POSTGRES_PORT": os.environ.get("INDEXER_SMOKE_POSTGRES_PORT", "55433")},
