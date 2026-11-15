@@ -57,6 +57,16 @@ so no route template exists to label. They are deferred to the HTTP route layer 
 will not be approximated from CLI invocations. Raw-expiration checks remain with
 the retention work and are not part of this query surface.
 
+Migration 8 adds nullable `block_time`, `amount_raw` and `fee_raw` columns and fills
+them from `record_json` in the migration transaction, so a failure leaves the session
+at version 7. `record_json` is unchanged and NULL stays unknown. The fill updates every
+`transfers` row while holding its locks, so a large session is blocked for its duration. `record_json` remains the source of truth, so the
+columns can be recomputed from it with the migration's own `UPDATE`. Rollback follows
+the general policy in `docs/replay-jobs.md`: a pre-migration binary refuses the
+upgraded session (`storage_schema_newer_than_binary`), so restore the pre-upgrade
+backup into a separate session and use its matching binary. Do not drop the columns
+or decrement the schema version by hand.
+
 ### Query window coverage
 
 `coverage` on a window response is the coverage of the slot span of the window's
