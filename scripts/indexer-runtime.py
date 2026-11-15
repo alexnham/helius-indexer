@@ -109,6 +109,16 @@ def atomic_json(path, value):
     temporary.replace(path)
 
 
+def record_event(session, event, outcome, **fields):
+    """Append a supervisor transition in the CLI's event schema; values are fixed identifiers or counts."""
+    severity = "info" if outcome in {"startup", "retry", "success"} else "error"
+    line = {"timestamp_unix_ms": time.time_ns() // 1_000_000, "severity": severity, "component": "runtime",
+            "operation": "supervisor", "outcome": outcome, "error_class": None, "source_kind": "laserstream",
+            "mode": "live", "event": event, **fields}
+    with (session / "events.jsonl").open("a") as events:
+        events.write(json.dumps(line) + "\n")
+
+
 def resume_slot(live, mint):
     """Kafka mode resumes from the producer's resume_from (cursor minus the reorder margin),
     never the raw cursor; the PostgreSQL path resumes from the newest retained slot."""
@@ -281,6 +291,7 @@ def main():
                 atomic_json(session / "worker.json", {**last, "state": "stopped" if stopped.is_set() else "retrying" if failed else "running",
                             "cycle": number, "coverage": "unknown"})
                 if failed:
+                    record_event(session, "worker_retrying", "retry", cycle=number, exit_code=code, resume_from=resume, backoff_seconds=30)
                     stopped.wait(30)  # bounded backoff before reconnecting
         def status():
             return {"worker": json.loads((session / "worker.json").read_text()), "configuration": {**config, "archive": archive, "binary": binary},
@@ -297,6 +308,8 @@ def main():
             raise KeyboardInterrupt
         signal.signal(signal.SIGTERM, stop)
         signal.signal(signal.SIGINT, stop)
+        # A restart is visible because each start appends one; resume positions come from storage.
+        record_event(session, "runtime_started", "startup", inspect_only=inspect_only, binary=binary, archive=archive)
         if thread:
             thread.start()
         print("Provider-backed console ready; " + ("inspection only" if inspect_only else "continuous intake starting") + "; coverage unknown", flush=True)

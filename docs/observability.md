@@ -346,6 +346,18 @@ retained boundary slot in the same transaction as deletion. Shutdown tracks both
 intake and prune subprocesses; timeout kills and reaps the current child. Pruning
 keeps coverage `unknown`.
 
+### Console event feed
+
+`/api/events` returns up to 100 events, newest first, from the last 256 KiB of the
+session's `events.jsonl`, with an optional `category` of `live`, `backfill`, `storage`
+or `errors`. Category comes from the event's `mode`, component/name and severity.
+`stage_completed` and `durable_range_completed` are omitted as hot-path volume. Only
+scalar fields pass: strings must be lowercase identifiers or base58 chain values, so
+URLs, credentials and free-form text never reach the page. The response reports
+whether the log exists, whether older events were cut off and how many non-JSON lines
+were skipped. Supervisor transitions `runtime_started` and `worker_retrying` use the
+CLI event schema with component `runtime`. The feed is inspection, not an exporter.
+
 ## PostgreSQL readiness and identity integrity
 
 The console health path uses `health SESSION`, a read-only schema-version/table
