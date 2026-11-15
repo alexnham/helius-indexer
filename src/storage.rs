@@ -84,8 +84,10 @@ const BATCH_INPUTS: &str = "INSERT INTO capture_inputs(signature,source,result_d
                  FROM unnest($1::text[],$2::text[],$3::bytea[]) AS u(signature,source,digest)
                  JOIN captures c ON c.signature=u.signature ORDER BY c.signature
                  ON CONFLICT(signature,source,result_digest) DO UPDATE SET status=excluded.status";
-const BATCH_TRANSFERS: &str = "INSERT INTO transfers(transfer_id,signature,slot,outer_index,inner_index,mint,record_json)
-         SELECT * FROM unnest($1::text[],$2::text[],$3::bigint[],$4::int[],$5::int[],$6::text[],$7::text[])
+const BATCH_TRANSFERS: &str = "INSERT INTO transfers(transfer_id,signature,slot,outer_index,inner_index,mint,record_json,block_time,amount_raw,fee_raw)
+         SELECT u.id,u.signature,u.slot,u.outer_index,u.inner_index,u.mint,u.record,u.block_time,u.amount::numeric,u.fee::numeric
+         FROM unnest($1::text[],$2::text[],$3::bigint[],$4::int[],$5::int[],$6::text[],$7::text[],$8::bigint[],$9::text[],$10::text[])
+         AS u(id,signature,slot,outer_index,inner_index,mint,record,block_time,amount,fee)
          ON CONFLICT(slot,transfer_id) DO NOTHING RETURNING signature";
 const BATCH_ACKNOWLEDGE: &str = "UPDATE live_raw SET status=u.status FROM unnest($1::bigint[],$2::text[]) AS u(id,status) WHERE live_raw.id=u.id";
 
@@ -731,6 +733,9 @@ fn insert_transfer_rows(
         Vec::new(),
         Vec::new(),
         Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
     );
     for (signature, transfer) in rows {
         columns.0.push(transfer.transfer_id.as_str());
@@ -744,11 +749,15 @@ fn insert_transfer_rows(
         columns
             .6
             .push(serde_json::to_string(transfer).unwrap_or_default());
+        columns.7.push(transfer.block_time);
+        columns.8.push(transfer.amount_raw.map(|n| n.to_string()));
+        columns.9.push(transfer.fee_raw.map(|n| n.to_string()));
     }
     for row in tx.query(
         statement,
         &[
             &columns.0, &columns.1, &columns.2, &columns.3, &columns.4, &columns.5, &columns.6,
+            &columns.7, &columns.8, &columns.9,
         ],
     )? {
         *counts.entry(row.get::<_, String>(0)).or_insert(0) += 1;
@@ -878,9 +887,11 @@ fn reconcile_repeat(tx: &mut Transaction<'_>, prepared: &Prepared<'_>) -> Result
     if prior_status == "decoded" || prior_status == "failed_transaction" {
         for merged in updates {
             let text = serde_json::to_string(&merged).map_err(|_| Error("serialization_failed"))?;
+            let amount = merged.amount_raw.map(|n| n.to_string());
+            let fee = merged.fee_raw.map(|n| n.to_string());
             tx.execute(
-                "UPDATE transfers SET record_json=$1 WHERE signature=$2 AND transfer_id=$3",
-                &[&text, &signature, &merged.transfer_id],
+                "UPDATE transfers SET record_json=$1,block_time=$2,amount_raw=$3::text::numeric,fee_raw=$4::text::numeric WHERE signature=$5 AND transfer_id=$6",
+                &[&text, &merged.block_time, &amount, &fee, &signature, &merged.transfer_id],
             )
             .map_err(write_failed)?;
         }
@@ -921,6 +932,7 @@ pub(crate) fn insert_transfers(
         Vec::new(),
         Vec::new(),
     );
+    let (mut block_times, mut amounts, mut fees) = (Vec::new(), Vec::new(), Vec::new());
     for transfer in transfers {
         ids.push(transfer.transfer_id.as_str());
         slots.push(i64::try_from(transfer.slot).map_err(|_| Error("unsupported_slot"))?);
@@ -933,14 +945,18 @@ pub(crate) fn insert_transfers(
         });
         mints.push(transfer.mint.as_str());
         records.push(serde_json::to_string(transfer).map_err(|_| Error("serialization_failed"))?);
+        block_times.push(transfer.block_time);
+        amounts.push(transfer.amount_raw.map(|n| n.to_string()));
+        fees.push(transfer.fee_raw.map(|n| n.to_string()));
     }
     let inserted = tx
         .execute(
-            "INSERT INTO transfers(transfer_id,signature,slot,outer_index,inner_index,mint,record_json)
-             SELECT id,$2,slot,outer_index,inner_index,mint,record FROM unnest($1::text[],$3::bigint[],$4::int[],$5::int[],$6::text[],$7::text[])
-             AS u(id,slot,outer_index,inner_index,mint,record)
+            "INSERT INTO transfers(transfer_id,signature,slot,outer_index,inner_index,mint,record_json,block_time,amount_raw,fee_raw)
+             SELECT id,$2,slot,outer_index,inner_index,mint,record,block_time,amount::numeric,fee::numeric
+             FROM unnest($1::text[],$3::bigint[],$4::int[],$5::int[],$6::text[],$7::text[],$8::bigint[],$9::text[],$10::text[])
+             AS u(id,slot,outer_index,inner_index,mint,record,block_time,amount,fee)
              ON CONFLICT(slot,transfer_id) DO NOTHING",
-            &[&ids, &signature, &slots, &outer, &inner, &mints, &records],
+            &[&ids, &signature, &slots, &outer, &inner, &mints, &records, &block_times, &amounts, &fees],
         )
         .map_err(write_failed)?;
     Ok(inserted as usize)

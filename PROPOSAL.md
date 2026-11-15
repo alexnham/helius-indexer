@@ -82,6 +82,13 @@ LaserStream replay is documented as roughly 48 hours and honors mint filtering. 
 
 Every user query applies an explicit block-time cutoff for the rolling 30-day window. Database TTL handles eventual physical cleanup and does not define query eligibility.
 
+Block-time policy (reviewed 2026-11-14):
+
+- A transfer with unknown (null) block time never appears in a time-filtered listing and never silently counts in a window.
+- Time-filtered responses report such transfers as an explicit `null_block_time` count. Aggregates state that they cover known-time rows only.
+- There is no slot-derived time fallback. Unknown time stays unknown until history or reconciliation supplies it.
+- The server computes each cutoff from an injected clock and returns the cutoff in the response.
+
 Provisionally retain matched raw transactions for 37 days: 30 days of query history plus a seven-day repair margin. Compressed object storage is the candidate raw store. Preserve instructions, inner instructions, relevant execution metadata, source provenance, and schema/version information needed to repeat decoding. Size and validate this policy before production.
 
 The initial API provides:
