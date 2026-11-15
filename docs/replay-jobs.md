@@ -46,10 +46,10 @@ Main uses versions 2/3 for Kafka; the unpublished replay prototypes used those
 numbers for different tables. Migration 4 supplies any missing Kafka tables and
 retains existing replay tables. Migration 5 adds missing input provenance without
 resetting scope, receipts or charged budgets. This supports both main and the
-version 2/3 replay prototypes; migrations 6, 7, 9 and 10 add routing, archive attempts, overlap outcomes and the gap lane (8 adds transfer columns); the current schema version is 10. Raw rows referenced by replay receipts are classified as replay;
+version 2/3 replay prototypes; migrations 6, 7, 9 and 10 add routing, archive attempts, overlap outcomes and the gap lane (8 adds transfer columns, 11 the sampling policy); the current schema version is 11. Raw rows referenced by replay receipts are classified as replay;
 missing historical attempt/hash/acknowledgment provenance stays null. Back up the
 session using PostgreSQL tooling before upgrading. Earlier binaries reject newer
-schema versions (the current version is 10); rolling back requires restoring the
+schema versions (the current version is 11); rolling back requires restoring the
 pre-upgrade backup into a separate session and using its matching binary. Do not manually decrement the migration
 version or delete receipts to make an older binary open an upgraded session.
 The new tables currently have no deletion/TTL policy; job receipt retention will

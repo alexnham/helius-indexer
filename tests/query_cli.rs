@@ -141,19 +141,27 @@ fn all_stored_includes_rows_past_the_window_and_unknown_time_rows() {
 
 #[test]
 fn all_stored_output_keeps_the_pre_window_key_set() {
+    // Plus `sampling` (from the sampled demo): no output may present sampled data as exact.
     let db = TestDatabase::new();
     let session = three_rows(&db);
     let query = ok(cli(&session, &["query", "--all-stored"]));
     assert_eq!(
         keys(&query),
-        sorted(&["coverage", "limit", "live", "transfers"])
+        sorted(&["coverage", "limit", "live", "sampling", "transfers"])
     );
     assert_eq!(query["coverage"], "unknown");
     assert_eq!(query["limit"], 1000);
     let recent = ok(cli(&session, &["query-recent", "--all-stored"]));
     assert_eq!(
         keys(&recent),
-        sorted(&["coverage", "limit", "live", "order", "transfers"])
+        sorted(&[
+            "coverage",
+            "limit",
+            "live",
+            "order",
+            "sampling",
+            "transfers"
+        ])
     );
     assert_eq!(recent["order"], "newest_first");
     let summary = ok(cli(&session, &["summary", key(3).as_str(), "--all-stored"]));
@@ -166,6 +174,7 @@ fn all_stored_output_keeps_the_pre_window_key_set() {
             "known_volume_raw",
             "mint",
             "other_decoder_transfer_count",
+            "sampling",
             "target_decoder",
             "transfer_count",
             "unknown_amount_count",
