@@ -26,6 +26,7 @@ const DELIVERY_TIMEOUT: Duration = Duration::from_secs(120);
 /// Consumer prefetch bound (librdkafka may overshoot it by one fetch per partition).
 /// It must hold at least one maximum-size message.
 const PREFETCH_KBYTES: usize = 32 * 1024;
+/// Per partition; the byte bound is for the whole consumer.
 const PREFETCH_MESSAGES: usize = 1_000;
 /// A storage write blocked longer than this loses the consumer's partitions; positions
 /// stored with the output keep the next owner correct.
@@ -1183,7 +1184,7 @@ mod consumer_tests {
             let (db, name) = (test.0.clone(), topic.0.clone());
             std::thread::spawn(move || consume(&db, &test_brokers(), &name, 30).unwrap())
         };
-        std::thread::sleep(Duration::from_secs(8));
+        std::thread::sleep(Duration::from_secs(10));
         assert_eq!(stored_positions(&test), 0, "nothing advances while blocked");
         lock.batch_execute("COMMIT;").unwrap();
         let report = worker.join().unwrap();
