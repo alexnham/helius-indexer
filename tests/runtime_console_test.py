@@ -185,6 +185,10 @@ class RuntimeConsole(unittest.TestCase):
         self.assertTrue(RUNTIME.should_route({"routing": quiet, "attempts": [{"status": "outside_replay_window"}]}))
         self.assertTrue(RUNTIME.should_route({"routing": {**quiet, "archive": {"error_class": "archive_tip_unknown"}}}))
         self.assertFalse(RUNTIME.should_route({"routing": {"measurement_age_seconds": None, "archive": {}}}))
+        # Uncovered slots between the archive tip and replay are re-measured hourly.
+        gap = {**quiet, "segments": [{"start": 1, "end": 9, "kind": "archive"}, {"start": 10, "end": 19, "kind": "uncovered"}]}
+        self.assertTrue(RUNTIME.should_route({"routing": gap}))
+        self.assertFalse(RUNTIME.should_route({"routing": {**gap, "measurement_age_seconds": 60}}))
         # A recent attempt, even a failed one that recorded nothing, defers the next.
         self.assertFalse(RUNTIME.should_route({"routing": None}, since_attempt=60))
         self.assertTrue(RUNTIME.should_route({"routing": None}, since_attempt=3600))
