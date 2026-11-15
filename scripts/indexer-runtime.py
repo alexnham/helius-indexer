@@ -151,7 +151,7 @@ def install_binary(session, binary, upgrade):
     return "upgraded" if state == "upgrade_required" else state
 
 
-def initialize(session, binary, database, upgrade=False, mint=None, percent=None):
+def initialize(session, binary, database, mint=None, percent=None, upgrade=False):
     session.mkdir(parents=True, exist_ok=True, mode=0o700)
     state = install_binary(session, binary, upgrade)
     if state == "upgrade_required":
