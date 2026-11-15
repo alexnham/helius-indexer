@@ -3,9 +3,10 @@ CREATE TABLE dataset_policy (
     singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
     policy TEXT NOT NULL CHECK (policy IN ('exact', 'sha256-transfer-id-v1')),
     mint TEXT,
-    CHECK ((policy = 'exact' AND mint IS NULL) OR (policy = 'sha256-transfer-id-v1' AND mint IS NOT NULL))
+    percent SMALLINT NOT NULL CHECK (percent BETWEEN 1 AND 100),
+    CHECK ((policy = 'exact' AND mint IS NULL AND percent = 100) OR (policy = 'sha256-transfer-id-v1' AND mint IS NOT NULL))
 );
-INSERT INTO dataset_policy(singleton, policy, mint) VALUES(TRUE, 'exact', NULL);
+INSERT INTO dataset_policy(singleton, policy, mint, percent) VALUES(TRUE, 'exact', NULL, 100);
 
 -- Serialize activation with the first admission of durable inputs and progress.
 CREATE FUNCTION lock_dataset_policy() RETURNS trigger LANGUAGE plpgsql AS $$

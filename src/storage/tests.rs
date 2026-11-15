@@ -40,10 +40,15 @@ fn sampled_dataset_is_stable_on_replay_and_repair_and_retains_inputs() {
             .unwrap();
     let capture = crate::decoder::parse_capture(&serde_json::to_vec(&fixture).unwrap()).unwrap();
     let mint = crate::decoder::decode(&capture).unwrap()[0].mint.clone();
-    assert_eq!(Store::init_sample(path, &mint).unwrap()["denominator"], 10);
-    assert!(Store::init_sample(path, &mint).is_ok());
+    assert_eq!(
+        Store::init_sample(path, &mint, 10).unwrap()["numerator"],
+        10
+    );
+    assert!(Store::init_sample(path, &mint, 10).is_ok());
+    assert!(Store::init_sample(path, &mint, 20).is_err());
     let policy = Sampling {
         mint: Some(mint.clone()),
+        percent: 10,
     };
     let mut selected = Vec::new();
     let mut inputs = Vec::new();
@@ -128,7 +133,7 @@ fn sampled_dataset_is_stable_on_replay_and_repair_and_retains_inputs() {
     repaired.sort_by(|a, b| a.transfer_id.cmp(&b.transfer_id));
     selected.sort_by(|a, b| a.transfer_id.cmp(&b.transfer_id));
     assert_eq!(repaired, selected);
-    assert!(Store::init_sample(path, &bs58::encode([5u8; 32]).into_string()).is_err());
+    assert!(Store::init_sample(path, &bs58::encode([5u8; 32]).into_string(), 10).is_err());
 }
 
 #[test]
@@ -144,7 +149,7 @@ fn sampled_activation_rejects_existing_exact_inputs() {
         .persist(&capture, raw, &decoded)
         .unwrap();
     assert_eq!(
-        Store::init_sample(path, &mint).unwrap_err().0,
+        Store::init_sample(path, &mint, 10).unwrap_err().0,
         "sample_session_not_empty"
     );
     assert_eq!(Store::sampling(path).unwrap()["policy"], "exact");
@@ -166,7 +171,7 @@ fn activation_waits_for_inflight_input_and_rejects_exact_dataset() {
     let (sender, receiver) = std::sync::mpsc::channel();
     let handle = std::thread::spawn(move || {
         sender.send(()).unwrap();
-        Store::init_sample(&path2, &bs58::encode([3u8; 32]).into_string())
+        Store::init_sample(&path2, &bs58::encode([3u8; 32]).into_string(), 10)
     });
     receiver.recv().unwrap();
     // Commit only once activation is blocked on the writer's policy lock.
@@ -180,4 +185,37 @@ fn activation_waits_for_inflight_input_and_rejects_exact_dataset() {
         "sample_session_not_empty"
     );
     assert_eq!(Store::sampling(path).unwrap()["policy"], "exact");
+}
+
+#[test]
+fn sample_percent_sets_the_rate_keeps_all_at_100_and_nests_smaller_samples() {
+    let raw = include_bytes!("../../tests/fixtures/mainnet-transfer.json");
+    let template =
+        crate::decoder::decode(&crate::decoder::parse_capture(raw).unwrap()).unwrap()[0].clone();
+    let rows: Vec<_> = (0..20_000)
+        .map(|n| Transfer {
+            transfer_id: format!("{}:{n}", template.transfer_id),
+            ..template.clone()
+        })
+        .collect();
+    let policy = |percent| Sampling {
+        mint: Some(template.mint.clone()),
+        percent,
+    };
+    for percent in [1, 10, 50, 100] {
+        let kept = rows.iter().filter(|r| policy(percent).accepts(r)).count();
+        let expected = rows.len() * percent as usize / 100;
+        assert!(kept.abs_diff(expected) <= 400, "{percent}%: kept {kept}");
+    }
+    assert!(rows.iter().all(|r| policy(100).accepts(r)));
+    assert!(
+        rows.iter()
+            .filter(|r| policy(10).accepts(r))
+            .all(|r| policy(50).accepts(r))
+    );
+    let other_mint = Transfer {
+        mint: "other".into(),
+        ..template.clone()
+    };
+    assert!(!policy(100).accepts(&other_mint));
 }

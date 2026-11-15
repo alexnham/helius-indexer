@@ -288,13 +288,15 @@ implementation does not satisfy this target. Follow the staged
 [corrected backfill plan](docs/backfill-replan.md); a full-window run and paid
 infrastructure remain separately authorized actions.
 
-## Isolated 10% demo dataset
+## Isolated sampled demo dataset
 
 An explicitly initialized, single-mint demo dataset may retain a deterministic
-10% sample of decoded transfers (#72). Its versioned policy
-(`sha256-transfer-id-v1`: keep a transfer when the first 8 bytes of
-SHA-256(`transfer_id`), read big-endian, are below ⌊2⁶⁴/10⌋) and mint are immutable
-dataset metadata, fixed before any input is admitted. Ordinary datasets remain
+sample of decoded transfers (#72), at a configured percentage P from 1 to 100;
+the requested demo uses 10%. Its versioned policy (`sha256-transfer-id-v1`: keep a
+transfer when the first 8 bytes of SHA-256(`transfer_id`), read big-endian as an
+integer h, satisfy h × 100 < P × 2⁶⁴), mint and P are immutable dataset metadata,
+fixed before any input is admitted. A lower percentage selects a subset of any
+higher one; 100% keeps every transfer of the mint. Ordinary datasets remain
 exact. Selection depends only on stable transfer identity, so live, history,
 retries and decoder corrections decide identically. Listings and aggregates carry
 the policy and report actual sampled counts; no extrapolated totals are shown, and

@@ -24,9 +24,8 @@ def integer(env, name, default, low, high):
 
 
 def configuration(env, tip):
-    sample = env.get("INDEXER_SAMPLE", "0")
-    if sample not in ("0", "1"):
-        raise ValueError("Invalid INDEXER_SAMPLE")
+    # Unset is an exact dataset; 1-100 keeps that percentage of the mint's transfers.
+    percent = integer(env, "INDEXER_SAMPLE_PERCENT", 0, 1, 100) if env.get("INDEXER_SAMPLE_PERCENT") else None
     mint = env.get("INDEXER_MINT", CONSOLE.USDC)
     if not CONSOLE.valid_mint(mint):
         raise ValueError("Invalid INDEXER_MINT")
@@ -38,7 +37,7 @@ def configuration(env, tip):
     job=env.get("INDEXER_REPLAY_JOB", "recent")
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}",job):
         raise ValueError("Invalid INDEXER_REPLAY_JOB")
-    return {"historical_source":"laserstream_replay","replay_job":job,"mint": mint, "mints": [mint], "sampled": sample == "1", "slot_start": start, "slot_end": end,
+    return {"historical_source":"laserstream_replay","replay_job":job,"mint": mint, "mints": [mint], "sample_percent": percent, "slot_start": start, "slot_end": end,
             "live_from": integer(env, "INDEXER_LIVE_FROM", max(0, tip - 4), 0, tip),
             "seconds": integer(env, "INDEXER_LIVE_SECONDS", 60, 1, 300),
             "keep": integer(env, "INDEXER_KEEP_TRANSFERS", 1000, 1, 1_000_000),
@@ -58,14 +57,14 @@ def resume_configuration(session, env, tip):
     requested.setdefault("INDEXER_MINT",saved["mint"])
     requested.setdefault("INDEXER_DB_SESSION",saved["database"])
     requested.setdefault("INDEXER_REPLAY_JOB",saved["replay_job"])
-    requested.setdefault("INDEXER_SAMPLE","1" if saved.get("sampled") else "0")
+    requested.setdefault("INDEXER_SAMPLE_PERCENT",str(saved.get("sample_percent") or ""))
     requested["INDEXER_BACKFILL_END"]=env.get("INDEXER_BACKFILL_END") or str(saved["slot_end"])
     requested["INDEXER_BACKFILL_START"]=env.get("INDEXER_BACKFILL_START") or str(saved["slot_start"])
     if env.get("INDEXER_BACKFILL_SLOTS") and not env.get("INDEXER_BACKFILL_START"):
         requested["INDEXER_BACKFILL_START"]=str(int(requested["INDEXER_BACKFILL_END"])-int(env["INDEXER_BACKFILL_SLOTS"])+1)
     current=configuration(requested,tip)
-    for field in ["mint","database","replay_job","slot_start","slot_end","sampled"]:
-        if current[field]!=saved.get(field, False):
+    for field in ["mint","database","replay_job","slot_start","slot_end","sample_percent"]:
+        if current[field]!=saved.get(field):
             raise ValueError("Frozen replay scope changed; choose a new directory and job ID")
     return current
 
@@ -117,7 +116,7 @@ def resume_slot(live, mint):
     return live.get("last_received_slot")
 
 
-def initialize(session, binary, database, mint=None, sampled=False):
+def initialize(session, binary, database, mint=None, percent=None):
     import shutil
     session.mkdir(parents=True, exist_ok=True, mode=0o700)
     target = session / "helius-indexer"
@@ -129,10 +128,11 @@ def initialize(session, binary, database, mint=None, sampled=False):
     # Recovery runs behind live-priority admission inside the native paired worker.
     CONSOLE.command(session, "migrate", database)
     # The dataset policy is immutable; it must be set before any input is admitted.
-    if sampled:
-        CONSOLE.command(session, "sample-init", database, mint)
+    if percent is not None:
+        CONSOLE.command(session, "sample-init", database, mint, percent)
     policy = CONSOLE.command(session, "sample-status", database)
-    if (policy.get("policy") != "exact") != sampled or (sampled and policy.get("mint") != mint):
+    sampled = policy.get("policy") != "exact"
+    if sampled != (percent is not None) or (sampled and (policy.get("mint"), policy.get("numerator")) != (mint, percent)):
         raise ValueError("Dataset sampling mode or mint does not match runtime configuration")
 
 
@@ -168,7 +168,7 @@ def main():
             env = {**os.environ, "HELIUS_API_KEY": key, "INDEXER_LIVE_OPT_IN": "1", "SOLANA_RPC_URL": endpoint}
         CONSOLE.require_database_url()
         initialize(session, Path(os.environ.get("INDEXER_BINARY", "/usr/local/bin/helius-indexer")), config["database"],
-                   config["mint"], config.get("sampled", False))
+                   config["mint"], config.get("sample_percent"))
         if not inspect_only:
             CONSOLE.command(session,"replay-create",config["database"],config["replay_job"],config["mint"],config["slot_start"],config["slot_end"])
             atomic_json(session / "session.json", config)
@@ -195,7 +195,7 @@ def main():
                     if stopped.is_set():
                         atomic_json(session / "worker.json", {"state": "stopped", "cycle": number, "coverage": "unknown"})
                         return
-                    if config.get("sampled", False):
+                    if config.get("sample_percent") is not None:
                         pruned = None  # A sampled demo keeps every raw input for decoder repair.
                     else:
                         prune_code, pruned = cycle(["prune", db, config["keep"]], timeout=300, report_name="prune.json")

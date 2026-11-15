@@ -116,22 +116,31 @@ fn read_failed(_: postgres::Error) -> Error {
 #[derive(Clone)]
 struct Sampling {
     mint: Option<String>,
+    /// Inclusion percentage, 1..=100; 100 for an exact dataset.
+    percent: i16,
 }
 
 impl Sampling {
     fn from_tx(tx: &mut Transaction<'_>) -> Result<Self> {
         let row = tx
             .query_one(
-                "SELECT policy,mint FROM dataset_policy WHERE singleton FOR SHARE",
+                "SELECT policy,mint,percent FROM dataset_policy WHERE singleton FOR SHARE",
                 &[],
             )
             .map_err(read_failed)?;
         Self::from_row(&row).ok_or(Error("stored_policy_invalid"))
     }
     fn from_row(row: &postgres::Row) -> Option<Self> {
+        let percent: i16 = row.get(2);
         match (row.get::<_, &str>(0), row.get::<_, Option<String>>(1)) {
-            ("exact", None) => Some(Self { mint: None }),
-            ("sha256-transfer-id-v1", Some(mint)) => Some(Self { mint: Some(mint) }),
+            ("exact", None) if percent == 100 => Some(Self {
+                mint: None,
+                percent,
+            }),
+            ("sha256-transfer-id-v1", Some(mint)) if (1..=100).contains(&percent) => Some(Self {
+                mint: Some(mint),
+                percent,
+            }),
             _ => None,
         }
     }
@@ -141,15 +150,16 @@ impl Sampling {
                 return false;
             }
             let hash = Sha256::digest(transfer.transfer_id.as_bytes());
-            u64::from_be_bytes(hash[..8].try_into().expect("hash prefix"))
-                < 1_844_674_407_370_955_161
+            let prefix = u64::from_be_bytes(hash[..8].try_into().expect("hash prefix"));
+            // prefix / 2^64 < percent / 100, exactly, in integers.
+            u128::from(prefix) * 100 < (self.percent as u128) << 64
         })
     }
     fn json(&self) -> serde_json::Value {
         match &self.mint {
-            None => serde_json::json!({"policy":"exact","numerator":1,"denominator":1}),
+            None => serde_json::json!({"policy":"exact","numerator":100,"denominator":100}),
             Some(mint) => {
-                serde_json::json!({"policy":"sha256-transfer-id-v1","numerator":1,"denominator":10,"mint":mint})
+                serde_json::json!({"policy":"sha256-transfer-id-v1","numerator":self.percent,"denominator":100,"mint":mint})
             }
         }
     }
@@ -166,7 +176,10 @@ impl Store {
     }
 
     /// The policy is fixed before any input is admitted to this session.
-    pub fn init_sample(db: &Database, mint: &str) -> Result<serde_json::Value> {
+    pub fn init_sample(db: &Database, mint: &str, percent: i16) -> Result<serde_json::Value> {
+        if !(1..=100).contains(&percent) {
+            return Err(Error("invalid_sample_percent"));
+        }
         if bs58::decode(mint)
             .into_vec()
             .map_or(true, |v| v.len() != 32)
@@ -177,33 +190,34 @@ impl Store {
         let mut tx = client.transaction().map_err(write_failed)?;
         let row = tx
             .query_one(
-                "SELECT policy,mint FROM dataset_policy WHERE singleton FOR UPDATE",
+                "SELECT policy,mint,percent FROM dataset_policy WHERE singleton FOR UPDATE",
                 &[],
             )
             .map_err(read_failed)?;
         let policy: String = row.get(0);
         let existing: Option<String> = row.get(1);
-        if policy == "sha256-transfer-id-v1" && existing.as_deref() == Some(mint) {
+        let sampled = Sampling {
+            mint: Some(mint.into()),
+            percent,
+        };
+        if policy == "sha256-transfer-id-v1"
+            && existing.as_deref() == Some(mint)
+            && row.get::<_, i16>(2) == percent
+        {
             tx.commit().map_err(|_| Error("storage_commit_failed"))?;
-            return Ok(Sampling {
-                mint: Some(mint.into()),
-            }
-            .json());
+            return Ok(sampled.json());
         }
         let occupied: bool = tx.query_one("SELECT EXISTS(SELECT 1 FROM captures) OR EXISTS(SELECT 1 FROM live_raw) OR EXISTS(SELECT 1 FROM historical_inputs) OR EXISTS(SELECT 1 FROM historical_slots) OR EXISTS(SELECT 1 FROM live_runs) OR EXISTS(SELECT 1 FROM transfers)", &[]).map_err(read_failed)?.get(0);
         if policy != "exact" || occupied {
             return Err(Error("sample_session_not_empty"));
         }
         tx.execute(
-            "UPDATE dataset_policy SET policy='sha256-transfer-id-v1', mint=$1 WHERE singleton",
-            &[&mint],
+            "UPDATE dataset_policy SET policy='sha256-transfer-id-v1', mint=$1, percent=$2 WHERE singleton",
+            &[&mint, &percent],
         )
         .map_err(write_failed)?;
         tx.commit().map_err(|_| Error("storage_commit_failed"))?;
-        Ok(Sampling {
-            mint: Some(mint.into()),
-        }
-        .json())
+        Ok(sampled.json())
     }
 
     pub fn sampling(db: &Database) -> Result<serde_json::Value> {
@@ -393,7 +407,7 @@ impl Store {
         let statements = self.statements.clone().expect("prepared above");
         let mut tx = self.db.transaction()?;
         let sampling = Sampling::from_row(&tx.query_one(
-            "SELECT policy,mint FROM dataset_policy WHERE singleton FOR SHARE",
+            "SELECT policy,mint,percent FROM dataset_policy WHERE singleton FOR SHARE",
             &[],
         )?)
         .expect("dataset policy constrained by schema");
