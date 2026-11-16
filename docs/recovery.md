@@ -111,3 +111,22 @@ of ticket #5. A real provider replay-boundary outage recovery, independent sourc
 bridge (#17), automated repair supervision, and continuously refreshed recovery
 monitoring remain open. Decoder revision replacement is handled by the explicit
 [offline repair commands](decoder-repair.md); it does not certify full live coverage.
+
+## Kafka crash matrix
+
+Each crash point below has a test in `src/kafka.rs`. Consumer cases kill a real child process with SIGKILL.
+Producer cases reproduce the state a crash leaves (stored cursor and topic contents),
+because the stream loop has no offline source yet (#59).
+
+| Crash point | What survives | Restart behavior |
+| --- | --- | --- |
+| Producer, before publish | Stored cursor below the input | Resume from `resume_from` (cursor − 150) re-receives it |
+| Producer, after publish, before its cursor is stored | The input in the topic, old cursor | The input is produced again; the consumer stores it once |
+| Consumer, during its batch write | Nothing: output and positions commit in one transaction | The batch is consumed again once the session timeout (10 s) moves the dead member's partitions |
+| Consumer, after its batch committed | Output and positions | Nothing already stored is consumed again |
+| Consumer group rebalance mid-run | Stored positions; a revoked member drops any unwritten batch | The joining member consumes from stored positions |
+
+In every case each transfer is stored once and live coverage stays `unknown` with no
+verified boundary. Delivery and stored positions are processing progress, never
+coverage, as the [replay contract](replay-jobs.md) requires of filtered input. A clean
+shutdown leaves the group at once; only a crash waits for the session timeout.
