@@ -26,15 +26,39 @@ no fixed slots-per-day calculation is used. This is conservative scheduling,
 not proof of complete temporal coverage. Windowed queries still apply exact
 known block-time eligibility and disclose null block times.
 
-Each bridge batch processes at most eight positions, under its existing 128 MiB
-archive and nine 64 MiB RPC response ceilings. The wrapper reserves 704 MiB before
+Configure runs with `run --config config/backfill.example.json` alongside the
+usual `--binary`, `--directory`, `--session` and provider opt-in arguments. The
+JSON accepts integer `slots_per_batch`, `max_batches`, `max_reserved_bytes` and
+`min_free_bytes`; explicit CLI flags override file values. Unknown keys and invalid
+limits fail before provider access. `max_batches` is required in the file or CLI.
+The checked-in example preserves the existing defaults and requests 100 batches.
+Credentials remain in environment variables, never this file.
+
+`slots_per_batch` defaults to eight and accepts 1–10,000. For example, set it to
+1,000 and `max_reserved_bytes` to at least 67,310,190,592 bytes (62.6875 GiB) to
+admit one worst-case batch. This reservation is deliberately pessimistic, not an
+expected download size or measured recommendation. Larger batches still share the
+existing 128 MiB/32-request archive ceiling and 120-second cooperative deadline;
+they can stop or fail before reaching the slot maximum. They do not increase
+concurrency. Native historical operations remain in subranges of at most 128 slots,
+with the same per-slot durable writes and independent coverage checks.
+
+The native `bridge` worker also accepts `INDEXER_BRIDGE_BATCH_SLOTS`; the wrapper
+sets it from the effective config, overriding an inherited value. Run settings
+are saved as `run_config` in the manifest, while native reports/events expose the
+effective batch limits. Existing sessions can resume with changed limits without
+changing their frozen range, sampling policy, or binary. A session frozen with an
+older binary needs a new session to use the native batch-size setting.
+
+Each bridge batch processes at most the configured positions. The wrapper reserves
+128 MiB + (`slots_per_batch` + 1) × 64 MiB before
 each batch so a crash cannot reset its charge. When the batch finishes and reports
 its source response bytes, the charge drops to those bytes; failed, timed-out and
-interrupted batches keep the full 704 MiB. `run` stops at `--max-reserved-bytes`
+interrupted batches keep the full reservation. `run` stops at `--max-reserved-bytes`
 (default 2 GiB), low free disk, a `CANCEL` file in the session directory, or a batch
 that verified nothing new. Charged bytes are a scheduling allowance, not billing.
-Each native command may take up to 360 s, above its own 120 s archive and nine 20 s
-RPC request bounds; its stderr events go to the session's `events.jsonl`.
+Each native command may take up to 360 s. The native worker shares a cooperative
+120-second deadline with bounded 20-second RPC requests; its stderr events go to the session's `events.jsonl`.
 
 `status` takes no lock, so it works while `run` is active. Starting `run` deletes a
 `CANCEL` file left from an earlier stop and reports `cleared_stale_cancel`; create

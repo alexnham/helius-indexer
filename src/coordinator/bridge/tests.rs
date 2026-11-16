@@ -75,6 +75,7 @@ fn work(path: &Database, plan: &Plan, a: &mut Source, r: &mut Source) -> Value {
         Arc::new(WriteGate::default()),
         &mut Telemetry::default(),
         || false,
+        8,
     )
     .unwrap()
 }
@@ -176,6 +177,7 @@ fn cancellation_and_batch_limits_leave_unscheduled_work_visible() {
         Arc::new(WriteGate::default()),
         &mut Telemetry::default(),
         || true,
+        8,
     )
     .unwrap();
     assert!(a.calls.is_empty() && r.calls.is_empty());
@@ -296,6 +298,7 @@ fn elapsed_budget_rotates_scheduling_without_advancing_verified_coverage() {
             checks.set(n + 1);
             n > 3
         },
+        8,
     )
     .unwrap();
     assert_eq!(stopped["cancelled"], true);
@@ -396,4 +399,52 @@ fn corroborated_boundary_is_ready_but_native_rpc_stays_incomplete_even_after_res
     let count = Store::query(&path, None, 100).unwrap().len();
     work(&path, &plan, &mut a, &mut r);
     assert_eq!(Store::query(&path, None, 100).unwrap().len(), count);
+}
+
+#[test]
+fn configured_batch_slots_are_bounded() {
+    assert_eq!(parse_batch_slots(None).unwrap(), 8);
+    assert_eq!(parse_batch_slots(Some("1000")).unwrap(), 1000);
+    assert_eq!(parse_batch_slots(Some("10000")).unwrap(), 10000);
+    for value in ["0", "10001", "-1", "abc", "18446744073709551616"] {
+        assert_eq!(
+            parse_batch_slots(Some(value)).unwrap_err().0,
+            "invalid_bridge_batch_slots"
+        );
+    }
+}
+
+#[test]
+fn large_batches_keep_historical_operations_bounded() {
+    let ranges: Vec<_> = subranges(10, 1009).collect();
+    assert_eq!(ranges.len(), 8);
+    assert_eq!(ranges.first(), Some(&(10, 137)));
+    assert_eq!(ranges.last(), Some(&(906, 1009)));
+    for (start, end) in &ranges {
+        crate::backfill::scope(crate::live::USDC, *start, *end).unwrap();
+    }
+    assert!(ranges.windows(2).all(|pair| pair[0].1 + 1 == pair[1].0));
+}
+
+#[test]
+fn configured_batch_crosses_historical_subranges_and_resumes_without_duplicates() {
+    let (_dir, path, plan, mut archive, mut rpc) = setup(150);
+    let result = batch(
+        &path,
+        &plan,
+        &mut archive,
+        &mut rpc,
+        Arc::new(WriteGate::default()),
+        &mut Telemetry::default(),
+        || false,
+        1000,
+    )
+    .unwrap();
+    assert_eq!(result["batch_limits"]["unique_slots"], 1000);
+    assert_eq!(result["historical"]["complete"], true);
+    assert_eq!(result["historical"]["contiguous_through"], 150);
+    assert_eq!(archive.calls.len() + rpc.calls.len(), 142);
+    let before = Store::summary(&path, &plan.mint).unwrap();
+    work(&path, &plan, &mut archive, &mut rpc);
+    assert_eq!(Store::summary(&path, &plan.mint).unwrap(), before);
 }

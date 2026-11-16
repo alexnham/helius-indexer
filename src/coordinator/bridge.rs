@@ -16,7 +16,25 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-const BATCH_SLOTS: u64 = 8;
+fn parse_batch_slots(value: Option<&str>) -> Result<u64> {
+    let slots = value
+        .unwrap_or("8")
+        .parse::<u64>()
+        .map_err(|_| Error("invalid_bridge_batch_slots"))?;
+    if !(1..=10_000).contains(&slots) {
+        return Err(Error("invalid_bridge_batch_slots"));
+    }
+    Ok(slots)
+}
+fn batch_slots() -> Result<u64> {
+    let value = std::env::var("INDEXER_BRIDGE_BATCH_SLOTS")
+        .map(Some)
+        .or_else(|error| match error {
+            std::env::VarError::NotPresent => Ok(None),
+            _ => Err(Error("invalid_bridge_batch_slots")),
+        })?;
+    parse_batch_slots(value.as_deref())
+}
 const MAX_PLAN_SPAN: u64 = 16_000_000;
 const REPORT_RANGES: usize = 32;
 
@@ -245,6 +263,13 @@ pub fn status(database: &Database, mint: &str, start: u64) -> Result<Value> {
     )
 }
 
+fn subranges(start: u64, end: u64) -> impl Iterator<Item = (u64, u64)> {
+    (start..=end)
+        .step_by(crate::backfill::MAX_SLOTS as usize)
+        .map(move |first| (first, (first + crate::backfill::MAX_SLOTS - 1).min(end)))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn batch<A: BlockSource, R: BlockSource>(
     database: &Database,
     plan: &Plan,
@@ -253,6 +278,7 @@ fn batch<A: BlockSource, R: BlockSource>(
     gate: Arc<WriteGate>,
     telemetry: &mut Telemetry,
     cancelled: impl Fn() -> bool,
+    slots: u64,
 ) -> Result<Value> {
     let db = BridgeLog::open(database)?;
     let before = progress(&db, plan)?;
@@ -260,14 +286,20 @@ fn batch<A: BlockSource, R: BlockSource>(
     history.set_gate(Arc::clone(&gate));
     let mut attempts: Vec<Value> = vec![];
     if let Some(start) = before.next_pending_slot.filter(|_| !cancelled()) {
-        let end = (start + BATCH_SLOTS - 1).min(plan.end);
-        history.verify_parent_gaps(&plan.mint, start, end)?;
+        let end = (start + slots - 1).min(plan.end);
+        for (first, last) in subranges(start, end) {
+            history.verify_parent_gaps(&plan.mint, first, last)?;
+        }
         if start <= plan.tip {
             let archive_end = end.min(plan.tip.saturating_sub(1));
             if start <= archive_end {
-                let (_, metrics) =
-                    history.run(&plan.mint, start, archive_end, archive, &cancelled)?;
-                attempts.push(json!({"source_kind":"archive","metrics":metrics}));
+                for (index, (first, last)) in subranges(start, archive_end).enumerate() {
+                    if index > 0 && cancelled() {
+                        break;
+                    }
+                    let (_, metrics) = history.run(&plan.mint, first, last, archive, &cancelled)?;
+                    attempts.push(json!({"source_kind":"archive","metrics":metrics}));
+                }
             }
         }
         if start <= plan.tip && plan.tip <= end && !cancelled() {
@@ -282,10 +314,17 @@ fn batch<A: BlockSource, R: BlockSource>(
         }
         let rpc_start = start.max(plan.tip + 1);
         if rpc_start <= end && !cancelled() {
-            let (_, metrics) = history.run(&plan.mint, rpc_start, end, rpc, &cancelled)?;
-            attempts.push(json!({"source_kind":"rpc","metrics":metrics}));
+            for (index, (first, last)) in subranges(rpc_start, end).enumerate() {
+                if index > 0 && cancelled() {
+                    break;
+                }
+                let (_, metrics) = history.run(&plan.mint, first, last, rpc, &cancelled)?;
+                attempts.push(json!({"source_kind":"rpc","metrics":metrics}));
+            }
         }
-        history.verify_parent_gaps(&plan.mint, start, end)?;
+        for (first, last) in subranges(start, end) {
+            history.verify_parent_gaps(&plan.mint, first, last)?;
+        }
         {
             let _permit = gate.historical()?;
             db.advance(&plan.mint, plan.start, end + 1)?;
@@ -297,7 +336,7 @@ fn batch<A: BlockSource, R: BlockSource>(
     output["cancelled"] = json!(cancelled());
     output["source_diagnostics"] = json!({"archive":archive.diagnostics(),"rpc":rpc.diagnostics()});
     output["summary"] = crate::storage::Store::summary(database, &plan.mint)?;
-    output["batch_limits"] = json!({"unique_slots":BATCH_SLOTS,"archive_response_bytes":128*1024*1024,"archive_requests":32,"rpc_block_responses":9,"rpc_block_response_bytes_each":crate::backfill::MAX_BLOCK_BYTES,"request_seconds":20});
+    output["batch_limits"] = json!({"unique_slots":slots,"archive_response_bytes":128*1024*1024,"archive_requests":32,"rpc_block_responses":slots+1,"rpc_block_response_bytes_each":crate::backfill::MAX_BLOCK_BYTES,"request_seconds":20});
     telemetry.set_context("coordinator", "archive_rpc", "historical");
     let mut event = telemetry.event(
         "bridge_batch_finished",
@@ -309,6 +348,7 @@ fn batch<A: BlockSource, R: BlockSource>(
         },
         None,
     );
+    event["batch_limits"] = output["batch_limits"].clone();
     event["mint"] = json!(plan.mint);
     event["start"] = json!(plan.start);
     event["end"] = json!(plan.end);
@@ -346,6 +386,7 @@ pub fn run(
     live_seconds: Option<u64>,
     telemetry: &mut Telemetry,
 ) -> Result<Value> {
+    let slots = batch_slots()?;
     if let Some(seconds) = live_seconds {
         if mint != crate::live::USDC {
             return Err(Error("invalid_live_mint"));
@@ -384,6 +425,7 @@ pub fn run(
                 began.elapsed() >= Duration::from_secs(live_seconds.unwrap_or(120).min(120))
                     || cancel.as_ref().is_some_and(|p| Path::new(p).exists())
             },
+            slots,
         )
     };
     if let Some(seconds) = live_seconds {

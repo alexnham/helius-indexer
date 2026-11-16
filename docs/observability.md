@@ -511,3 +511,11 @@ The loopback console polls while visible and separates actual sampled counts
 from historical slot evidence. No credential-bearing endpoint, raw payload or
 provider error text is added to its public status. See
 [30-day operation](30-day-backfill.md) for limits and source verification.
+
+Backfill JSON run settings are retained in the manifest's `run_config` and exposed
+by `status`. `bridge_batch_finished` includes `batch_limits`, matching the native
+report's configured slot ceiling and conservative RPC-response bound. Settings
+are diagnostic fields, not metric labels. The wrapper derives its crash-safe
+reservation from the configured slot count; changing settings never resets consumed
+allowances. Offline checks cover config precedence, rejected settings, propagation,
+and bounded native historical subranges.

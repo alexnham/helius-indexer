@@ -114,9 +114,11 @@ def parser_for():
 
     run = sub.add_parser("run", help="run a bounded number of bridge batches")
     session_args(run)
-    run.add_argument("--max-batches", required=True, type=int)
-    run.add_argument("--max-reserved-bytes", type=int, default=DEFAULT_RESERVE_LIMIT)
-    run.add_argument("--min-free-bytes", type=int, default=DEFAULT_MIN_FREE)
+    run.add_argument("--config", type=Path, help="JSON run settings; explicit flags override the file")
+    run.add_argument("--slots-per-batch", type=int)
+    run.add_argument("--max-batches", type=int)
+    run.add_argument("--max-reserved-bytes", type=int)
+    run.add_argument("--min-free-bytes", type=int)
 
     status = sub.add_parser("status", help="read durable bridge and sampling status")
     session_args(status)
@@ -125,6 +127,31 @@ def parser_for():
     session_args(serve)
     serve.add_argument("--port", type=int, default=8768)
     return parser
+
+
+def configure_run(args):
+    defaults = {"slots_per_batch": 8, "max_batches": None,
+                "max_reserved_bytes": DEFAULT_RESERVE_LIMIT,
+                "min_free_bytes": DEFAULT_MIN_FREE}
+    config = {}
+    if args.config is not None:
+        try:
+            config = json.loads(args.config.expanduser().read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            raise SafeError("backfill config is missing or invalid JSON") from None
+        if not isinstance(config, dict) or config.keys() - defaults.keys():
+            raise SafeError("backfill config contains unsupported settings")
+        if any(type(value) is not int for value in config.values()):
+            raise SafeError("backfill config settings must be integers")
+    for key, default in defaults.items():
+        if getattr(args, key) is None:
+            setattr(args, key, config.get(key, default))
+    if args.max_batches is None:
+        raise SafeError("max_batches is required in the config or --max-batches")
+    if not 1 <= args.slots_per_batch <= 10_000:
+        raise SafeError("slots_per_batch must be between 1 and 10000")
+    # One extra RPC response allows the archive/RPC boundary comparison.
+    args.batch_reserve = 128 * 1024**2 + (args.slots_per_batch + 1) * 64 * 1024**2
 
 
 def validate(args):
@@ -138,7 +165,9 @@ def validate(args):
         raise SafeError("start slot must be positive")
     if args.command == "serve" and not 1024 <= args.port <= 65535:
         raise SafeError("port must be between 1024 and 65535")
-    if args.command == "run" and (args.max_batches <= 0 or args.max_reserved_bytes < BATCH_RESERVE or args.min_free_bytes < 0):
+    if args.command == "run":
+        configure_run(args)
+    if args.command == "run" and (args.max_batches <= 0 or args.max_reserved_bytes < args.batch_reserve or args.min_free_bytes < 0):
         raise SafeError("invalid run limits")
     args.directory = args.directory.expanduser().resolve()
     args.binary = args.binary.expanduser().resolve()
@@ -322,7 +351,7 @@ def status(args):
     output = {
         "manifest": {key: manifest.get(key) for key in (
             "session", "mint", "start_slot", "state", "stop_reason", "window", "sampling",
-            "budget", "batches",
+            "budget", "batches", "run_config",
         )},
         "bridge": bridge, "sampling": sampling,
     }
@@ -343,6 +372,7 @@ def run(args):
     path, _ = manifest_paths(args.directory)
     cancel_file = args.directory / "CANCEL"
     env["BACKFILL_CANCEL_FILE"] = str(cancel_file)
+    env["INDEXER_BRIDGE_BATCH_SLOTS"] = str(args.slots_per_batch)
     with locked(args.directory):
         manifest = load_manifest(path, args)
         frozen_binary(args, manifest)
@@ -352,6 +382,9 @@ def run(args):
         cancel_file.unlink(missing_ok=True)
         manifest["state"] = "running"
         manifest["stop_reason"] = None
+        manifest["run_config"] = {key: getattr(args, key) for key in (
+            "slots_per_batch", "max_batches", "max_reserved_bytes", "min_free_bytes")}
+        manifest["budget"]["per_batch_reserved_bytes"] = args.batch_reserve
         manifest["budget"]["max_reserved_bytes"] = args.max_reserved_bytes
         # A previous process may have died after its durable reservation.
         for batch in manifest["batches"]:
@@ -402,21 +435,24 @@ def run_batches(args, env, path, manifest, cancel_file):
             manifest["stop_reason"] = "free_disk_below_threshold"
             return
         budget = manifest["budget"]
-        if budget["reserved_bytes"] + BATCH_RESERVE > args.max_reserved_bytes:
+        if budget["reserved_bytes"] + args.batch_reserve > args.max_reserved_bytes:
             manifest["stop_reason"] = "byte_reservation_limit"
             return
 
         manifest["total_batches"] = manifest.get("total_batches", 0) + 1
         attempt = {"number": manifest["total_batches"],
-                   "state": "running", "reserved_bytes": BATCH_RESERVE,
+                   "slots_per_batch": args.slots_per_batch,
+                   "state": "running", "reserved_bytes": args.batch_reserve,
                    "actual_response_bytes": None, "started_at_unix_seconds": int(time.time())}
         manifest["batches"].append(attempt)
-        budget["reserved_bytes"] += BATCH_RESERVE
+        budget["reserved_bytes"] += args.batch_reserve
         write_manifest(path, manifest)  # reservation survives a crash before the child starts
         try:
             report = child(args, ["bridge", args.session,
                                   args.directory / "archive-cache", args.mint,
                                   manifest["start_slot"]], env)
+            if report.get("batch_limits", {}).get("unique_slots", 8) != args.slots_per_batch:
+                raise SafeError("frozen worker did not confirm slots_per_batch; use a new session with the updated binary")
         except KeyboardInterrupt:
             attempt.update(state="cancelled_unknown", finished_at_unix_seconds=int(time.time()))
             budget["unknown_actual_batches"] += 1
@@ -437,7 +473,7 @@ def run_batches(args, env, path, manifest, cancel_file):
         else:
             budget["actual_response_bytes"] += actual
             # A measured batch is charged what it read; only unknown batches keep the worst case.
-            budget["reserved_bytes"] += actual - BATCH_RESERVE
+            budget["reserved_bytes"] += actual - args.batch_reserve
             attempt["reserved_bytes"] = actual
         attempt["progress"] = concise_bridge(report)["historical"]
         manifest["batches"] = manifest["batches"][-256:]
