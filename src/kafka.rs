@@ -294,6 +294,32 @@ struct Positions {
     failed: std::sync::Mutex<Option<Error>>,
     /// Largest prefetched byte count librdkafka reported, summed over partitions.
     prefetch_peak: std::sync::atomic::AtomicU64,
+    /// Next offset stored in PostgreSQL per assigned partition; -1 means the earliest offset.
+    stored: std::sync::Mutex<std::collections::HashMap<i32, i64>>,
+    assignments: std::sync::atomic::AtomicU64,
+    revocations: std::sync::atomic::AtomicU64,
+    telemetry: crate::telemetry::Telemetry,
+}
+
+/// Total budget for one lag measurement across partitions; past it lag is unknown.
+const WATERMARK_BUDGET: Duration = Duration::from_secs(1);
+
+/// Durable lag: the broker's high watermark minus the position stored with the output, so
+/// fetched-but-unwritten input still counts. Unknown when nothing is assigned or a
+/// watermark request fails.
+fn durable_lag(consumer: &rdkafka::consumer::BaseConsumer<Positions>, topic: &str) -> Option<i64> {
+    use rdkafka::consumer::Consumer;
+    let stored = consumer.context().stored.lock().ok()?.clone();
+    if stored.is_empty() {
+        return None;
+    }
+    let deadline = std::time::Instant::now() + WATERMARK_BUDGET;
+    stored.iter().try_fold(0, |lag, (partition, next)| {
+        let left = deadline.checked_duration_since(std::time::Instant::now())?;
+        let (low, high) = consumer.fetch_watermarks(topic, *partition, left).ok()?;
+        let next = if *next < 0 { low } else { *next };
+        (high >= 0 && next >= 0).then(|| lag + (high - next).max(0))
+    })
 }
 
 impl ClientContext for Positions {
@@ -330,14 +356,21 @@ impl rdkafka::consumer::ConsumerContext for Positions {
                             .iter()
                             .map(|e| (e.topic().to_string(), e.partition()))
                             .collect();
+                        let mut known = self.stored.lock().ok();
                         for (topic, partition) in partitions {
-                            let offset = stored
-                                .iter()
-                                .find(|s| s.0 == partition)
-                                .map_or(Offset::Beginning, |s| Offset::Offset(s.1));
+                            let next = stored.iter().find(|s| s.0 == partition).map(|s| s.1);
+                            let offset = next.map_or(Offset::Beginning, Offset::Offset);
                             let _ = tpl.set_partition_offset(&topic, partition, offset);
+                            if let Some(known) = known.as_mut() {
+                                known.insert(partition, next.unwrap_or(-1));
+                            }
                         }
+                        drop(known);
                         let _ = consumer.assign(tpl);
+                        self.assignments
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        self.telemetry
+                            .emit("consumer_rebalanced", "assign", "success", None);
                     }
                     // Without stored positions nothing is assigned; the loop reports the error.
                     Err(error) => {
@@ -351,6 +384,13 @@ impl rdkafka::consumer::ConsumerContext for Positions {
                 self.revoked
                     .store(true, std::sync::atomic::Ordering::SeqCst);
                 let _ = consumer.unassign();
+                if let Ok(mut known) = self.stored.lock() {
+                    known.clear();
+                }
+                self.revocations
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.telemetry
+                    .emit("consumer_rebalanced", "revoke", "success", None);
             }
             _ => {}
         }
@@ -372,6 +412,10 @@ pub fn consume(
     require_loopback(brokers)?;
     ensure_topic(brokers, topic, PARTITIONS)?;
     let group = format!("indexer-{}", database.session());
+    // One run identity for every event this consumer emits.
+    let mut telemetry = crate::telemetry::Telemetry::default();
+    telemetry.set_context("kafka_consumer", "kafka", "live");
+    let started = std::time::Instant::now();
     let consumer: BaseConsumer<Positions> = config(brokers)
         .set("group.id", &group)
         .set("enable.auto.commit", "false")
@@ -396,18 +440,21 @@ pub fn consume(
             revoked: Default::default(),
             failed: Default::default(),
             prefetch_peak: Default::default(),
+            stored: Default::default(),
+            assignments: Default::default(),
+            revocations: Default::default(),
+            telemetry,
         })
         .map_err(|_| Error("kafka_unavailable"))?;
     consumer
         .subscribe(&[topic])
         .map_err(|_| Error("kafka_unavailable"))?;
     let mut store = crate::storage::Store::open(database)?;
-    // One run identity for every event this consumer emits.
-    let mut telemetry = crate::telemetry::Telemetry::default();
-    telemetry.set_context("kafka_consumer", "kafka", "live");
+    let telemetry = &consumer.context().telemetry;
     let deadline = std::time::Instant::now() + Duration::from_secs(seconds);
     let mut buffer: Vec<rdkafka::message::OwnedMessage> = Vec::new();
     let mut buffered_bytes = 0;
+    let mut measured = None;
     let mut since: Option<std::time::Instant> = None;
     let mut totals = Totals::default();
     loop {
@@ -426,9 +473,14 @@ pub fn consume(
             || buffer.len() >= BATCH_INPUTS
             || buffered_bytes >= BATCH_BYTES;
         if (done || due) && !buffer.is_empty() {
+            // At most once a second, so measuring delays writes by at most the budget.
+            if measured.is_none_or(|m: std::time::Instant| m.elapsed() >= Duration::from_secs(1)) {
+                measured = Some(std::time::Instant::now());
+                totals.lag_peak = totals.lag_peak.max(durable_lag(&consumer, topic));
+            }
             let started = std::time::Instant::now();
             let written =
-                write_consumed(&mut store, &group, topic, &buffer, &mut totals, &telemetry);
+                write_consumed(&mut store, &group, topic, &buffer, &mut totals, telemetry);
             totals.storage_seconds += started.elapsed().as_secs_f64();
             if let Err(error) = written {
                 telemetry.emit(
@@ -438,6 +490,15 @@ pub fn consume(
                     Some(error.0),
                 );
                 return Err(error);
+            }
+            if let Ok(mut known) = consumer.context().stored.lock() {
+                use rdkafka::Message;
+                for message in &buffer {
+                    // Only partitions still assigned; a revocation cleared the rest.
+                    if let Some(next) = known.get_mut(&message.partition()) {
+                        *next = (*next).max(message.offset() + 1);
+                    }
+                }
             }
             buffer.clear();
             buffered_bytes = 0;
@@ -471,12 +532,19 @@ pub fn consume(
             since = None;
         }
     }
+    use std::sync::atomic::Ordering::Relaxed;
+    let context = consumer.context();
+    let elapsed = started.elapsed().as_secs_f64();
     Ok(
         serde_json::json!({"consumer_group":group,"topic":topic,"consumed":totals.consumed,
         "inserted_transfers":totals.inserted,"retained_failures":totals.retained,
         "batches":totals.batches,"revoked_unwritten":totals.revoked_unwritten,"storage_failures_retained":totals.storage_retained,
         "storage_write_seconds":totals.storage_seconds,
         "prefetch_peak_bytes":consumer.context().prefetch_peak.load(std::sync::atomic::Ordering::Relaxed),
+        "batch_retries":totals.batch_retries,
+        "rebalances":{"assigned":context.assignments.load(Relaxed),"revoked":context.revocations.load(Relaxed)},
+        "lag_messages":durable_lag(&consumer, topic),"lag_peak_messages":totals.lag_peak,
+        "elapsed_seconds":elapsed,"consumed_per_second":totals.consumed as f64/elapsed,
         "storage":store.stats(),"coverage":"unknown"}),
     )
 }
@@ -491,6 +559,9 @@ struct Totals {
     storage_retained: u64,
     consecutive_retained: u64,
     storage_seconds: f64,
+    batch_retries: u64,
+    /// Largest durable lag seen before a batch write; None until one was known.
+    lag_peak: Option<i64>,
 }
 
 /// Consecutive inputs retained for storage failure before the consumer treats the fault
@@ -515,6 +586,7 @@ fn write_consumed(
         totals.consecutive_retained = 0;
         return Ok(());
     }
+    totals.batch_retries += 1;
     for message in messages {
         let error = match write_once(store, group, topic, std::slice::from_ref(message), totals) {
             Ok(()) => {
@@ -1039,6 +1111,10 @@ mod consumer_tests {
         // so the stored rows, not the newly-inserted count, are the measure.
         assert_eq!(Store::query(&test.0, None, 100).unwrap().len(), 2);
         assert_eq!(report["storage_failures_retained"], 1);
+        assert_eq!(
+            report["batch_retries"], 1,
+            "the failed batch was retried per message"
+        );
         assert_eq!(stored_positions(&test), 3, "the partition is not blocked");
         let status: String = test
             .sql()
@@ -1467,6 +1543,8 @@ mod consumer_tests {
             reports[1]["consumed"].as_u64().unwrap() > 0,
             "partitions moved to the joining member"
         );
+        assert!(reports[0]["rebalances"]["revoked"].as_u64().unwrap() >= 1);
+        assert!(reports[1]["rebalances"]["assigned"].as_u64().unwrap() >= 1);
         assert_eq!(live_coverage(&test), serde_json::json!(["unknown", null]));
     }
 
@@ -1512,5 +1590,36 @@ mod consumer_tests {
         assert_eq!(consumed["consumed"], 17, "duplicates reach the consumer");
         assert_eq!(Store::query(&test.0, None, 100).unwrap().len(), 9);
         assert_eq!(live_coverage(&test), serde_json::json!(["unknown", null]));
+    }
+
+    #[test]
+    fn consumer_lag_counts_unstored_input_and_returns_to_zero() {
+        let test = TestDatabase::new();
+        let topic = TestTopic::new(1);
+        produce(
+            &topic.0,
+            &(1..=25u8)
+                .map(|n| signed(n, 300 + u64::from(n)))
+                .collect::<Vec<_>>(),
+        );
+        Store::open(&test.0).unwrap();
+        let mut lock = test.sql();
+        lock.batch_execute("BEGIN; LOCK TABLE kafka_offsets IN EXCLUSIVE MODE;")
+            .unwrap();
+        let worker = consume_in_background(&test, &topic.0, 12);
+        wait_for_lock_waiter(&test);
+        // Settle while the batch write waits; the lag measured before it saw nothing stored.
+        std::thread::sleep(Duration::from_secs(3));
+        lock.batch_execute("COMMIT;").unwrap();
+        let report = worker.join().unwrap();
+        assert_eq!(report["consumed"], 25);
+        assert_eq!(
+            report["lag_peak_messages"], 25,
+            "fetched but unstored input is lag"
+        );
+        assert_eq!(report["lag_messages"], 0);
+        assert_eq!(report["rebalances"]["assigned"], 1);
+        assert_eq!(report["rebalances"]["revoked"], 0);
+        assert!(report["consumed_per_second"].as_f64().unwrap() > 0.0);
     }
 }

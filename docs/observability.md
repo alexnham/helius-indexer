@@ -462,6 +462,27 @@ The Kafka consumer report adds `storage_write_seconds` and `prefetch_peak_bytes`
 (from librdkafka statistics, sampled every second); producer and consumer buffer
 bounds and their backpressure are listed in [recovery](recovery.md).
 
+For the #36 metrics, the consumer report and events give:
+
+- **Consume rate:** `consumed_per_second` over `elapsed_seconds`. The produce rate is
+  `input_transactions_per_second` in the producer's `live_metrics` event.
+- **Consumer lag:** `lag_messages` at exit and `lag_peak_messages`, measured as the broker
+  high watermark minus the position stored with the output, summed over assigned
+  partitions. Fetched but unwritten input therefore counts. It is measured at most once a
+  second before a write, within a one-second request budget; a failed or slow request,
+  or no assignment, gives `null` (unknown), never zero. While the broker is unreachable each
+  measurement spends its whole budget, so writes can slow by up to one second per second,
+  and the exit report can take one more second.
+- **Rebalances:** `rebalances.assigned` and `rebalances.revoked`, plus a
+  `consumer_rebalanced` event (operation `assign` or `revoke`) for each one.
+- **Retries:** `batch_retries` counts batches that failed storage and were retried
+  input by input. The idempotent producer's own resends inside librdkafka are not counted.
+- **Decode failures and oldest pending age:** `retained_failures` in the report, and
+  `live-status` `unresolved_items` and `oldest_unresolved_age_seconds`. Retained Kafka
+  inputs are part of those.
+
+These are JSON inspection fields and events, not labelled metric series.
+
 ## Sampled demo datasets
 
 A sampled dataset (#72) exposes its immutable policy, inclusion fraction and mint
