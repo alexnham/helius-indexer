@@ -1,7 +1,9 @@
 # Docker captured-data console
 
-This packages the current captured-transfer test console. It does not start live
-intake, backfill or a production API, and requires no provider credentials.
+This packages the captured-transfer test console. Plain `docker compose up` starts
+the provider-backed [runtime](runtime-testing.md) instead; this console is opt-in
+under the `test` profile. It does not start live intake, backfill or a production
+API, and requires no provider credentials.
 
 ## Start
 
@@ -9,17 +11,16 @@ Install/start a current Docker engine (28+ for the documented localhost publishi
 behavior) with Docker Compose. From the repository:
 
 ```sh
-docker compose up --build
+docker compose --profile test up --build console
 ```
 
-Open **http://127.0.0.1:8765** after startup reports ready. If the native console
-already occupies that port, leave it running and use:
+Open **http://127.0.0.1:8766** after startup reports ready. To use another port:
 
 ```sh
-INDEXER_CONSOLE_PORT=8766 docker compose up --build
+INDEXER_CONSOLE_PORT=8768 docker compose --profile test up --build console
 ```
 
-Then open **http://127.0.0.1:8766**. The same setting controls the container port,
+The same setting controls the container port,
 published host port and health check, retaining Host-header validation. Optional
 configuration is documented in `.env.example`; no `.env` file is required. Compose
 passes only the console port to the container, not your provider keys.
@@ -44,11 +45,11 @@ An interrupted first seed can resume idempotently; the completion receipt is
 published only after checks pass. A local file lock prevents concurrent seeders.
 
 ```sh
-docker compose stop
-docker compose start
+docker compose stop console
+docker compose start console
 # Recreate containers while keeping data:
-docker compose down
-docker compose up --build
+docker compose --profile test down
+docker compose --profile test up --build console
 ```
 
 Rebuilding an image does not silently migrate existing data or replace a session's
@@ -60,10 +61,11 @@ binary to run. Database portability and migrations need their own validation.
 Only for an intentional reset of this Compose project's session:
 
 ```sh
-docker compose down --volumes
+docker compose --profile test down --volumes
 ```
 
-That deletes the named volume and everything stored in it. Ordinary `down` preserves
+That deletes every named volume of this Compose project, including the runtime's
+data and the shared PostgreSQL database, and everything stored in them. Ordinary `down` preserves
 it. Stop the services before archiving the volumes, or use `pg_dump` from the
 `postgres` service. Sessions created before PostgreSQL are not migrated: remove the
 old `console-data` volume and let the console reseed. Ingestion profiles, credential
@@ -97,8 +99,8 @@ The host's current native console can keep running on a different port.
 # Requires the native default CLI already built:
 python3 -m unittest discover -s tests -p '*console_test.py'
 # Build once, then test an isolated disposable Compose project:
-docker compose build
-INDEXER_CONSOLE_PORT=8766 python3 scripts/docker-smoke.py
+docker compose build console
+python3 scripts/docker-smoke.py
 ```
 
 The smoke script checks non-root execution, absence of Cargo, HTTP availability,
@@ -124,8 +126,8 @@ The default Docker console is healthy on the separate test port 8766. AMD64
 verification is configured in CI and remains pending until that job passes.
 No Rust source changed; the native Rust suite was not rebuilt/rerun locally.
 
-The separate [provider-backed runtime](runtime-testing.md) is now available under
-`--profile live`: real live intake and configurable bounded recent RPC history,
-a separate data volume, runtime-only secret and inspectable coverage. The default
-captured console remains unchanged. Archive-enabled image packaging from #27 is
+The separate [provider-backed runtime](runtime-testing.md) is now the default
+`docker compose up` service: real live intake and configurable bounded recent RPC history,
+a separate data volume, runtime-only secret and inspectable coverage. The captured
+console moved to the `test` profile on port 8766. Archive-enabled image packaging from #27 is
 still separate work.

@@ -102,5 +102,5 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: docker compose config --quiet
-      - run: docker compose build
+      - run: docker compose build console
       - run: python3 scripts/docker-smoke.py
