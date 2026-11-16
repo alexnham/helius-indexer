@@ -458,6 +458,10 @@ The runtime resumes Kafka from the stored `resume_from`, never its maximum raw
 slot. Deterministic tests exercise direct batch acknowledgment and Kafka publication
 alongside a replay receipt using real local PostgreSQL/Kafka, without provider calls.
 
+The Kafka consumer report adds `storage_write_seconds` and `prefetch_peak_bytes`
+(from librdkafka statistics, sampled every second); producer and consumer buffer
+bounds and their backpressure are listed in [recovery](recovery.md).
+
 ## Sampled demo datasets
 
 A sampled dataset (#72) exposes its immutable policy, inclusion fraction and mint
