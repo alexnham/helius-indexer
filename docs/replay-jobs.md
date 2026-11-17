@@ -111,6 +111,12 @@ side is unknown. The command needs replay credentials; with
 `INDEXER_LIVE_OPT_IN=1` and the archive feature it may also make the bounded
 `archive-tip` requests (at most four epoch probes under the default archive limits, plus a finalized reference from `SOLANA_RPC_URL`) using CACHE.
 
+For overlap verification, `INDEXER_ROUTE_ARCHIVE=always` probes the archive even when
+replay serves the whole job, so a job inside both windows routes as `overlap` and
+`replay-archive` plus `replay-overlap` can reconcile it. Without it a measured overlap
+cannot arise: the archive is probed only for a job starting before replay's first slot,
+and replay refuses such a job.
+
 Each measurement appends a revision (migration 6): replay first-available, reference
 slot, archive probe result and segments. Archive serves slots up to its last
 available slot, replay serves first-available through the reference, both is

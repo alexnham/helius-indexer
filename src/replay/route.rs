@@ -56,11 +56,26 @@ pub fn split(
 
 /// Measure replay first; probe the archive only when replay cannot serve the whole
 /// job, so a recent-only job does no archive work.
+#[cfg(test)]
 pub(crate) fn measure_with(
     database: &Database,
     id: &str,
     replay: impl FnOnce() -> Result<(Option<u64>, u64)>,
     archive: impl FnOnce() -> Result<Option<u64>>,
+    telemetry: &mut Telemetry,
+) -> Result<Value> {
+    probe_with(database, id, replay, archive, false, telemetry)
+}
+
+/// As `measure_with`; `always_probe_archive` also probes for a job replay serves whole,
+/// so a job inside both windows routes as `overlap` and can be reconciled. A job that
+/// straddles replay's first slot cannot: replay refuses a start outside its window.
+fn probe_with(
+    database: &Database,
+    id: &str,
+    replay: impl FnOnce() -> Result<(Option<u64>, u64)>,
+    archive: impl FnOnce() -> Result<Option<u64>>,
+    always_probe_archive: bool,
     telemetry: &mut Telemetry,
 ) -> Result<Value> {
     valid_id(id)?;
@@ -72,15 +87,16 @@ pub(crate) fn measure_with(
     })?;
     let replay_serves_all =
         replay_first.is_some_and(|f| f <= scope.start) && scope.end <= reference;
-    let (archive_probed, archive_last, archive_error) = if replay_serves_all {
-        (false, None, None)
-    } else {
-        match archive() {
-            Ok(last) => (true, last, None),
-            // An unavailable archive leaves its slots unknown; it does not fail routing.
-            Err(e) => (true, None, Some(e.0)),
-        }
-    };
+    let (archive_probed, archive_last, archive_error) =
+        if replay_serves_all && !always_probe_archive {
+            (false, None, None)
+        } else {
+            match archive() {
+                Ok(last) => (true, last, None),
+                // An unavailable archive leaves its slots unknown; it does not fail routing.
+                Err(e) => (true, None, Some(e.0)),
+            }
+        };
     let segments = split(
         scope.start,
         scope.end,
@@ -114,12 +130,15 @@ pub(crate) fn measure_with(
 }
 
 /// Opt-in provider measurement. Without the archive feature the archive side is unknown.
+/// `INDEXER_ROUTE_ARCHIVE=always` probes the archive even for a recent job (overlap
+/// verification); the default skips it.
 pub fn measure(
     database: &Database,
     id: &str,
     cache: &Path,
     telemetry: &mut Telemetry,
 ) -> Result<Value> {
+    let always_probe_archive = std::env::var("INDEXER_ROUTE_ARCHIVE").is_ok_and(|v| v == "always");
     valid_id(id)?;
     let scope = JobLog::open(database)?.scope(id)?;
     live::validate_options(scope.start, 30)?;
@@ -147,7 +166,14 @@ pub fn measure(
         let _ = cache;
         Err(Error("archive_feature_disabled"))
     };
-    measure_with(database, id, replay, archive, telemetry)
+    probe_with(
+        database,
+        id,
+        replay,
+        archive,
+        always_probe_archive,
+        telemetry,
+    )
 }
 
 #[cfg(test)]
@@ -188,6 +214,28 @@ mod tests {
             split(0, u64::MAX - 1, Some(u64::MAX), None, u64::MAX),
             vec![(0, u64::MAX - 1, "archive")]
         );
+    }
+
+    #[test]
+    fn always_probing_routes_a_job_inside_both_windows_as_overlap() {
+        let db = TestDatabase::new();
+        super::super::create(&db.0, "verify", USDC, 100, 149).unwrap();
+        let report = probe_with(
+            &db.0,
+            "verify",
+            || Ok((Some(90), 500)),
+            || Ok(Some(139)),
+            true,
+            &mut Telemetry::default(),
+        )
+        .unwrap();
+        let routing = &report["routing"];
+        assert_eq!(routing["archive"]["probed"], true);
+        assert_eq!(
+            routing["segments"],
+            json!([{"start":100,"end":139,"kind":"overlap"},{"start":140,"end":149,"kind":"replay"}])
+        );
+        assert_eq!(report["coverage"], "unknown");
     }
 
     #[test]
