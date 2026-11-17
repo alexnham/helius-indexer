@@ -69,3 +69,27 @@ One LaserStream replay grant (705 messages, 6.6 MB, one connection), one
 3. **Unsupported token instruction:** 3 replay inputs and 2 archive slots in 50 slots.
    Related to #60; which instruction it is was not identified.
 4. Criterion 4 is measured on 6 slots only; the other 44 wait on finding 1.
+
+## Resume after #103 and #105 (22:27–22:28 UTC)
+
+Same session and job, runtime image built from `main` at 47865a9 (adds #103:
+full blocks keep only mint-touching transactions, and #105: a batch starts at the
+least-attempted pending slot). Eight `replay-archive` batches with two
+`archive-grant`s; no new replay grant. Same per-batch limits.
+
+| Check | Result |
+| --- | --- |
+| Archive batches 8–13 | Advanced through 470015958–470015999 in order; 41 of 42 new slots `complete`, slot 470015982 `unknown` (`unsupported_token_instruction`) |
+| Archive batches 14–15 | Retried 470015982 from cache, still `unknown` |
+| Resume cost | 84 Old Faithful requests, 23.3 MB |
+| Overlap outcomes | 10 `consistent`, 37 `replay_omission`, 0 `conflict`, 3 `pending` |
+| Verified slots / coverage | `verified.overlap_slots` 47; job coverage `unknown` (3 slots unresolved) |
+
+Finding 1 is fixed: batches no longer stall behind an unresolved slot. With #103,
+unrelated transactions no longer fail a slot, but the three slots with an
+unsupported instruction (470015950, 470015953, 470015982) touch USDC itself and stay
+`unknown`. The 37 `replay_omission` slots match finding 2 (failed transactions
+counted); that cause was checked against RPC for slot 470015957 only.
+
+Criterion 4: 47 of 50 slots reconciled with no conflicting transfer. The remaining
+3 need #60.
