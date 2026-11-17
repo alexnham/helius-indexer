@@ -224,6 +224,8 @@ pub struct Metrics {
     pub retries: u64,
     pub decoded_transactions: u64,
     pub decoded_transfers: u64,
+    /// Block transactions that do not touch the mint: read for slot evidence, not stored.
+    pub unrelated_transactions: u64,
     pub decode_failures: u64,
     pub elapsed_seconds: f64,
     /// Successful decode attempts per elapsed second; not a benchmark result.
@@ -254,8 +256,8 @@ impl Metrics {
                 ))
         );
         output.push_str(&format!(
-            "indexer_historical_cached_blocks_total {}\n",
-            self.cached_blocks
+            "indexer_historical_cached_blocks_total {}\nindexer_historical_unrelated_transactions_total {}\n",
+            self.cached_blocks, self.unrelated_transactions
         ));
         let progress = &coverage.progress;
         output.push_str(&format!(
@@ -583,6 +585,7 @@ impl History {
                     gate: &self.gate,
                     revision_repair: self.revision_repair,
                     capture_source: source.capture_source(),
+                    mint,
                 },
             );
             match outcome {
@@ -656,6 +659,7 @@ struct BlockContext<'a> {
     gate: &'a crate::coordinator::WriteGate,
     revision_repair: bool,
     capture_source: &'a str,
+    mint: &'a str,
 }
 fn process_block(
     raw: &[u8],
@@ -669,6 +673,7 @@ fn process_block(
         gate,
         revision_repair,
         capture_source,
+        mint,
     } = context;
     let value: Value = serde_json::from_slice(raw).map_err(|_| Error("invalid_block_json"))?;
     if value["jsonrpc"] != "2.0" || value["id"] != 1 || value.get("error").is_some() {
@@ -720,6 +725,12 @@ fn process_block(
             .ok_or(Error("invalid_block_transaction"))?;
         object.insert("slot".into(), json!(slot));
         object.insert("blockTime".into(), block["blockTime"].clone());
+        // A full block (archive, getBlock) holds every mint's transactions; keep the ones
+        // the replay filter would deliver, so historical and replay input store alike.
+        if !crate::replay::overlap::touches_mint(&result, mint) {
+            metrics.unrelated_transactions += 1;
+            continue;
+        }
         let mut capture = json!({"schema_version":1,"cluster":"mainnet-beta","commitment":"finalized","source":capture_source,"result":result});
         if let Some(provenance) = value
             .get("archive_provenance")

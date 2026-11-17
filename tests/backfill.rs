@@ -50,6 +50,31 @@ fn sql(path: &Database, query: &str) {
 }
 
 #[test]
+fn a_full_block_stores_only_transactions_that_touch_the_mint() {
+    let (_dir, path) = db();
+    let usdc = fixture()["result"].clone();
+    let slot = usdc["slot"].as_u64().unwrap();
+    // The same transaction for another mint, with its own signature.
+    let other = bs58::encode([9; 32]).into_string();
+    let mut unrelated: Value =
+        serde_json::from_str(&usdc.to_string().replace(&mint(), &other)).unwrap();
+    unrelated["transaction"]["signatures"][0] = json!(bs58::encode([5; 64]).into_string());
+    let mut source = source(vec![(slot, block(slot, slot - 1, vec![usdc, unrelated]))]);
+    let (coverage, metrics) = History::open(&path)
+        .unwrap()
+        .run(&mint(), slot, slot, &mut source, || false)
+        .unwrap();
+    assert!(coverage.complete, "the slot is still read whole");
+    assert_eq!(metrics.unrelated_transactions, 1);
+    assert_eq!(metrics.decoded_transactions, 1);
+    let expected = decoder::decode(
+        &decoder::parse_capture(include_bytes!("fixtures/mainnet-transfer.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(Store::query(&path, None, 1000).unwrap(), expected);
+}
+
+#[test]
 fn captured_input_and_historical_block_have_identical_queries_and_restart_is_a_noop() {
     let (_dir, path) = db();
     let slot = fixture()["result"]["slot"].as_u64().unwrap();
