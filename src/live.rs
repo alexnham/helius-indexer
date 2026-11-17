@@ -465,6 +465,8 @@ fn run_intake(
                     let _permit = admit()?;
                     job.reservation.allowance()?;
                 }
+                // A buffered batch times out at its flush window, which is not idleness.
+                let idle_timeout = buffered_since.is_none();
                 let update = match network(
                     &runtime,
                     deadline,
@@ -499,7 +501,9 @@ fn run_intake(
                             telemetry,
                         )?;
                         (buffered_bytes, buffered_since) = (0, None);
-                        telemetry.emit("stream_idle", "intake", "waiting", None);
+                        if idle_timeout {
+                            telemetry.emit("stream_idle", "intake", "waiting", None);
+                        }
                         continue;
                     }
                     Err(Error("intake_time_limit")) => {

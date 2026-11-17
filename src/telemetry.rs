@@ -70,7 +70,7 @@ impl Telemetry {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis();
-        json!({"timestamp_unix_ms":timestamp,"severity":if matches!(outcome,"success"|"startup"|"retry"|"time_limit"|"message_limit") {"info"} else {"error"},
+        json!({"timestamp_unix_ms":timestamp,"severity":if matches!(outcome,"success"|"startup"|"retry"|"time_limit"|"message_limit"|"waiting") {"info"} else {"error"},
             "component":self.component,"operation":operation,"outcome":outcome,"error_class":error_class,
             "run_id":self.run_id,"slot":self.slot,"decoder_version":crate::decoder::DECODER_VERSION,
             "source_kind":self.source_kind,"mode":self.mode,"event":event})
@@ -114,6 +114,14 @@ impl Telemetry {
 #[cfg(test)]
 mod context_tests {
     use super::*;
+    #[test]
+    fn waiting_is_informational_and_failures_are_errors() {
+        let telemetry = Telemetry::default();
+        let idle = telemetry.event("stream_idle", "intake", "waiting", None);
+        let failed = telemetry.event("connection_ended", "intake", "failed", None);
+        assert_eq!(idle["severity"], "info");
+        assert_eq!(failed["severity"], "error");
+    }
     #[test]
     fn pipeline_events_keep_correlation_and_bounded_error_context() {
         let mut telemetry = Telemetry::default();
