@@ -34,6 +34,79 @@ fn concurrent_parent_child_conflict_is_rejected_before_both_anchors_commit() {
 }
 
 #[test]
+fn an_indexed_mint_keeps_other_mints_only_as_context_of_its_transactions() {
+    let db = pg::TestDatabase::new();
+    let path = &db.0;
+    let fixture: serde_json::Value =
+        serde_json::from_slice(include_bytes!("../../tests/fixtures/mainnet-transfer.json"))
+            .unwrap();
+    let input = |index: u8| {
+        let mut value = fixture.clone();
+        value["result"]["transaction"]["signatures"][0] =
+            bs58::encode([index; 64]).into_string().into();
+        let raw = serde_json::to_vec(&value).unwrap();
+        let capture = crate::decoder::parse_capture(&raw).unwrap();
+        let decoded = crate::decoder::decode(&capture).unwrap();
+        (capture, raw, decoded)
+    };
+    let (swap, swap_raw, mut swap_rows) = input(1);
+    let (unrelated, unrelated_raw, mut unrelated_rows) = input(2);
+    let mint = swap_rows[0].mint.clone();
+    let other = bs58::encode([9u8; 32]).into_string();
+    assert_eq!(
+        Store::init_mint(path, &mint).unwrap()["mint"],
+        mint.as_str()
+    );
+    assert!(
+        Store::init_mint(path, &mint).is_ok(),
+        "the same mint is a no-op"
+    );
+    assert_eq!(
+        Store::init_mint(path, &other).unwrap_err().0,
+        "mint_session_not_empty"
+    );
+    // A swap moving the indexed mint and another one, and a transaction without the indexed
+    // mint. The edited rows bypass the decoder, so this test does not repeat them: a repeat
+    // re-decodes the raw input.
+    swap_rows[1].mint = other.clone();
+    for row in &mut unrelated_rows {
+        row.mint = other.clone();
+    }
+    let mut store = Store::open(path).unwrap();
+    assert_eq!(
+        store
+            .persist(&swap, &swap_raw, &Ok(swap_rows.clone()))
+            .unwrap(),
+        1
+    );
+    store
+        .persist(&unrelated, &unrelated_raw, &Ok(unrelated_rows))
+        .unwrap();
+
+    assert_eq!(
+        Store::query(path, None, 1000).unwrap(),
+        vec![swap_rows[0].clone()]
+    );
+    let signatures = [
+        swap_rows[0].signature.as_str(),
+        unrelated.result.transaction.signatures[0].as_str(),
+    ];
+    let context = Store::context(path, &signatures).unwrap();
+    assert_eq!(
+        context.as_object().unwrap().len(),
+        1,
+        "no context without an indexed transfer"
+    );
+    assert_eq!(
+        context[&swap_rows[0].signature],
+        serde_json::json!([serde_json::to_value(&swap_rows[1]).unwrap()])
+    );
+    assert_eq!(Store::sampling(path).unwrap()["policy"], "exact");
+    // An exact session with an indexed mint still prunes, context with its transfers.
+    Store::prune(path, 1).unwrap();
+}
+
+#[test]
 fn sampled_dataset_is_stable_on_replay_and_repair_and_retains_inputs() {
     let db = pg::TestDatabase::new();
     let path = &db.0;
@@ -51,6 +124,7 @@ fn sampled_dataset_is_stable_on_replay_and_repair_and_retains_inputs() {
     let policy = Sampling {
         mint: Some(mint.clone()),
         percent: 10,
+        sampled: true,
     };
     let mut selected = Vec::new();
     let mut inputs = Vec::new();
@@ -232,6 +306,7 @@ fn sample_percent_sets_the_rate_keeps_all_at_100_and_nests_smaller_samples() {
     let policy = |percent| Sampling {
         mint: Some(template.mint.clone()),
         percent,
+        sampled: true,
     };
     for percent in [1, 10, 50, 100] {
         let kept = rows.iter().filter(|r| policy(percent).accepts(r)).count();

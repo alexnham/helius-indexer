@@ -150,6 +150,11 @@ impl Store {
         if let Ok(transfers) = decoded {
             tx.execute("DELETE FROM transfers WHERE signature=$1", &[&signature])
                 .map_err(write_failed)?;
+            tx.execute(
+                "DELETE FROM transfer_context WHERE signature=$1",
+                &[&signature],
+            )
+            .map_err(write_failed)?;
             new_rows = insert_transfers(&mut tx, signature, Some(&transfers))?;
             tx.execute("UPDATE capture_inputs SET status='revision_reconciled' WHERE signature=$1 AND status='decoder_revision_conflict'",&[&signature])
                 .map_err(write_failed)?;

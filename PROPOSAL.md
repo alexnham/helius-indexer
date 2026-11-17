@@ -130,7 +130,7 @@ Locally these run in Docker; production uses managed equivalents through configu
 
 Historical full blocks (archive, `getBlock`) store only transactions that touch the job's mint, the same predicate as the replay filter, so live, replay and historical input select the same transactions; the whole block is still read for slot evidence.
 
-Unresolved: matched transactions currently persist transfers of every mint they contain (about 40% were USDC in the measured sample). Decide whether to filter to configured mints at write time or keep related-mint transfers.
+A session fixes its indexed mint before admitting input (`mint-init`, or `sample-init` for a sampled dataset). Only that mint's transfers are transfer records. Other mints' transfers in a transaction with at least one stored indexed transfer are kept as **context** (`transfer_context`), returned beside the transfers they accompany and never counted, summed or covered: those mints are seen only where the indexed mint is. A session that admitted input before fixing a mint keeps storing every mint's transfers. Decision recorded 2026-11-17 (#39).
 
 ## Rust package organization
 
