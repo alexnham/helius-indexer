@@ -158,6 +158,23 @@ fn batches_are_charged_before_work_and_resume_at_the_first_incomplete_slot() {
 }
 
 #[test]
+fn an_unresolved_slot_does_not_stall_later_batches() {
+    let db = TestDatabase::new();
+    routed(&db.0, 129, 130);
+    // Slot 100 never arrives; every other archive slot does.
+    let mut source = source(101..=129);
+    let starts: Vec<Value> = (0..4)
+        .map(|_| work(&db.0, &mut source).unwrap()["start"].clone())
+        .collect();
+    assert_eq!(starts, [json!(100), json!(108), json!(116), json!(124)]);
+    let segments = &status(&db.0, "job").unwrap()["archive"]["slot_status"]["segments"];
+    assert_eq!(segments[0]["complete"], 29);
+    assert_eq!(segments[0]["pending"], 1);
+    // The unresolved slot stays unverified: nothing is verified past it.
+    assert_eq!(status(&db.0, "job").unwrap()["coverage"], "unknown");
+}
+
+#[test]
 fn a_failing_source_still_consumes_its_charge_and_exhaustion_needs_a_grant() {
     let db = TestDatabase::new();
     routed(&db.0, 109, 130);
