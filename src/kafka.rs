@@ -23,11 +23,14 @@ const PRODUCER_QUEUE_MESSAGES: usize = 10_000;
 const PRODUCER_QUEUE_KBYTES: usize = 64 * 1024;
 /// An undelivered message fails after this long and stops intake behind the cursor.
 const DELIVERY_TIMEOUT: Duration = Duration::from_secs(120);
-/// Consumer prefetch bound (librdkafka may overshoot it by one fetch per partition).
+/// Consumer prefetch bound; librdkafka may overshoot it by one fetch (`FETCH_MAX_BYTES`).
 /// It must hold at least one maximum-size message.
 const PREFETCH_KBYTES: usize = 32 * 1024;
 /// Per partition; the byte bound is for the whole consumer.
 const PREFETCH_MESSAGES: usize = 1_000;
+/// One fetch may overshoot the prefetch bound by this much; librdkafka's 50 MiB default
+/// would more than double it. It cannot go below the largest message.
+const FETCH_MAX_BYTES: usize = MAX_MESSAGE_BYTES + 64 * 1024;
 /// A storage write blocked longer than this loses the consumer's partitions; positions
 /// stored with the output keep the next owner correct.
 const MAX_POLL_INTERVAL: Duration = Duration::from_secs(300);
@@ -324,12 +327,15 @@ fn durable_lag(consumer: &rdkafka::consumer::BaseConsumer<Positions>, topic: &st
 
 impl ClientContext for Positions {
     fn stats(&self, statistics: rdkafka::Statistics) {
-        let queued: u64 = statistics
+        // Every partition reports the one consumer queue its fetches are forwarded to, so
+        // summing them would count that queue once per partition.
+        let queued = statistics
             .topics
             .values()
             .flat_map(|t| t.partitions.values())
             .map(|p| p.fetchq_size)
-            .sum();
+            .max()
+            .unwrap_or(0);
         self.prefetch_peak
             .fetch_max(queued, std::sync::atomic::Ordering::Relaxed);
     }
@@ -424,6 +430,7 @@ pub fn consume(
         // A blocked storage write stops polling; librdkafka then stops fetching at these bounds.
         .set("queued.max.messages.kbytes", PREFETCH_KBYTES.to_string())
         .set("queued.min.messages", PREFETCH_MESSAGES.to_string())
+        .set("fetch.max.bytes", FETCH_MAX_BYTES.to_string())
         .set(
             "max.poll.interval.ms",
             MAX_POLL_INTERVAL.as_millis().to_string(),
@@ -1252,7 +1259,8 @@ mod consumer_tests {
     fn a_blocked_database_stops_fetching_at_the_prefetch_bound_and_loses_nothing() {
         const MIB: usize = 1024 * 1024;
         let test = TestDatabase::new();
-        let topic = TestTopic::new(1);
+        // Several partitions: one fetch then spans them, which is where the overshoot comes from.
+        let topic = TestTopic::new(6);
         // 64 MiB of undecodable inputs: more than one batch plus the prefetch bound.
         let mut producer = IntakeProducer::new(&test_brokers(), &topic.0).unwrap();
         for slot in 0..64 {
@@ -1277,10 +1285,9 @@ mod consumer_tests {
         assert_eq!(stored_positions(&test), 64, "every input stored once");
         assert!(report["storage_write_seconds"].as_f64().unwrap() >= 5.0);
         let peak = report["prefetch_peak_bytes"].as_u64().unwrap() as usize;
-        // Prefetch fills toward the bound while blocked; the documented overshoot is one
-        // fetch per partition, so allow two messages for it.
+        // Prefetch fills toward the bound while blocked and may overshoot it by one fetch.
         assert!(
-            (16 * MIB..=super::PREFETCH_KBYTES * 1024 + 2 * (MIB + 1024)).contains(&peak),
+            (16 * MIB..=super::PREFETCH_KBYTES * 1024 + super::FETCH_MAX_BYTES).contains(&peak),
             "prefetch stayed bounded while the write was blocked: {peak}"
         );
     }

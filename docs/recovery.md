@@ -20,7 +20,8 @@ than dropping input:
   restart produces it again.
 - **Consumer:** one batch holds at most 100 inputs or 16 MiB, matching live intake.
   librdkafka prefetches at most 32 MiB in total, or 1,000 messages per partition, and
-  may overshoot the byte bound by one fetch per partition. While a PostgreSQL write is blocked the consumer stops polling,
+  may overshoot the byte bound by one fetch, capped at 16 MiB (`fetch.max.bytes`, the
+  largest message), so about 48 MiB at most. While a PostgreSQL write is blocked the consumer stops polling,
   so fetching stops at that bound, positions stay where they were, and the rest stays
   on the broker.
 - A write blocked longer than `max.poll.interval.ms` (300 s) loses the consumer's
@@ -28,9 +29,10 @@ than dropping input:
   inputs may be redelivered but are stored once.
 
 The consumer report gives `storage_write_seconds` (time in PostgreSQL writes) and
-`prefetch_peak_bytes` (largest prefetched byte count librdkafka reported). Tests
-cover a full producer queue against an unreachable broker and a consumer whose
-position writes are locked for ten seconds.
+`prefetch_peak_bytes` (largest prefetched byte count librdkafka reported for the
+consumer's one shared queue). Tests cover a full producer queue against an
+unreachable broker and a six-partition consumer whose position writes are locked for
+ten seconds.
 
 ## First response
 
