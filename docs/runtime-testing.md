@@ -117,6 +117,11 @@ docker compose exec runtime /app/data/runtime-replay/helius-indexer replay-statu
 docker compose exec runtime /app/data/runtime-replay/helius-indexer live-status runtime
 ```
 
+A fresh runtime session fixes `INDEXER_MINT` as its indexed mint. `/api/transfers`
+lists only that mint's transfers; `context` maps each listed signature to the other
+mints' transfers in the same transaction (for example the SOL side of a swap). Context
+has no coverage and is not in counts or volume.
+
 Check these independently:
 
 - `worker.report.live` and `live.runs`: actual live connection/termination state.
