@@ -133,8 +133,11 @@ above by restoring the pre-upgrade backup.
 
 ## Archive batches
 
-`replay-archive` takes the latest route revision and processes the first up to
-eight incomplete slots of its `archive` or `overlap` segments, within one segment,
+`replay-archive` takes the latest route revision and processes up to eight
+incomplete slots of its `archive` or `overlap` segments, within one segment, starting
+at the pending slot with the fewest attempts (earliest first). Untried slots therefore
+go before retries, and a slot that stays `unknown` cannot stall later batches; it stays
+pending and unverified, so `verified_through` never passes it. The batch runs
 through the shared History path: retained raw input, shared decoder and storage,
 and per-slot `complete`/`skipped`/`unknown` status from full blocks. A job with no
 route is refused; a job whose route has no pending archive slots charges nothing.

@@ -48,36 +48,42 @@ pub(crate) fn lane_segments(
     }
 }
 
-/// Next up-to-eight incomplete slots a lane may serve under the latest route.
+/// Next up-to-eight incomplete slots a lane may serve under the latest route. A batch
+/// starts at the pending slot with the fewest attempts, earliest first: untried slots go
+/// before retries, so one unresolved slot cannot stall the lane.
 fn next_range(database: &Database, id: &str, lane: Lane) -> Result<Option<(i64, u64, u64)>> {
     let mut log = JobLog::open(database)?;
     let mint = log.scope(id)?.mint;
     let (revision, segments) = log.latest_route(id)?.ok_or(Error("replay_route_missing"))?;
     let bounds = log.route_bounds(id, revision)?;
     let history = History::open(database)?;
+    let mut pending = Vec::new();
     for (start, end, _) in lane_segments(lane, &segments, bounds) {
         let coverage = history.coverage(&mint, start, end)?;
-        if let Some(slot) = coverage
-            .slots
-            .iter()
-            .find(|s| s.status != "complete" && s.status != "skipped")
-        {
-            let mut last = end.min(slot.slot + BATCH_SLOTS - 1);
-            // A skipped slot is proven only by a later block's parent link, so a batch
-            // reaching the gap's end also fetches the replay start's block (finalized only).
-            // It settles a skipped tail; it is not counted as gap coverage.
-            if lane == Lane::Gap
-                && last == end
-                && bounds.1 == Some(end + 1)
-                && end < bounds.2
-                && last - slot.slot + 1 < BATCH_SLOTS
-            {
-                last = end + 1;
-            }
-            return Ok(Some((revision, slot.slot, last)));
-        }
+        pending.extend(
+            coverage
+                .slots
+                .into_iter()
+                .filter(|s| s.status != "complete" && s.status != "skipped")
+                .map(|s| (s.attempts, s.slot, end)),
+        );
     }
-    Ok(None)
+    let Some(&(_, slot, end)) = pending.iter().min() else {
+        return Ok(None);
+    };
+    let mut last = end.min(slot + BATCH_SLOTS - 1);
+    // A skipped slot is proven only by a later block's parent link, so a batch
+    // reaching the gap's end also fetches the replay start's block (finalized only).
+    // It settles a skipped tail; it is not counted as gap coverage.
+    if lane == Lane::Gap
+        && last == end
+        && bounds.1 == Some(end + 1)
+        && end < bounds.2
+        && last - slot + 1 < BATCH_SLOTS
+    {
+        last = end + 1;
+    }
+    Ok(Some((revision, slot, last)))
 }
 
 /// Per routed archive/overlap segment, full-block slot status counts. Replay segments get none.
