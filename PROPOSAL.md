@@ -128,6 +128,8 @@ The owner chose to build for horizontal scale ahead of measured need, supersedin
 
 Locally these run in Docker; production uses managed equivalents through configuration. Supporting load figures: [USDC load measurement](docs/validation/2026-11-13-usdc-load.md). Each step still needs the crash, duplicate, and coverage checks in this proposal.
 
+Historical full blocks (archive, `getBlock`) store only transactions that touch the job's mint, the same predicate as the replay filter, so live, replay and historical input select the same transactions; the whole block is still read for slot evidence.
+
 Unresolved: matched transactions currently persist transfers of every mint they contain (about 40% were USDC in the measured sample). Decide whether to filter to configured mints at write time or keep related-mint transfers.
 
 ## Rust package organization
