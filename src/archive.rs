@@ -193,6 +193,9 @@ impl BlockSource for Observation {
         }
         Ok(self.raw.clone())
     }
+    fn keeps_full_blocks(&self) -> bool {
+        true
+    }
 }
 pub fn compare_blocks(archive: &[u8], rpc: &[u8], slot: u64) -> Result<()> {
     let parse = |raw: &[u8]| -> Result<Value> {

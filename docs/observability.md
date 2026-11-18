@@ -234,7 +234,10 @@ block re-verification uses source `retained_block` and shared run correlation.
 `indexer_historical_cached_blocks_total` counts reused blocks separately from
 source requests. `indexer_historical_unrelated_transactions_total` (report field
 `unrelated_transactions`) counts block transactions that do not touch the job's mint:
-read for slot evidence, neither decoded nor stored. No per-signature metric labels are introduced.
+read for slot evidence, neither decoded nor stored. `indexer_historical_retained_bytes_total`
+(report field `retained_bytes`) counts block bytes written to `historical_inputs` after
+unrelated transactions are pruned to their signatures; compare it with
+`indexer_input_bytes_total`. No per-signature metric labels are introduced.
 
 `repair_complete` never means verified full-slot coverage. Failed corrections hide
 prior output from normal reads while preserving it physically. Summary fields
