@@ -94,9 +94,10 @@ impl WriteStats {
 const BATCH_CAPTURES: &str = "INSERT INTO captures(signature,slot,result_json,capture_json,status,decoder_version)
                  SELECT s,sl,r,c,st,$6 FROM unnest($1::text[],$2::bigint[],$3::text[],$4::bytea[],$5::text[]) AS u(s,sl,r,c,st)
                  ON CONFLICT(signature) DO NOTHING RETURNING signature";
-// Copies the payload from the captures just inserted, so it is uploaded once, not twice.
+// A first observation's payload is the captures row just inserted: NULL references it
+// (migration 0013), so the payload is stored once.
 const BATCH_INPUTS: &str = "INSERT INTO capture_inputs(signature,source,result_digest,slot,result_json,capture_json,status)
-                 SELECT c.signature,u.source,u.digest,c.slot,c.result_json,c.capture_json,c.status
+                 SELECT c.signature,u.source,u.digest,c.slot,NULL,NULL,c.status
                  FROM unnest($1::text[],$2::text[],$3::bytea[]) AS u(signature,source,digest)
                  JOIN captures c ON c.signature=u.signature ORDER BY c.signature
                  ON CONFLICT(signature,source,result_digest) DO UPDATE SET status=excluded.status";
@@ -998,6 +999,18 @@ fn insert_transfer_rows(
     Ok(counts)
 }
 
+/// Copies the current captures payload into first-observation input rows that reference it
+/// (NULL payload, migration 0013). Runs before every write that changes a captures payload,
+/// so recorded inputs keep their exact bytes.
+pub(crate) fn materialize_inputs(tx: &mut impl GenericClient, signature: &str) -> Result<()> {
+    tx.execute(
+        "UPDATE capture_inputs i SET result_json=c.result_json,capture_json=c.capture_json FROM captures c WHERE c.signature=i.signature AND i.signature=$1 AND i.result_json IS NULL",
+        &[&signature],
+    )
+    .map(drop)
+    .map_err(write_failed)
+}
+
 /// Reconciles an observation of an already stored transaction inside the caller's
 /// savepoint. `Err` rolls the item back; `Ok(result)` keeps its writes, including a
 /// durable quarantine receipt when `result` is an error.
@@ -1116,6 +1129,7 @@ fn reconcile_repeat(
         // Quarantine is durable, but existing logical query results remain unchanged.
         return Ok(Err(error));
     }
+    materialize_inputs(tx, signature)?;
     tx.execute(
         "UPDATE captures SET result_json=$1 WHERE signature=$2",
         &[&reference, &signature],
@@ -1138,6 +1152,7 @@ fn reconcile_repeat(
     if decoded.is_err() {
         return Ok(Ok(0));
     }
+    materialize_inputs(tx, signature)?;
     tx.execute(
         "UPDATE captures SET capture_json=$1,status=$2 WHERE signature=$3",
         &[&raw, &status, &signature],

@@ -22,6 +22,10 @@ pub(crate) const MIGRATIONS: &[(i32, &str)] = &[
     (10, include_str!("migrations/0010_gap_fill.sql")),
     (11, include_str!("migrations/0011_sampling.sql")),
     (12, include_str!("migrations/0012_mint_context.sql")),
+    (
+        13,
+        include_str!("migrations/0013_capture_input_reference.sql"),
+    ),
 ];
 
 /// Connection errors are reduced to a class: driver messages can echo the URL or credentials.

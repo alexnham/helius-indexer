@@ -873,3 +873,134 @@ fn coverage_gap_list_is_bounded_while_counts_stay_exact() {
     assert_eq!(coverage["missing_ranges_truncated"], true);
     assert_eq!(coverage["covered_range_count"], 151);
 }
+
+/// The captured transfer as observed by `source`, with signature `index` at `slot`.
+fn observation(index: u8, source: &str, slot: u64) -> (Capture, Vec<u8>, Result<Vec<Transfer>>) {
+    let mut value: serde_json::Value =
+        serde_json::from_slice(include_bytes!("../../tests/fixtures/mainnet-transfer.json"))
+            .unwrap();
+    value["result"]["transaction"]["signatures"][0] =
+        bs58::encode([index; 64]).into_string().into();
+    value["result"]["slot"] = slot.into();
+    value["source"] = source.into();
+    let raw = serde_json::to_vec(&value).unwrap();
+    let capture = crate::decoder::parse_capture(&raw).unwrap();
+    let decoded = crate::decoder::decode(&capture);
+    (capture, raw, decoded)
+}
+
+#[test]
+fn a_first_observation_references_captures_and_keeps_its_bytes_when_captures_changes() {
+    let db = pg::TestDatabase::new();
+    let mut store = Store::open(&db.0).unwrap();
+    let (capture, raw, decoded) = observation(7, "solana-mainnet-rpc", 400);
+    store.persist(&capture, &raw, &decoded).unwrap();
+    let signature = capture.result.transaction.signatures[0].clone();
+    let mut sql = db.0.test_client();
+    let input = |sql: &mut Client, source: &str| -> (Option<String>, Option<Vec<u8>>) {
+        let row = sql
+            .query_one(
+                "SELECT result_json,capture_json FROM capture_inputs WHERE signature=$1 AND source=$2",
+                &[&signature, &source],
+            )
+            .unwrap();
+        (row.get(0), row.get(1))
+    };
+    // Stored once: the input row references the captures payload.
+    assert_eq!(input(&mut sql, "solana-mainnet-rpc"), (None, None));
+    let row = sql
+        .query_one(
+            "SELECT result_json,capture_json FROM captures WHERE signature=$1",
+            &[&signature],
+        )
+        .unwrap();
+    let (original_result, original_raw): (String, Vec<u8>) = (row.get(0), row.get(1));
+    assert_eq!(original_raw, raw);
+    let mut log = replay::JobLog::open(&db.0).unwrap();
+    assert_eq!(
+        log.slot_captures(400, "solana-mainnet-rpc").unwrap()[&signature].0,
+        raw
+    );
+    // A second source's observation reconciles and rewrites the captures payload; the
+    // first observation's exact bytes are copied into its input row first.
+    let (other, other_raw, other_decoded) = observation(7, "fixture", 400);
+    store.persist(&other, &other_raw, &other_decoded).unwrap();
+    assert_eq!(
+        input(&mut sql, "solana-mainnet-rpc"),
+        (Some(original_result), Some(raw.clone()))
+    );
+    assert_eq!(
+        log.slot_captures(400, "solana-mainnet-rpc").unwrap()[&signature].0,
+        raw
+    );
+    assert_eq!(
+        log.slot_captures(400, "fixture").unwrap()[&signature].0,
+        other_raw
+    );
+}
+
+#[test]
+fn an_input_row_with_its_own_payload_is_read_as_stored() {
+    let db = pg::TestDatabase::new();
+    let mut store = Store::open(&db.0).unwrap();
+    let (capture, raw, decoded) = observation(8, "solana-mainnet-rpc", 401);
+    store.persist(&capture, &raw, &decoded).unwrap();
+    let signature = capture.result.transaction.signatures[0].clone();
+    // Rows written before migration 0013 carry their own bytes.
+    let legacy = b"{\"legacy\":true}".to_vec();
+    db.0.test_client()
+        .execute(
+            "UPDATE capture_inputs SET result_json='{}',capture_json=$2 WHERE signature=$1",
+            &[&signature, &legacy],
+        )
+        .unwrap();
+    let mut log = replay::JobLog::open(&db.0).unwrap();
+    assert_eq!(
+        log.slot_captures(401, "solana-mainnet-rpc").unwrap()[&signature].0,
+        legacy
+    );
+    // Half a payload is rejected.
+    assert!(
+        db.0.test_client()
+            .execute(
+                "UPDATE capture_inputs SET capture_json=NULL WHERE signature=$1",
+                &[&signature],
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn retention_drops_a_referencing_input_row_with_its_capture() {
+    let db = pg::TestDatabase::new();
+    let mut store = Store::open(&db.0).unwrap();
+    let (old, old_raw, old_decoded) = observation(9, "solana-mainnet-rpc", 402);
+    let (new, new_raw, new_decoded) = observation(10, "solana-mainnet-rpc", 403);
+    store.persist(&old, &old_raw, &old_decoded).unwrap();
+    store.persist(&new, &new_raw, &new_decoded).unwrap();
+    let kept = new_decoded.unwrap().len();
+    Store::prune(&db.0, kept).unwrap();
+    let mut sql = db.0.test_client();
+    for (signature, expected) in [
+        (&old.result.transaction.signatures[0], 0i64),
+        (&new.result.transaction.signatures[0], 1),
+    ] {
+        for table in ["captures", "capture_inputs"] {
+            let count: i64 = sql
+                .query_one(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE signature=$1"),
+                    &[signature],
+                )
+                .unwrap()
+                .get(0);
+            assert_eq!(count, expected, "{table}");
+        }
+    }
+    let mut log = replay::JobLog::open(&db.0).unwrap();
+    assert_eq!(
+        log.slot_captures(403, "solana-mainnet-rpc").unwrap()
+            [&new.result.transaction.signatures[0]]
+            .0,
+        new_raw
+    );
+}
