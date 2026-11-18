@@ -200,15 +200,10 @@ fn retained_blocks_keep_unrelated_transactions_as_signatures_and_replay_offline(
     for workers in [1, 2] {
         let (_dir, path) = db();
         let mut source = source(vec![(slot, raw.clone())]);
-        let checks = Cell::new(0);
-        let mut history = parallel_history(&path, workers);
-        let (_, metrics) = history
-            .run(&mint(), slot, slot, &mut source, || {
-                checks.set(checks.get() + 1);
-                checks.get() > 1
-            })
+        let (coverage, metrics) = parallel_history(&path, workers)
+            .run(&mint(), slot, slot, &mut source, || false)
             .unwrap();
-        assert!(metrics.cancelled);
+        assert!(coverage.complete);
         let row = path
             .test_client()
             .query_one("SELECT pruned,response FROM historical_inputs", &[])
@@ -226,7 +221,15 @@ fn retained_blocks_keep_unrelated_transactions_as_signatures_and_replay_offline(
             json!(bs58::encode([7; 32]).into_string())
         );
         assert!(metrics.retained_bytes > 0 && metrics.retained_bytes < metrics.input_bytes);
-        // The pruned block alone completes the slot: same transfers, same block identity.
+        // The state a cancellation after the raw acknowledgment leaves, minus every decoded
+        // row: the pruned block alone must recreate the output and match the block identity.
+        sql(
+            &path,
+            "DELETE FROM transfers; DELETE FROM capture_inputs; DELETE FROM captures; \
+             UPDATE historical_slots SET status='unknown', error_class='cancelled'; \
+             DELETE FROM historical_source_slots;",
+        );
+        assert!(Store::query(&path, None, 1000).unwrap().is_empty());
         source.blocks.clear();
         let (coverage, metrics) = parallel_history(&path, workers)
             .run(&mint(), slot, slot, &mut source, || false)
