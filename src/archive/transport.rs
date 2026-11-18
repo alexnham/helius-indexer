@@ -16,6 +16,8 @@ const MAX_CHUNK: usize = 16 * 1024 * 1024;
 /// Slots whose index records one prefetch reads in a single request (12 bytes each).
 const PREFETCH_SLOTS: u64 = 64;
 const EPOCH_SLOTS: u64 = 432000;
+/// Largest range one prefetch request covers; pieces of a window download concurrently.
+const PIECE_BYTES: usize = 8 * 1024 * 1024;
 /// (slot, CAR offset, length, 12-byte index record).
 type IndexEntry = (u64, u64, u32, Vec<u8>);
 static FILE_ID: AtomicU64 = AtomicU64::new(0);
@@ -110,63 +112,31 @@ impl ArchiveSource {
             .map(|d| d.min(Duration::from_secs(20)))
             .ok_or(Error("archive_time_limit"))
     }
-    fn fetch(&mut self, path: &str, offset: u64, length: usize) -> Result<Vec<u8>> {
+    /// Counts one request of `length` bytes against the limits, beyond `reserved` bytes
+    /// already admitted but not yet read, and returns its deadline.
+    fn admit(&mut self, offset: u64, length: usize, reserved: u64) -> Result<Duration> {
         if !self.network {
             return Err(Error("archive_cache_miss"));
         }
         if length == 0
             || length > MAX_CHUNK
             || self.stats.requests >= self.limits.requests
-            || self.stats.response_body_bytes + length as u64 + 1 > self.limits.bytes
+            || self.stats.response_body_bytes + reserved + length as u64 + 1 > self.limits.bytes
         {
             return Err(Error("archive_download_limit"));
         }
         let timeout = self.request_timeout()?;
-        let end = offset
+        offset
             .checked_add(length as u64 - 1)
             .ok_or(Error("archive_invalid_range"))?;
         self.stats.requests += 1;
-        let mut response = self
-            .agent
-            .get(format!("{ORIGIN}/{path}"))
-            .header("Range", format!("bytes={offset}-{end}"))
-            .header("Accept-Encoding", "identity")
-            .config()
-            .timeout_global(Some(timeout))
-            .build()
-            .call()
-            .map_err(|_| Error("archive_request_failed"))?;
-        match response.status().as_u16() {
-            403 => return Err(Error("archive_access_denied")),
-            404 => return Err(Error("archive_object_unavailable")),
-            206 => {}
-            _ => return Err(Error("archive_range_not_honored")),
-        }
-        let range = response
-            .headers()
-            .get("content-range")
-            .and_then(|h| h.to_str().ok())
-            .ok_or(Error("archive_invalid_content_range"))?;
-        validate_range(range, offset, end)?;
-        if response
-            .headers()
-            .get("content-encoding")
-            .is_some_and(|h| h != "identity")
-        {
-            return Err(Error("archive_unexpected_encoding"));
-        }
-        let mut bytes = Vec::new();
-        let read = response
-            .body_mut()
-            .as_reader()
-            .take(length as u64 + 1)
-            .read_to_end(&mut bytes);
-        self.stats.response_body_bytes += bytes.len() as u64;
-        read.map_err(|_| Error("archive_read_failed"))?;
-        if bytes.len() != length {
-            return Err(Error("archive_truncated_range"));
-        }
-        Ok(bytes)
+        Ok(timeout)
+    }
+    fn fetch(&mut self, path: &str, offset: u64, length: usize) -> Result<Vec<u8>> {
+        let timeout = self.admit(offset, length, 0)?;
+        let (bytes, read) = get(&self.agent, path, offset, length, timeout);
+        self.stats.response_body_bytes += read;
+        bytes
     }
     pub(super) fn probe_epoch(&mut self, epoch: u64) -> Result<bool> {
         if !self.network {
@@ -317,16 +287,62 @@ impl ArchiveSource {
                 wanted.push((s, offset, length, record.to_vec()));
             }
         }
-        for run in contiguous_runs(wanted) {
+        // Pieces are admitted in order against the budget, then downloaded concurrently.
+        let path = format!("{epoch}/epoch-{epoch}.car");
+        let (mut admitted, mut refused, mut reserved) = (Vec::new(), None, 0);
+        for run in contiguous_runs(wanted, PIECE_BYTES) {
             let base = run[0].1;
-            let span = run.last().map(|e| e.1 + u64::from(e.2) - base).unwrap();
-            let bytes = self.fetch(&format!("{epoch}/epoch-{epoch}.car"), base, span as usize)?;
-            for (s, offset, length, record) in run {
-                let at = (offset - base) as usize;
-                self.store(s, offset, length, record, &bytes[at..at + length as usize])?;
+            let span = run.last().map(|e| e.1 + u64::from(e.2) - base).unwrap() as usize;
+            match self.admit(base, span, reserved) {
+                Ok(timeout) => {
+                    reserved += span as u64;
+                    admitted.push((base, span, timeout, run));
+                }
+                Err(error) => {
+                    refused = Some(error);
+                    break;
+                }
             }
         }
-        Ok(())
+        // Each piece's thread also caches its slots, so their file syncs overlap.
+        let this = &*self;
+        let path = &path;
+        let pieces: Vec<(Result<()>, u64)> = std::thread::scope(|scope| {
+            let handles: Vec<_> = admitted
+                .into_iter()
+                .map(|(base, span, timeout, run)| {
+                    scope.spawn(move || {
+                        let (bytes, read) = get(&this.agent, path, base, span, timeout);
+                        let stored = bytes.and_then(|bytes| {
+                            run.into_iter().try_for_each(|(s, offset, length, record)| {
+                                let at = (offset - base) as usize;
+                                let raw = &bytes[at..at + length as usize];
+                                this.store(s, offset, length, record, raw).map(drop)
+                            })
+                        });
+                        (stored, read)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| {
+                    h.join()
+                        .unwrap_or((Err(Error("archive_request_failed")), 0))
+                })
+                .collect()
+        });
+        let mut first_error = None;
+        for (stored, read) in pieces {
+            self.stats.response_body_bytes += read;
+            if let Err(error) = stored {
+                first_error.get_or_insert(error);
+            }
+        }
+        match first_error.or(refused) {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 }
 impl BlockSource for ArchiveSource {
@@ -437,6 +453,66 @@ fn normalized(
     }
     Ok(bytes)
 }
+/// One admitted range request; also returns the response body bytes read, for the stats.
+fn get(
+    agent: &ureq::Agent,
+    path: &str,
+    offset: u64,
+    length: usize,
+    timeout: Duration,
+) -> (Result<Vec<u8>>, u64) {
+    let end = offset + length as u64 - 1;
+    let response = agent
+        .get(format!("{ORIGIN}/{path}"))
+        .header("Range", format!("bytes={offset}-{end}"))
+        .header("Accept-Encoding", "identity")
+        .config()
+        .timeout_global(Some(timeout))
+        .build()
+        .call();
+    let mut response = match response {
+        Ok(response) => response,
+        Err(_) => return (Err(Error("archive_request_failed")), 0),
+    };
+    let checked = match response.status().as_u16() {
+        403 => Err(Error("archive_access_denied")),
+        404 => Err(Error("archive_object_unavailable")),
+        206 => response
+            .headers()
+            .get("content-range")
+            .and_then(|h| h.to_str().ok())
+            .ok_or(Error("archive_invalid_content_range"))
+            .and_then(|range| validate_range(range, offset, end)),
+        _ => Err(Error("archive_range_not_honored")),
+    }
+    .and_then(|()| {
+        if response
+            .headers()
+            .get("content-encoding")
+            .is_some_and(|h| h != "identity")
+        {
+            Err(Error("archive_unexpected_encoding"))
+        } else {
+            Ok(())
+        }
+    });
+    if let Err(error) = checked {
+        return (Err(error), 0);
+    }
+    let mut bytes = Vec::new();
+    let read = response
+        .body_mut()
+        .as_reader()
+        .take(length as u64 + 1)
+        .read_to_end(&mut bytes);
+    let count = bytes.len() as u64;
+    let result = match read {
+        Err(_) => Err(Error("archive_read_failed")),
+        Ok(_) if bytes.len() != length => Err(Error("archive_truncated_range")),
+        Ok(_) => Ok(bytes),
+    };
+    (result, count)
+}
 fn read_bounded(path: &Path, max: usize) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     fs::File::open(path)
@@ -486,14 +562,15 @@ fn decode_index(record: &[u8]) -> Result<(u64, u32)> {
     Ok((offset, length))
 }
 /// Groups (slot, offset, length, record) entries into runs fetched with one request: each
-/// block starts where the previous one ended, and a run spans at most 16 MiB.
-fn contiguous_runs(entries: Vec<IndexEntry>) -> Vec<Vec<IndexEntry>> {
+/// block starts where the previous one ended, and a run spans at most `max_span` bytes
+/// (a single larger block, up to 16 MiB, is its own run).
+fn contiguous_runs(entries: Vec<IndexEntry>, max_span: usize) -> Vec<Vec<IndexEntry>> {
     let mut runs: Vec<Vec<IndexEntry>> = Vec::new();
     for entry in entries {
         match runs.last_mut() {
             Some(run)
                 if run.last().is_some_and(|p| p.1 + u64::from(p.2) == entry.1)
-                    && entry.1 + u64::from(entry.2) - run[0].1 <= MAX_CHUNK as u64 =>
+                    && entry.1 + u64::from(entry.2) - run[0].1 <= max_span as u64 =>
             {
                 run.push(entry)
             }
@@ -528,21 +605,27 @@ mod tests {
         assert!(decode_index(&[1; 11]).is_err());
     }
     #[test]
-    fn only_adjacent_blocks_share_a_request_and_a_run_stays_under_16_mib() {
+    fn only_adjacent_blocks_share_a_request_and_a_run_stays_within_a_piece() {
         let e = |slot, offset, length: usize| (slot, offset, length as u32, vec![]);
         let starts = |runs: Vec<Vec<IndexEntry>>| {
             runs.iter()
                 .map(|r| r.iter().map(|e| e.0).collect::<Vec<_>>())
                 .collect::<Vec<_>>()
         };
-        // 1-2 adjacent; 3 leaves a gap; 4 is adjacent to 3 but would pass 16 MiB.
-        let runs = contiguous_runs(vec![
-            e(1, 100, 10),
-            e(2, 110, 5),
-            e(3, 200, MAX_CHUNK - 10),
-            e(4, 200 + MAX_CHUNK as u64 - 10, 11),
-        ]);
-        assert_eq!(starts(runs), vec![vec![1, 2], vec![3], vec![4]]);
+        // 1-2 adjacent; 3 leaves a gap; 4 is adjacent to 3 but would pass the piece size;
+        // 5 is larger than a piece on its own and still gets a run.
+        let piece = PIECE_BYTES as u64;
+        let runs = contiguous_runs(
+            vec![
+                e(1, 100, 10),
+                e(2, 110, 5),
+                e(3, 200, PIECE_BYTES - 10),
+                e(4, 200 + piece - 10, 11),
+                e(5, 201 + piece, PIECE_BYTES + 1),
+            ],
+            PIECE_BYTES,
+        );
+        assert_eq!(starts(runs), vec![vec![1, 2], vec![3], vec![4], vec![5]]);
     }
     #[test]
     fn offline_cache_miss_never_attempts_a_network() {
