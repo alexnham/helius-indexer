@@ -114,6 +114,18 @@ adapter tests are not claimed as captured block anchors. Full-block retained-inp
 recovery evidence and limitations are in `docs/rpc-evidence-recovery.md`.
 
 
+## Token-2022 mint setup
+
+`mainnet-mint-setup.json` is one successful finalized mainnet transaction from slot
+470015982, signature
+`3y8cT8wmCnF7nqVRBqRij57jFz7K6txF6iRKanjnqezKvQMLf1E6LPTFidMDfX52cMgTK7L7DCyxL9tGvYxRHBTU`,
+received from LaserStream replay in the 2026-11-17 #31 overlap run. Its inner
+instructions create a classic USDC account (18) and two Token-2022 mints (25, 35, 20).
+It moves no tokens, so the expected edge list is empty. `Program log:`, `Program data:`
+and `Program return:` lines were removed; invocation and success lines are kept.
+No credentials or provider URLs are included. A test rewrites tag 25 to 29 to check
+that unverified setup tags stay unsupported.
+
 ## Confidential transfer layouts (synthetic)
 
 `confidential-transfers.json` contains two synthetic finalized-envelope examples

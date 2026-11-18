@@ -111,6 +111,12 @@ side is unknown. The command needs replay credentials; with
 `INDEXER_LIVE_OPT_IN=1` and the archive feature it may also make the bounded
 `archive-tip` requests (at most four epoch probes under the default archive limits, plus a finalized reference from `SOLANA_RPC_URL`) using CACHE.
 
+For overlap verification, `INDEXER_ROUTE_ARCHIVE=always` probes the archive even when
+replay serves the whole job, so a job inside both windows routes as `overlap` and
+`replay-archive` plus `replay-overlap` can reconcile it. Without it a measured overlap
+cannot arise: the archive is probed only for a job starting before replay's first slot,
+and replay refuses such a job.
+
 Each measurement appends a revision (migration 6): replay first-available, reference
 slot, archive probe result and segments. Archive serves slots up to its last
 available slot, replay serves first-available through the reference, both is
@@ -127,8 +133,11 @@ above by restoring the pre-upgrade backup.
 
 ## Archive batches
 
-`replay-archive` takes the latest route revision and processes the first up to
-eight incomplete slots of its `archive` or `overlap` segments, within one segment,
+`replay-archive` takes the latest route revision and processes up to eight
+incomplete slots of its `archive` or `overlap` segments, within one segment, starting
+at the pending slot with the fewest attempts (earliest first). Untried slots therefore
+go before retries, and a slot that stays `unknown` cannot stall later batches; it stays
+pending and unverified, so `verified_through` never passes it. The batch runs
 through the shared History path: retained raw input, shared decoder and storage,
 and per-slot `complete`/`skipped`/`unknown` status from full blocks. A job with no
 route is refused; a job whose route has no pending archive slots charges nothing.
@@ -191,7 +200,7 @@ route and decoder revision:
 | Outcome | Meaning |
 | --- | --- |
 | `consistent` | Every replay-delivered signature is in the archive block with identical decoded transfers (identity, raw amounts, fees, confidentiality, instruction positions); block time is compared only when both sides have it. |
-| `replay_omission` | As above, and the archive block has mint transactions replay never delivered. Archive is authoritative on membership. |
+| `replay_omission` | As above, and the archive block has successful mint transactions replay never delivered. Archive is authoritative on membership. Failed transactions are left out, as the replay filter excludes them and they move no tokens. |
 | `conflict` | `replay_not_in_archive` (a replay signature missing from a complete archive block) or `effects_differ`. Fails closed and stays visible. |
 | `pending` | The archive slot is incomplete, a replay input is unresolved or no longer retained, or the stored output's decoder revision differs. |
 

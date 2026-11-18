@@ -90,7 +90,7 @@ Block-time policy (reviewed 2026-11-14):
 - The server computes each cutoff from an injected clock and returns the cutoff in the response.
 - Requirements change (2026-11-14): the 30-day window is the default for the CLI `query`, `query-recent` and `summary`. The `--all-stored` flag is an explicit exception: it is a local captured-data inspection mode over every retained row, including rows up to 37 days old and rows with unknown block time, and returns the pre-window output shape with `coverage: "unknown"`. It is not query-eligible, must not be exposed by any served API, and a served API must default to the window.
 
-Provisionally retain matched raw transactions for 37 days: 30 days of query history plus a seven-day repair margin. Compressed object storage is the candidate raw store. Preserve instructions, inner instructions, relevant execution metadata, source provenance, and schema/version information needed to repeat decoding. Size and validate this policy before production. For historical blocks the retained raw unit is the full block; a per-transaction capture is kept only for a transaction that produced transfers or touches the mint, and anything else is recovered by replaying the retained block.
+Provisionally retain matched raw transactions for 37 days: 30 days of query history plus a seven-day repair margin. Compressed object storage is the candidate raw store. Preserve instructions, inner instructions, relevant execution metadata, source provenance, and schema/version information needed to repeat decoding. Size and validate this policy before production.
 
 The initial API provides:
 
@@ -128,7 +128,9 @@ The owner chose to build for horizontal scale ahead of measured need, supersedin
 
 Locally these run in Docker; production uses managed equivalents through configuration. Supporting load figures: [USDC load measurement](docs/validation/2026-11-13-usdc-load.md). Each step still needs the crash, duplicate, and coverage checks in this proposal.
 
-Unresolved: matched transactions currently persist transfers of every mint they contain (about 40% were USDC in the measured sample). Decide whether to filter to configured mints at write time or keep related-mint transfers.
+Historical full blocks (archive, `getBlock`) store only transactions that touch the job's mint, the same predicate as the replay filter, so live, replay and historical input select the same transactions; the whole block is still read for slot evidence.
+
+A session fixes its indexed mint before admitting input (`mint-init`, or `sample-init` for a sampled dataset). Only that mint's transfers are transfer records. Other mints' transfers in a transaction with at least one stored indexed transfer are kept as **context** (`transfer_context`), returned beside the transfers they accompany and never counted, summed or covered: those mints are seen only where the indexed mint is. A session that admitted input before fixing a mint keeps storing every mint's transfers. Decision recorded 2026-11-17 (#39).
 
 ## Rust package organization
 

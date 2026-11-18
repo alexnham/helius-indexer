@@ -9,8 +9,8 @@ dated report that holds the command, dataset, environment and full results.
 
 | # | Run | Ticket | Proves | Status |
 | --- | --- | --- | --- | --- |
-| 1 | Live demo (`docker compose up`, defaults) | [#73](https://github.com/alexnham/helius-indexer/issues/73) | Live intake → Kafka → consumer → dashboard, end to end | Next |
-| 2 | Bounded archive/replay overlap | [#31](https://github.com/alexnham/helius-indexer/issues/31) | Old Faithful data and the archive-to-live seam are correct | Planned |
+| 1 | Live demo (`docker compose up`, defaults) | [#73](https://github.com/alexnham/helius-indexer/issues/73) | Live intake → Kafka → consumer → dashboard, end to end | [Done](2026-11-16-live-demo.md) |
+| 2 | Bounded archive/replay overlap | [#31](https://github.com/alexnham/helius-indexer/issues/31) | Old Faithful data and the archive-to-live seam are correct | [Done](2026-11-17-provider-overlap.md): 50 of 50 slots `consistent` under decoder v7 |
 | 3 | One-day 10% sample | [#72](https://github.com/alexnham/helius-indexer/issues/72) | Throughput, disk and cost per day, to size run 4 | Planned |
 | 4 | 30-day backfill, one mint | [#70](https://github.com/alexnham/helius-indexer/issues/70) | The full deliverable | Needs spend approval |
 
@@ -18,7 +18,10 @@ dated report that holds the command, dataset, environment and full results.
 
 | Date | Run | Source | Headline result | Report |
 | --- | --- | --- | --- | --- |
-| 2026-11-18 | Historical block write throughput | local | Batched block writes: 118 → ~830 tx/s when every transaction transfers the mint, 151 → ~2,900 tx/s when 1 in 20 does | [report](2026-11-18-historical-block-throughput.md) |
+| 2026-11-18 | Historical block write throughput | local | Batched block writes: 97 → 723–995 tx/s when every transaction transfers the mint, 1,223 → 2,721–3,650 tx/s when 1 in 20 does | [report](2026-11-18-historical-block-throughput.md) |
+| 2026-11-18 | Archive/replay overlap under v7 (#31) | provider | 50 of 50 slots `consistent`, 0 conflicts, verified through 470015999 | [report](2026-11-17-provider-overlap.md#final-run-under-decoder-v7-2026-11-18-0245-utc) |
+| 2026-11-17 | Archive/replay overlap (#31) | provider | 47 of 50 slots reconciled after #105, 0 conflicts; 3 slots unknown (unsupported instruction); omissions are failed transactions (checked on one slot) | [report](2026-11-17-provider-overlap.md) |
+| 2026-11-16 | Live demo, first run (#73) | provider + local | 93–117 tx/s live intake; consumer kept up at 91/s; 1.9% of replay inputs unresolved; found #99 and #100 | [report](2026-11-16-live-demo.md) |
 | 2026-11-14 | Kafka consumer-group throughput | local + hosted | Loopback 1,339 tx/s with one consumer; hosted PostgreSQL 65–72 tx/s, below the ~80 tx/s USDC load | [report](2026-11-14-kafka-consumer-throughput.md) |
 | 2026-11-14 | Hosted PostgreSQL TLS and latency | hosted | One writer 0.98 tx/s; batches of 100 reach 45 tx/s | [report](2026-11-14-hosted-postgres-tls.md) |
 | 2026-11-14 | Archive/replay routing and overlap | offline | Routing, archive batches and reconciliation pass offline; no provider measured | [report](2026-11-14-archive-routing.md) |

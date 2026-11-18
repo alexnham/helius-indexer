@@ -50,6 +50,31 @@ fn sql(path: &Database, query: &str) {
 }
 
 #[test]
+fn a_full_block_stores_only_transactions_that_touch_the_mint() {
+    let (_dir, path) = db();
+    let usdc = fixture()["result"].clone();
+    let slot = usdc["slot"].as_u64().unwrap();
+    // The same transaction for another mint, with its own signature.
+    let other = bs58::encode([9; 32]).into_string();
+    let mut unrelated: Value =
+        serde_json::from_str(&usdc.to_string().replace(&mint(), &other)).unwrap();
+    unrelated["transaction"]["signatures"][0] = json!(bs58::encode([5; 64]).into_string());
+    let mut source = source(vec![(slot, block(slot, slot - 1, vec![usdc, unrelated]))]);
+    let (coverage, metrics) = History::open(&path)
+        .unwrap()
+        .run(&mint(), slot, slot, &mut source, || false)
+        .unwrap();
+    assert!(coverage.complete, "the slot is still read whole");
+    assert_eq!(metrics.unrelated_transactions, 1);
+    assert_eq!(metrics.decoded_transactions, 1);
+    let expected = decoder::decode(
+        &decoder::parse_capture(include_bytes!("fixtures/mainnet-transfer.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(Store::query(&path, None, 1000).unwrap(), expected);
+}
+
+#[test]
 fn captured_input_and_historical_block_have_identical_queries_and_restart_is_a_noop() {
     let (_dir, path) = db();
     let slot = fixture()["result"]["slot"].as_u64().unwrap();
@@ -695,45 +720,6 @@ fn numbered(n: u64, related: bool) -> Value {
     tx
 }
 
-#[test]
-fn unrelated_transactions_without_output_stay_only_in_the_retained_block() {
-    let (_dir, path) = db();
-    let slot = fixture()["result"]["slot"].as_u64().unwrap();
-    let mut related_failure = numbered(2, true);
-    related_failure["meta"]["err"] = json!({"InstructionError": [0, {"Custom": 1}]});
-    let txs = vec![numbered(1, true), related_failure, numbered(3, false)];
-    let mut source = source(vec![(slot, block(slot, slot - 1, txs))]);
-    let (coverage, metrics) = History::open(&path)
-        .unwrap()
-        .run(&mint(), slot, slot, &mut source, || false)
-        .unwrap();
-    assert!(coverage.complete);
-    assert_eq!(metrics.decoded_transactions, 3);
-    assert_eq!(Store::query(&path, Some(&mint()), 100).unwrap().len(), 2);
-    let mut db = path.test_client();
-    let stored: Vec<String> = db
-        .query("SELECT signature FROM captures ORDER BY signature", &[])
-        .unwrap()
-        .iter()
-        .map(|r| r.get(0))
-        .collect();
-    let mut expected: Vec<String> = [1, 2]
-        .map(|n| {
-            numbered(n, true)["transaction"]["signatures"][0]
-                .as_str()
-                .unwrap()
-                .into()
-        })
-        .into();
-    expected.sort();
-    assert_eq!(stored, expected);
-    let retained: i64 = db
-        .query_one("SELECT COUNT(*) FROM historical_inputs", &[])
-        .unwrap()
-        .get(0);
-    assert_eq!(retained, 1);
-}
-
 /// Local write throughput for historical blocks: `cargo test --release --test backfill
 /// historical_block_throughput -- --ignored --nocapture`. Prints, never asserts, rates
 /// for blocks where every transaction transfers the mint and where one in twenty does.
@@ -761,7 +747,10 @@ fn historical_block_throughput() {
             .unwrap();
         let seconds = began.elapsed().as_secs_f64();
         assert!(coverage.complete);
-        assert_eq!(metrics.decoded_transactions, SLOTS * PER_BLOCK);
+        assert_eq!(
+            metrics.decoded_transactions + metrics.unrelated_transactions,
+            SLOTS * PER_BLOCK
+        );
         println!(
             "historical_block_throughput: 1 in {related_every} related, {} tx in {seconds:.2} s = {:.0} tx/s",
             SLOTS * PER_BLOCK,

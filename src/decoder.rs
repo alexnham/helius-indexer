@@ -4,7 +4,7 @@ use std::collections::HashSet;
 
 pub const SPL_TOKEN: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 pub const TOKEN_2022: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
-pub const DECODER_VERSION: &str = "token-transfers-v6";
+pub const DECODER_VERSION: &str = "token-transfers-v7";
 pub const MAX_CAPTURE_BYTES: usize = 16 * 1024 * 1024;
 
 pub fn parse_capture(bytes: &[u8]) -> Result<Capture> {
@@ -344,6 +344,8 @@ fn decode_instruction(
             ),
             3 | 12 => return Err(Error("invalid_transfer_instruction")),
             0..=24 => return Ok(()),
+            // InitializeMintCloseAuthority and InitializePermanentDelegate configure a mint.
+            25 | 35 if program == TOKEN_2022 => return Ok(()),
             _ => return Err(Error("unsupported_token_instruction")),
         }
     };

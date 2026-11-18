@@ -96,10 +96,7 @@ the new progress table exists.
 Correction invalidates any existing current-revision completed historical slot
 at that position, across mint scopes. Only a full retained-block replay can
 verify produced/empty/skipped coverage again. The repaired stream tail stays
-unverified even when captured transfers decode successfully. Historical block
-processing keeps no capture for a transaction that produced no transfers and does
-not touch the mint, so capture repair never sees it; if a later revision would emit
-transfers for such a transaction, only retained-block replay finds them.
+unverified even when captured transfers decode successfully.
 
 Capture batches return attempted/corrected/unresolved and replaced/written row
 counts, cancellation, a run ID, and scoped progress. Structured correction and

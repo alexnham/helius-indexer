@@ -124,6 +124,24 @@ class RuntimeConsole(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 RUNTIME.initialize(session, binary, exact, CONSOLE_MINT, 25)
 
+    def test_exact_runtime_fixes_its_mint_once_and_keeps_older_sessions_unfiltered(self):
+        with tempfile.TemporaryDirectory() as directory:
+            session = Path(directory)
+            binary = ROOT / "target/debug/helius-indexer"
+            fresh, older = database(), database()
+            RUNTIME.initialize(session, binary, fresh, CONSOLE_MINT)
+            RUNTIME.initialize(session, binary, fresh, CONSOLE_MINT)
+            policy = RUNTIME.CONSOLE.command(session, "sample-status", fresh)
+            self.assertEqual((policy["policy"], policy["mint"]), ("exact", CONSOLE_MINT))
+            self.assertEqual(RUNTIME.CONSOLE.command(session, "query", fresh)["context"], {})
+            with self.assertRaises(ValueError):
+                RUNTIME.initialize(session, binary, fresh, "So11111111111111111111111111111111111111112")
+            # A session that admitted input before it fixed a mint keeps storing every mint.
+            RUNTIME.initialize(session, binary, older)
+            RUNTIME.CONSOLE.command(session, "ingest", older, ROOT / "tests/fixtures/mainnet-transfer.json")
+            RUNTIME.initialize(session, binary, older, CONSOLE_MINT)
+            self.assertNotIn("mint", RUNTIME.CONSOLE.command(session, "sample-status", older))
+
     def test_independent_sample_checks_retained_instruction_values(self):
         spec = importlib.util.spec_from_file_location("comparison", ROOT / "scripts/compare-captured-usdc.py")
         comparison = importlib.util.module_from_spec(spec)

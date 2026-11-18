@@ -142,12 +142,20 @@ fn all_stored_includes_rows_past_the_window_and_unknown_time_rows() {
 #[test]
 fn all_stored_output_keeps_the_pre_window_key_set() {
     // Plus `sampling` (from the sampled demo): no output may present sampled data as exact.
+    // Plus `context`: other mints' transfers in the listed transactions (#39).
     let db = TestDatabase::new();
     let session = three_rows(&db);
     let query = ok(cli(&session, &["query", "--all-stored"]));
     assert_eq!(
         keys(&query),
-        sorted(&["coverage", "limit", "live", "sampling", "transfers"])
+        sorted(&[
+            "context",
+            "coverage",
+            "limit",
+            "live",
+            "sampling",
+            "transfers"
+        ])
     );
     assert_eq!(query["coverage"], "unknown");
     assert_eq!(query["limit"], 1000);
@@ -155,6 +163,7 @@ fn all_stored_output_keeps_the_pre_window_key_set() {
     assert_eq!(
         keys(&recent),
         sorted(&[
+            "context",
             "coverage",
             "limit",
             "live",

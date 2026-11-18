@@ -171,8 +171,17 @@ def initialize(session, binary, database, mint=None, percent=None, upgrade=False
     # The dataset policy is immutable; it must be set before any input is admitted.
     if percent is not None:
         CONSOLE.command(session, "sample-init", database, mint, percent)
+    elif mint is not None:
+        try:
+            # Fixes the indexed mint on a fresh session; a session with earlier input keeps
+            # storing every mint's transfers.
+            CONSOLE.command(session, "mint-init", database, mint)
+        except RuntimeError:
+            pass
     policy = CONSOLE.command(session, "sample-status", database)
     sampled = policy.get("policy") != "exact"
+    if policy.get("mint") not in (None, mint):
+        raise ValueError("Dataset sampling mode or mint does not match runtime configuration")
     if sampled != (percent is not None) or (sampled and (policy.get("mint"), policy.get("numerator")) != (mint, percent)):
         raise ValueError("Dataset sampling mode or mint does not match runtime configuration")
     return state

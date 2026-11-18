@@ -224,6 +224,8 @@ pub struct Metrics {
     pub retries: u64,
     pub decoded_transactions: u64,
     pub decoded_transfers: u64,
+    /// Block transactions that do not touch the mint: read for slot evidence, not stored.
+    pub unrelated_transactions: u64,
     pub decode_failures: u64,
     pub elapsed_seconds: f64,
     /// Successful decode attempts per elapsed second; not a benchmark result.
@@ -254,8 +256,8 @@ impl Metrics {
                 ))
         );
         output.push_str(&format!(
-            "indexer_historical_cached_blocks_total {}\n",
-            self.cached_blocks
+            "indexer_historical_cached_blocks_total {}\nindexer_historical_unrelated_transactions_total {}\n",
+            self.cached_blocks, self.unrelated_transactions
         ));
         let progress = &coverage.progress;
         output.push_str(&format!(
@@ -732,6 +734,12 @@ fn process_block(
             .ok_or(Error("invalid_block_transaction"))?;
         object.insert("slot".into(), json!(slot));
         object.insert("blockTime".into(), block["blockTime"].clone());
+        // A full block (archive, getBlock) holds every mint's transactions; keep the ones
+        // the replay filter would deliver, so historical and replay input store alike.
+        if !crate::replay::overlap::touches_mint(&result, mint) {
+            metrics.unrelated_transactions += 1;
+            continue;
+        }
         let mut capture = json!({"schema_version":1,"cluster":"mainnet-beta","commitment":"finalized","source":capture_source,"result":result});
         if let Some(provenance) = value
             .get("archive_provenance")
@@ -757,11 +765,6 @@ fn process_block(
                 Ok(transfers) => {
                     written_transactions += 1;
                     written_transfers += transfers.len() as u64;
-                    // An unrelated transaction without output stays only in the retained
-                    // block; overlap compares exactly the inputs `touches_mint` selects.
-                    if transfers.is_empty() && !crate::replay::overlap::touches_mint(tx, mint) {
-                        continue;
-                    }
                     pending_bytes += bytes.len();
                     pending.push((parsed, bytes, decoded));
                     if pending.len() >= BATCH_INPUTS || pending_bytes >= crate::live::BATCH_BYTES {

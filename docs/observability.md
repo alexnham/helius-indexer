@@ -231,7 +231,9 @@ corrected/unresolved outcomes, replaced/written rows, cancellation, and run ID.
 `retained_capture`, mode `repair`, bounded classes, and run correlation. Offline
 block re-verification uses source `retained_block` and shared run correlation.
 `indexer_historical_cached_blocks_total` counts reused blocks separately from
-source requests. No per-signature metric labels are introduced.
+source requests. `indexer_historical_unrelated_transactions_total` (report field
+`unrelated_transactions`) counts block transactions that do not touch the job's mint:
+read for slot evidence, neither decoded nor stored. No per-signature metric labels are introduced.
 
 `repair_complete` never means verified full-slot coverage. Failed corrections hide
 prior output from normal reads while preserving it physically. Summary fields

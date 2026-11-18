@@ -156,3 +156,33 @@ fn captured_rpc_and_archive_authority_observations_reconcile_in_either_order() {
         );
     }
 }
+
+#[test]
+fn token_2022_mint_setup_is_recognized_and_other_extension_tags_stay_unsupported() {
+    let cases: Vec<Value> =
+        serde_json::from_slice(include_bytes!("fixtures/mainnet-mint-setup.json")).unwrap();
+    let mut capture = cases[0]["capture"].clone();
+    let raw = serde_json::to_vec(&capture).unwrap();
+    let rows = decoder::decode(&decoder::parse_capture(&raw).unwrap()).unwrap();
+    assert_eq!(rows.len(), cases[0]["expected"].as_array().unwrap().len());
+
+    // Reallocate (29) is not in the captured evidence and stays unsupported.
+    let bytes = |d: &Value| bs58::decode(d.as_str().unwrap()).into_vec().unwrap();
+    let data = capture["result"]["meta"]["innerInstructions"][0]["instructions"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .map(|ix| &mut ix["data"])
+        .find(|d| bytes(d)[0] == 25)
+        .unwrap();
+    let mut bytes = bytes(data);
+    bytes[0] = 29;
+    *data = bs58::encode(bytes).into_string().into();
+    let raw = serde_json::to_vec(&capture).unwrap();
+    assert_eq!(
+        decoder::decode(&decoder::parse_capture(&raw).unwrap())
+            .unwrap_err()
+            .0,
+        "unsupported_token_instruction"
+    );
+}
