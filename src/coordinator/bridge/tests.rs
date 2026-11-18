@@ -296,7 +296,7 @@ fn elapsed_budget_rotates_scheduling_without_advancing_verified_coverage() {
         || {
             let n = checks.get();
             checks.set(n + 1);
-            n > 3
+            n > 4
         },
         8,
     )
