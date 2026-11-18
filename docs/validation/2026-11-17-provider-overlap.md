@@ -93,3 +93,31 @@ counted); that cause was checked against RPC for slot 470015957 only.
 
 Criterion 4: 47 of 50 slots reconciled with no conflicting transfer. The remaining
 3 need #60.
+
+## Final run under decoder v7 (2026-11-18 02:45 UTC)
+
+After #108 (failed transactions are left out of membership) and #109 (decoder v7
+recognizes Token-2022 tags 25 and 35), from `main` at 4e737ac:
+
+1. Offline repair of the session: `repair` over 470015950–470015999 in 37 batches
+   (3,677 captures), then `repair-history-archive`. All 50 archive slots `complete`,
+   including 470015950, 470015953 and 470015982.
+2. A job is fixed to its decoder revision (`replay_decoder_mismatch` for the v6 job),
+   so a new job `overlap_v7_470015950` over the same slots ran route, one 60 s replay
+   grant, retry, archive batches, `replay-overlap`.
+
+| Check | Result |
+| --- | --- |
+| Route | Replay first available 469908295; archive last 470447999; all 50 slots `overlap` |
+| Replay | 705 received in 12.1 s, 6.6 MB; 704 unique inputs, 704 decoded, 0 unresolved |
+| Archive | 0 requests: every slot already complete in shared history |
+| Overlap outcomes | **50 `consistent`**, 0 `replay_omission`, 0 `conflict`, 0 `pending` |
+| Verified | `verified.overlap_slots` 50, `verified_through` 470015999 |
+
+Criterion 4 is met for these 50 slots: every replay-delivered transaction is in the
+archive with identical decoded transfers, and every successful archive mint
+transaction was delivered by replay. The job-level `coverage` field stays `unknown`
+by design: filtered replay alone carries no slot-completion evidence.
+
+Cost of this run: one LaserStream grant (705 messages, 6.6 MB, one connection), one
+`SubscribeReplayInfo`, one archive tip probe.
