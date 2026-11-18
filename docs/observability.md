@@ -162,7 +162,8 @@ The bounded diagnostic additions `indexer_historical_source_errors_total`,
 `indexer_historical_write_errors_total`, `indexer_historical_elapsed_seconds`, and
 `indexer_historical_transactions_per_second` have no unbounded labels. The rate
 counts successful decode attempts divided by invocation elapsed time, including
-source/storage time, and is not a benchmark. Failed candidates are retained in
+source/storage time, and is not a benchmark. `indexer_historical_source_seconds` is the part of
+elapsed time spent in source `block` calls: fetching and, for the archive, decoding. Failed candidates are retained in
 historical raw blocks with scoped durable error/retry state. Snapshot counters
 are attempts; replay does not imply new unique query results.
 

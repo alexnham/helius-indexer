@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeMap,
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -61,6 +62,12 @@ pub struct ArchiveSource {
     agent: ureq::Agent,
     /// The run's slot range; a cache miss inside it prefetches the adjacent slots.
     planned: Option<(u64, u64)>,
+    /// Blocks decoded at once inside the planned range (`INDEXER_HISTORICAL_WORKERS`).
+    pub(super) threads: u64,
+    /// Normalized blocks decoded ahead of their `block` call.
+    ready: BTreeMap<u64, Result<Vec<u8>>>,
+    /// Recently decoded slots' own block hashes, so a child needs no second parse of its parent.
+    hashes: BTreeMap<u64, String>,
     pub stats: Stats,
 }
 impl ArchiveSource {
@@ -89,6 +96,9 @@ impl ArchiveSource {
                 .build()
                 .into(),
             planned: None,
+            threads: 1,
+            ready: BTreeMap::new(),
+            hashes: BTreeMap::new(),
             stats: Stats::default(),
         })
     }
@@ -201,11 +211,7 @@ impl ArchiveSource {
     }
     pub(super) fn tip_time(&mut self, slot: u64) -> Result<i64> {
         let (raw, _) = self.chunk(slot)?;
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|_| Error("archive_runtime_failed"))?;
-        runtime.block_on(super::decode::block_time(&raw, slot))
+        runtime()?.block_on(super::decode::block_time(&raw, slot))
     }
     fn paths(&self, slot: u64) -> (PathBuf, PathBuf) {
         let stem = format!("epoch-{}-slot-{slot}", slot / EPOCH_SLOTS);
@@ -326,6 +332,8 @@ impl ArchiveSource {
 impl BlockSource for ArchiveSource {
     fn plan(&mut self, start: u64, end: u64) {
         self.planned = Some((start, end));
+        self.threads = crate::backfill::historical_workers().unwrap_or(1) as u64;
+        self.ready.clear();
     }
     fn diagnostics(&self) -> serde_json::Value {
         serde_json::json!({"jetstreamer_revision":JETSTREAMER_REVISION,"response_body_bytes":self.stats.response_body_bytes,"requests":self.stats.requests,"cached_chunks":self.stats.cached_chunks,"limits":{"response_body_bytes":self.limits.bytes,"requests":self.limits.requests,"seconds":self.limits.seconds}})
@@ -336,23 +344,98 @@ impl BlockSource for ArchiveSource {
     fn capture_source(&self) -> &'static str {
         super::SOURCE
     }
+    /// Inside the planned range, decodes the next `threads` slots at once and serves them
+    /// in order. Cache reads and downloads stay sequential, so limits and stats are exact.
     fn block(&mut self, slot: u64) -> Result<Vec<u8>> {
-        let (raw, receipt) = self.chunk(slot)?;
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|_| Error("archive_runtime_failed"))?;
-        let (mut block, parent, _) = runtime.block_on(decode_slot(&raw, slot))?;
-        let (parent_raw, _) = self.chunk(parent)?;
-        let parent_hash = runtime.block_on(super::decode::parent_hash(&parent_raw, parent))?;
-        block["previousBlockhash"] = json!(parent_hash);
-        let bytes = serde_json::to_vec(&json!({"jsonrpc":"2.0","id":1,"result":block,"archive_provenance":{"jetstreamer_revision":receipt.jetstreamer_revision,"epoch":receipt.epoch,"slot":slot,"car_offset":receipt.offset,"car_length":receipt.length,"car_sha256":receipt.sha256}}))
-            .map_err(|_| Error("serialization_failed"))?;
-        if bytes.len() > crate::backfill::MAX_BLOCK_BYTES {
-            return Err(Error("archive_normalized_block_limit"));
+        if let Some(done) = self.ready.remove(&slot) {
+            return done;
         }
-        Ok(bytes)
+        // shortcut: a window may read (or download) slots the run then skips as complete; fine while windows stay at most 16 slots.
+        let last = match self.planned {
+            Some((start, end)) if (start..=end).contains(&slot) => {
+                end.min(slot + self.threads.max(1) - 1)
+            }
+            _ => slot,
+        };
+        self.ready.clear();
+        self.hashes
+            .retain(|s, _| *s + PREFETCH_SLOTS >= slot && *s < slot);
+        let chunks: Vec<_> = (slot..=last).map(|s| (s, self.chunk(s))).collect();
+        let decoded = parallel(chunks, |s, chunk| {
+            let (raw, receipt) = chunk?;
+            decode(&raw, s).map(|d| (d, receipt))
+        });
+        for (s, result) in &decoded {
+            if let Ok(((_, _, hash), _)) = result {
+                self.hashes.insert(*s, hash.clone());
+            }
+        }
+        let mut linked = Vec::new();
+        for (s, result) in decoded {
+            linked.push((
+                s,
+                result.and_then(|((block, parent, _), receipt)| {
+                    let hash = match self.hashes.get(&parent) {
+                        Some(hash) => hash.clone(),
+                        None => {
+                            let (raw, _) = self.chunk(parent)?;
+                            runtime()?.block_on(super::decode::parent_hash(&raw, parent))?
+                        }
+                    };
+                    Ok((block, hash, receipt))
+                }),
+            ));
+        }
+        self.ready = parallel(linked, |s, linked| {
+            let (block, hash, receipt) = linked?;
+            normalized(block, hash, s, &receipt)
+        })
+        .into_iter()
+        .collect();
+        self.ready
+            .remove(&slot)
+            .unwrap_or(Err(Error("archive_decode_failed")))
     }
+}
+fn runtime() -> Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| Error("archive_runtime_failed"))
+}
+fn decode(raw: &[u8], slot: u64) -> Result<(serde_json::Value, u64, String)> {
+    runtime()?.block_on(decode_slot(raw, slot))
+}
+/// Runs `work` on each item on its own thread; a panic becomes that slot's error.
+fn parallel<T: Send, U: Send>(
+    items: Vec<(u64, T)>,
+    work: impl Fn(u64, T) -> Result<U> + Sync,
+) -> Vec<(u64, Result<U>)> {
+    let work = &work;
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = items
+            .into_iter()
+            .map(|(s, item)| (s, scope.spawn(move || work(s, item))))
+            .collect();
+        handles
+            .into_iter()
+            .map(|(s, h)| (s, h.join().unwrap_or(Err(Error("archive_decode_failed")))))
+            .collect()
+    })
+}
+fn normalized(
+    mut block: serde_json::Value,
+    parent_hash: String,
+    slot: u64,
+    receipt: &Receipt,
+) -> Result<Vec<u8>> {
+    block["previousBlockhash"] = json!(parent_hash);
+    let bytes = serde_json::to_vec(&json!({"jsonrpc":"2.0","id":1,"result":block,"archive_provenance":{"jetstreamer_revision":receipt.jetstreamer_revision,"epoch":receipt.epoch,"slot":slot,"car_offset":receipt.offset,"car_length":receipt.length,"car_sha256":receipt.sha256}}))
+        .map_err(|_| Error("serialization_failed"))?;
+    if bytes.len() > crate::backfill::MAX_BLOCK_BYTES {
+        return Err(Error("archive_normalized_block_limit"));
+    }
+    Ok(bytes)
 }
 fn read_bounded(path: &Path, max: usize) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
