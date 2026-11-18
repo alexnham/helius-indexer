@@ -83,7 +83,9 @@ fn slot_outcome(log: &mut JobLog, id: &str, mint: &str, slot: u64) -> Result<Ove
     let replay = log.slot_captures(slot, REPLAY_SOURCE)?;
     let mut archive_mint = Vec::new();
     for (signature, (capture, _)) in &archive {
-        if touches_mint(&decoded(capture).map(|d| d.0).unwrap_or_default(), mint) {
+        let result = decoded(capture).map(|d| d.0).unwrap_or_default();
+        // The replay filter also excludes failed transactions (`failed: Some(false)`).
+        if touches_mint(&result, mint) && result["meta"]["err"].is_null() {
             archive_mint.push(signature.clone());
         }
     }

@@ -200,7 +200,7 @@ route and decoder revision:
 | Outcome | Meaning |
 | --- | --- |
 | `consistent` | Every replay-delivered signature is in the archive block with identical decoded transfers (identity, raw amounts, fees, confidentiality, instruction positions); block time is compared only when both sides have it. |
-| `replay_omission` | As above, and the archive block has mint transactions replay never delivered. Archive is authoritative on membership. |
+| `replay_omission` | As above, and the archive block has successful mint transactions replay never delivered. Archive is authoritative on membership. Failed transactions are left out, as the replay filter excludes them and they move no tokens. |
 | `conflict` | `replay_not_in_archive` (a replay signature missing from a complete archive block) or `effects_differ`. Fails closed and stays visible. |
 | `pending` | The archive slot is incomplete, a replay input is unresolved or no longer retained, or the stored output's decoder revision differs. |
 
