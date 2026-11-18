@@ -20,7 +20,8 @@ use std::{
 
 #[derive(Default)]
 struct State {
-    active: bool,
+    /// Writes holding a permit; at most `WriteGate::limit`.
+    active: usize,
     live_started: bool,
     live_waiting: usize,
     history_waiting: usize,
@@ -32,15 +33,29 @@ struct State {
     live_wait_seconds: f64,
     history_wait_seconds: f64,
 }
-#[derive(Default)]
 pub struct WriteGate {
     state: Mutex<State>,
     changed: Condvar,
+    limit: usize,
+}
+/// One permit per configured historical worker (`INDEXER_HISTORICAL_WORKERS`, default 1),
+/// so a single worker keeps the one-write-at-a-time schedule.
+impl Default for WriteGate {
+    fn default() -> Self {
+        Self::with_limit(crate::backfill::historical_workers().unwrap_or(1))
+    }
 }
 pub struct Permit<'a> {
     gate: &'a WriteGate,
 }
 impl WriteGate {
+    pub fn with_limit(limit: usize) -> Self {
+        Self {
+            state: Mutex::default(),
+            changed: Condvar::new(),
+            limit: limit.max(1),
+        }
+    }
     pub fn live(&self) -> Result<Permit<'_>> {
         self.enter(true, None)
     }
@@ -80,7 +95,7 @@ impl WriteGate {
             state.history_waiting += 1;
             state.history_since.get_or_insert(began);
         }
-        while state.active || (!live && state.live_waiting > 0) {
+        while state.active >= self.limit || (!live && state.live_waiting > 0) {
             if let Some(deadline) = deadline {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
@@ -128,13 +143,13 @@ impl WriteGate {
             state.history_admissions += 1;
             state.history_wait_seconds += began.elapsed().as_secs_f64();
         }
-        state.active = true;
+        state.active += 1;
         Ok(Permit { gate: self })
     }
     pub fn snapshot(&self) -> Result<Value> {
         let s = self.state.lock().map_err(|_| Error("scheduling_failed"))?;
         Ok(
-            json!({"active":s.active,"live_waiting":s.live_waiting,"historical_waiting":s.history_waiting,
+            json!({"active":s.active > 0,"active_writes":s.active,"write_limit":self.limit,"live_waiting":s.live_waiting,"historical_waiting":s.history_waiting,
             "oldest_pending_age_seconds":s.live_since.into_iter().chain(s.history_since).map(|t|t.elapsed().as_secs_f64()).reduce(f64::max).unwrap_or(0.0),
             "historical_admission_timeouts":s.history_timeouts,"live_admissions":s.live_admissions,"historical_admissions":s.history_admissions,
             "live_wait_seconds_sum":s.live_wait_seconds,"historical_wait_seconds_sum":s.history_wait_seconds}),
@@ -145,7 +160,7 @@ impl WriteGate {
 impl Drop for Permit<'_> {
     fn drop(&mut self) {
         if let Ok(mut state) = self.gate.state.lock() {
-            state.active = false;
+            state.active -= 1;
             self.gate.changed.notify_all();
         }
     }

@@ -300,6 +300,19 @@ pub struct History {
     revision_repair: bool,
     active_source: &'static str,
     gate: std::sync::Arc<crate::coordinator::WriteGate>,
+    workers: usize,
+}
+/// Historical block workers per run (`INDEXER_HISTORICAL_WORKERS`, 1–16, default 1).
+pub(crate) fn historical_workers() -> Result<usize> {
+    match std::env::var("INDEXER_HISTORICAL_WORKERS") {
+        Err(std::env::VarError::NotPresent) => Ok(1),
+        Ok(value) => value
+            .parse()
+            .ok()
+            .filter(|n| (1..=16).contains(n))
+            .ok_or(Error("invalid_historical_workers")),
+        Err(_) => Err(Error("invalid_historical_workers")),
+    }
 }
 fn now() -> u64 {
     SystemTime::now()
@@ -334,6 +347,7 @@ impl History {
             database: database.clone(),
             telemetry,
             gate: std::sync::Arc::new(crate::coordinator::WriteGate::default()),
+            workers: historical_workers()?,
         })
     }
     pub(crate) fn enable_revision_repair(&mut self, run_id: String) {
@@ -376,6 +390,16 @@ impl History {
     }
     pub fn set_gate(&mut self, gate: std::sync::Arc<crate::coordinator::WriteGate>) {
         self.gate = gate;
+    }
+    /// Overrides `INDEXER_HISTORICAL_WORKERS` and gives this history its own gate with one
+    /// permit per worker; call `set_gate` afterwards to share a gate instead.
+    pub fn set_workers(&mut self, workers: usize) -> Result<()> {
+        if !(1..=16).contains(&workers) {
+            return Err(Error("invalid_historical_workers"));
+        }
+        self.workers = workers;
+        self.gate = std::sync::Arc::new(crate::coordinator::WriteGate::with_limit(workers));
+        Ok(())
     }
     pub fn run_id(&self) -> &str {
         &self.telemetry.run_id
@@ -452,8 +476,11 @@ impl History {
         self.db
             .set_status(mint, slot, self.active_source, status, error, time)
     }
-    /// Single worker, no queue. Cancellation checked between slots and transaction writes.
-    /// A request already in flight is bounded by the source's request deadline.
+    /// Cancellation is checked between slots and transaction writes; a request already in
+    /// flight is bounded by the source's request deadline. With more than one historical
+    /// worker (never during revision repair), workers decode and write blocks on their own
+    /// connections while this thread fetches, retains input and records slot status. Slots
+    /// may then complete out of order; coverage is always derived from durable slot status.
     pub fn run(
         &mut self,
         mint: &str,
@@ -483,167 +510,51 @@ impl History {
         } else if !self.revision_repair {
             self.telemetry.set_context("backfill", "rpc", "historical");
         }
-        let mut store = {
-            let _permit = self.gate.historical()?;
-            Store::open(&self.database)?
-        };
-        for slot in start..=end {
-            if cancelled() {
-                metrics.cancelled = true;
-                break;
-            }
-            let current = self.coverage(mint, slot, slot)?.slots.remove(0);
-            let source_done = self.db.source_done(mint, slot, self.active_source)?;
-            if current.status == "skipped" || (current.status == "complete" && source_done) {
-                continue;
-            }
-            if current.attempts > 0 {
-                metrics.retries += 1;
-                event(
-                    &self.telemetry,
-                    "retry",
-                    "historical_slot",
-                    "retry",
-                    slot,
-                    mint,
-                    None,
-                );
-            }
-            {
+        if self.workers > 1 && !self.revision_repair {
+            self.run_workers(mint, start, end, source, &cancelled, &mut metrics)?;
+        } else {
+            let mut store = {
                 let _permit = self.gate.historical()?;
-                self.db.add_attempt(mint, slot)?;
-            }
-            let cached: Option<Vec<u8>> = if self.revision_repair
-                || current.error_class.is_none()
-                || current.error_class.as_deref() == Some("cancelled")
-                || matches!(
-                    current.error_class.as_deref(),
-                    Some("decoder_revision_conflict" | "decoder_repair_requires_verification")
-                )
-                || current
-                    .error_class
-                    .as_deref()
-                    .is_some_and(|e| e.starts_with("storage_"))
-            {
-                self.db.latest_input(mint, slot, source.provenance())?
-            } else {
-                None
+                Store::open(&self.database)?
             };
-            let response = match cached {
-                Some(bytes) => {
-                    metrics.cached_blocks += 1;
-                    Ok(bytes)
+            for slot in start..=end {
+                if cancelled() {
+                    metrics.cancelled = true;
+                    break;
                 }
-                None => {
-                    metrics.source_attempts += 1;
-                    source.block(slot)
-                }
-            };
-            let raw = match response {
-                Ok(bytes) if bytes.len() <= MAX_BLOCK_BYTES => bytes,
-                result => {
-                    let error = result.err().unwrap_or(Error("block_too_large"));
-                    if error.0 == "archive_cache_write_failed" {
-                        metrics.write_errors += 1;
-                    } else {
-                        metrics.source_errors += 1;
-                    }
-                    self.status(mint, slot, "unknown", Some(error.0), None)?;
-                    event(
-                        &self.telemetry,
-                        "coverage_gap",
-                        "source",
-                        "failed",
-                        slot,
-                        mint,
-                        Some(error.0),
-                    );
+                let Some((raw, attempt)) = self.fetch(mint, slot, source, &mut metrics)? else {
                     continue;
-                }
-            };
-            metrics.input_bytes += raw.len() as u64;
-            // Raw input acknowledgment precedes decoding. Every failed attempt remains reproducible.
-            {
-                let _permit = self.gate.historical()?;
-                self.db.retain_input(
+                };
+                retain(
+                    &self.db,
+                    &self.gate,
                     mint,
                     slot,
-                    current.attempts + 1,
+                    attempt,
                     source.provenance(),
-                    now(),
                     &raw,
                 )?;
-            }
-            let failures_before = metrics.decode_failures;
-            let outcome = process_block(
-                &raw,
-                slot,
-                &mut store,
-                &mut metrics,
-                &cancelled,
-                BlockContext {
-                    gate: &self.gate,
-                    revision_repair: self.revision_repair,
-                    capture_source: source.capture_source(),
-                    mint,
-                },
-            );
-            match outcome {
-                Ok((parent, time)) => {
-                    // A finalized child links directly to its parent; intermediate slots are skipped.
-                    // Never overwrite observed produced data with skip evidence.
-                    for skipped in start.max(parent.saturating_add(1))..slot {
-                        if !self.db.produced_block_observed(skipped)? {
-                            self.status(mint, skipped, "skipped", None, None)?;
-                        }
-                    }
-                    self.status(mint, slot, "complete", None, time)?;
-                    event(
-                        &self.telemetry,
-                        "durable_range_completed",
-                        "coverage",
-                        "success",
-                        slot,
+                let mut block = Metrics::default();
+                let outcome = process_block(
+                    &raw,
+                    slot,
+                    &mut store,
+                    &mut block,
+                    &cancelled,
+                    BlockContext {
+                        gate: &self.gate,
+                        revision_repair: self.revision_repair,
+                        capture_source: source.capture_source(),
                         mint,
-                        None,
-                    );
-                }
-                Err(error) => {
-                    if error.0 == "cancelled" {
-                        metrics.cancelled = true;
-                    }
-                    if error.0 == "rpc_block_unavailable" {
-                        metrics.source_errors += 1;
-                    } else if error.0.starts_with("storage_")
-                        || matches!(
-                            error.0,
-                            "capture_conflict"
-                                | "block_identity_conflict"
-                                | "block_parent_conflict"
-                        )
-                    {
-                        metrics.write_errors += 1;
-                    } else if error.0 != "cancelled" && metrics.decode_failures == failures_before {
-                        metrics.source_errors += 1;
-                    }
-                    self.status(mint, slot, "unknown", Some(error.0), None)?;
-                    event(
-                        &self.telemetry,
-                        "coverage_gap",
-                        "decode_store",
-                        "failed",
-                        slot,
-                        mint,
-                        Some(error.0),
-                    );
-                    if metrics.cancelled {
-                        break;
-                    }
+                    },
+                );
+                if self.finish(mint, start, slot, outcome, &block, &mut metrics)? {
+                    break;
                 }
             }
+            metrics.storage = store.stats();
         }
         metrics.source_diagnostics = source.diagnostics();
-        metrics.storage = store.stats();
         metrics.elapsed_seconds = started.elapsed().as_secs_f64();
         metrics.transactions_per_second =
             metrics.decoded_transactions as f64 / metrics.elapsed_seconds.max(f64::EPSILON);
@@ -654,7 +565,297 @@ impl History {
         }
         Ok((coverage, metrics))
     }
+
+    /// Bounded workers, one connection each, fed by a queue of at most one block per
+    /// worker, so at most two blocks per worker are held in memory.
+    fn run_workers(
+        &self,
+        mint: &str,
+        start: u64,
+        end: u64,
+        source: &mut impl BlockSource,
+        cancelled: &impl Fn() -> bool,
+        metrics: &mut Metrics,
+    ) -> Result<()> {
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        };
+        let connections = (0..self.workers)
+            .map(|_| {
+                let _permit = self.gate.historical()?;
+                Ok((
+                    Store::open(&self.database)?,
+                    HistoryLog::open(&self.database)?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let (gate, capture_source, provenance, stop) = (
+            &*self.gate,
+            source.capture_source(),
+            source.provenance(),
+            &AtomicBool::new(false),
+        );
+        std::thread::scope(|scope| -> Result<()> {
+            // Created inside the scope: an early return drops the sender, so idle workers exit.
+            let (work, queue) = mpsc::sync_channel::<(u64, Vec<u8>, u64)>(self.workers);
+            let queue = Arc::new(Mutex::new(queue));
+            let (done, results) = mpsc::channel();
+            let handles: Vec<_> = connections
+                .into_iter()
+                .map(|(mut store, log)| {
+                    let (queue, done) = (Arc::clone(&queue), done.clone());
+                    scope.spawn(move || {
+                        let stopped = || stop.load(Ordering::Relaxed);
+                        loop {
+                            let next = queue.lock().ok().and_then(|q| q.recv().ok());
+                            let Some((slot, raw, attempt)) = next else {
+                                break;
+                            };
+                            let mut block = Metrics::default();
+                            let outcome = retain(&log, gate, mint, slot, attempt, provenance, &raw)
+                                .and_then(|()| {
+                                    process_block(
+                                        &raw,
+                                        slot,
+                                        &mut store,
+                                        &mut block,
+                                        &stopped,
+                                        BlockContext {
+                                            gate,
+                                            revision_repair: false,
+                                            capture_source,
+                                            mint,
+                                        },
+                                    )
+                                });
+                            if done.send((slot, outcome, block)).is_err() {
+                                break;
+                            }
+                        }
+                        store.stats()
+                    })
+                })
+                .collect();
+            // Only workers hold the queue now: if they all exit, `send` fails instead of blocking.
+            drop((done, queue));
+            for slot in start..=end {
+                while let Ok((finished, outcome, block)) = results.try_recv() {
+                    if self.finish(mint, start, finished, outcome, &block, metrics)? {
+                        stop.store(true, Ordering::Relaxed);
+                    }
+                }
+                if stop.load(Ordering::Relaxed) || cancelled() {
+                    metrics.cancelled = true;
+                    stop.store(true, Ordering::Relaxed);
+                    break;
+                }
+                if let Some((raw, attempt)) = self.fetch(mint, slot, source, metrics)? {
+                    work.send((slot, raw, attempt))
+                        .map_err(|_| Error("historical_worker_failed"))?;
+                }
+            }
+            drop(work);
+            // Cancellation stays responsive while queued blocks finish.
+            loop {
+                match results.recv_timeout(Duration::from_millis(50)) {
+                    Ok((finished, outcome, block)) => {
+                        if self.finish(mint, start, finished, outcome, &block, metrics)? {
+                            stop.store(true, Ordering::Relaxed);
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        if !stop.load(Ordering::Relaxed) && cancelled() {
+                            metrics.cancelled = true;
+                            stop.store(true, Ordering::Relaxed);
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+            for handle in handles {
+                let stats = handle
+                    .join()
+                    .map_err(|_| Error("historical_worker_failed"))?;
+                metrics.storage.merge(&stats);
+            }
+            Ok(())
+        })
+    }
+
+    /// Fetches, or reuses, one slot's block with its attempt number; the caller retains it
+    /// before decoding. `None` when the slot needs no work or its source failed, which is
+    /// recorded as a coverage gap.
+    fn fetch(
+        &self,
+        mint: &str,
+        slot: u64,
+        source: &mut impl BlockSource,
+        metrics: &mut Metrics,
+    ) -> Result<Option<(Vec<u8>, u64)>> {
+        let current = self.coverage(mint, slot, slot)?.slots.remove(0);
+        let source_done = self.db.source_done(mint, slot, self.active_source)?;
+        if current.status == "skipped" || (current.status == "complete" && source_done) {
+            return Ok(None);
+        }
+        if current.attempts > 0 {
+            metrics.retries += 1;
+            event(
+                &self.telemetry,
+                "retry",
+                "historical_slot",
+                "retry",
+                slot,
+                mint,
+                None,
+            );
+        }
+        {
+            let _permit = self.gate.historical()?;
+            self.db.add_attempt(mint, slot)?;
+        }
+        let cached: Option<Vec<u8>> = if self.revision_repair
+            || current.error_class.is_none()
+            || current.error_class.as_deref() == Some("cancelled")
+            || matches!(
+                current.error_class.as_deref(),
+                Some("decoder_revision_conflict" | "decoder_repair_requires_verification")
+            )
+            || current
+                .error_class
+                .as_deref()
+                .is_some_and(|e| e.starts_with("storage_"))
+        {
+            self.db.latest_input(mint, slot, source.provenance())?
+        } else {
+            None
+        };
+        let response = match cached {
+            Some(bytes) => {
+                metrics.cached_blocks += 1;
+                Ok(bytes)
+            }
+            None => {
+                metrics.source_attempts += 1;
+                source.block(slot)
+            }
+        };
+        let raw = match response {
+            Ok(bytes) if bytes.len() <= MAX_BLOCK_BYTES => bytes,
+            result => {
+                let error = result.err().unwrap_or(Error("block_too_large"));
+                if error.0 == "archive_cache_write_failed" {
+                    metrics.write_errors += 1;
+                } else {
+                    metrics.source_errors += 1;
+                }
+                self.status(mint, slot, "unknown", Some(error.0), None)?;
+                event(
+                    &self.telemetry,
+                    "coverage_gap",
+                    "source",
+                    "failed",
+                    slot,
+                    mint,
+                    Some(error.0),
+                );
+                return Ok(None);
+            }
+        };
+        metrics.input_bytes += raw.len() as u64;
+        Ok(Some((raw, current.attempts + 1)))
+    }
+
+    /// Records one processed block's outcome and counts. True when the run was cancelled.
+    fn finish(
+        &self,
+        mint: &str,
+        start: u64,
+        slot: u64,
+        outcome: Result<(u64, Option<i64>)>,
+        block: &Metrics,
+        metrics: &mut Metrics,
+    ) -> Result<bool> {
+        metrics.decoded_transactions += block.decoded_transactions;
+        metrics.decoded_transfers += block.decoded_transfers;
+        metrics.decode_failures += block.decode_failures;
+        metrics.unrelated_transactions += block.unrelated_transactions;
+        match outcome {
+            Ok((parent, time)) => {
+                // A finalized child links directly to its parent; intermediate slots are skipped.
+                // Never overwrite observed produced data with skip evidence.
+                for skipped in start.max(parent.saturating_add(1))..slot {
+                    if !self.db.produced_block_observed(skipped)? {
+                        self.status(mint, skipped, "skipped", None, None)?;
+                    }
+                }
+                self.status(mint, slot, "complete", None, time)?;
+                event(
+                    &self.telemetry,
+                    "durable_range_completed",
+                    "coverage",
+                    "success",
+                    slot,
+                    mint,
+                    None,
+                );
+                Ok(false)
+            }
+            Err(error) => {
+                if error.0 == "cancelled" {
+                    metrics.cancelled = true;
+                }
+                if error.0 == "rpc_block_unavailable" {
+                    metrics.source_errors += 1;
+                } else if error.0.starts_with("storage_")
+                    || matches!(
+                        error.0,
+                        "capture_conflict" | "block_identity_conflict" | "block_parent_conflict"
+                    )
+                {
+                    metrics.write_errors += 1;
+                } else if error.0 != "cancelled" && block.decode_failures == 0 {
+                    metrics.source_errors += 1;
+                }
+                // With workers a later child can finish first and prove this slot skipped;
+                // a source with no block for it must not undo that evidence.
+                let skipped = error.0 == "rpc_block_unavailable"
+                    && self
+                        .db
+                        .slot(mint, slot)?
+                        .is_some_and(|record| record.0 == "skipped");
+                if !skipped {
+                    self.status(mint, slot, "unknown", Some(error.0), None)?;
+                }
+                event(
+                    &self.telemetry,
+                    "coverage_gap",
+                    "decode_store",
+                    "failed",
+                    slot,
+                    mint,
+                    Some(error.0),
+                );
+                Ok(metrics.cancelled)
+            }
+        }
+    }
 }
+/// Raw input acknowledgment precedes decoding. Every failed attempt remains reproducible.
+fn retain(
+    db: &HistoryLog,
+    gate: &crate::coordinator::WriteGate,
+    mint: &str,
+    slot: u64,
+    attempt: u64,
+    provenance: &str,
+    raw: &[u8],
+) -> Result<()> {
+    let _permit = gate.historical()?;
+    db.retain_input(mint, slot, attempt, provenance, now(), raw)
+}
+
 /// Transactions per historical write batch; the byte bound is shared with live intake.
 const BATCH_INPUTS: usize = 1_000;
 
@@ -714,7 +915,7 @@ fn process_block(
     }
     {
         let _permit = gate.historical()?;
-        store.observe_block_identity(slot, block, transactions)?;
+        store.observe_retained_block_identity(slot, block, transactions, raw)?;
     }
     let mut signatures = std::collections::HashSet::new();
     let mut failure = None;
