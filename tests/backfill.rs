@@ -624,11 +624,8 @@ fn historical_process_exit_restarts_from_retained_raw_without_advancing_a_gap() 
             before.contiguous_through,
             (phase == "after_progress").then_some(slot)
         );
-        let expected_before = match phase {
-            "after_raw" => 0,
-            "after_output" => 2,
-            _ => 4,
-        };
+        // A block's output is written as one batch, so a crash after output sees all of it.
+        let expected_before = if phase == "after_raw" { 0 } else { 4 };
         assert_eq!(
             Store::query(&path, None, 100).unwrap().len(),
             expected_before
@@ -672,5 +669,103 @@ fn historical_process_exit_restarts_from_retained_raw_without_advancing_a_gap() 
             .run(&mint(), slot, slot, &mut unavailable, || false)
             .unwrap();
         assert_eq!(Store::summary(&path, &mint()).unwrap(), summary);
+    }
+}
+
+/// The fixture transfer with signature `n`, or, when `related` is false, a failed
+/// transaction that neither touches the mint nor produces output.
+fn numbered(n: u64, related: bool) -> Value {
+    let mut tx = fixture()["result"].clone();
+    let mut signature = [1u8; 64];
+    signature[..8].copy_from_slice(&n.to_le_bytes());
+    tx["transaction"]["signatures"][0] = json!(bs58::encode(signature).into_string());
+    if !related {
+        for key in tx["transaction"]["message"]["accountKeys"]
+            .as_array_mut()
+            .unwrap()
+        {
+            if *key == json!(mint()) {
+                *key = json!("So11111111111111111111111111111111111111112");
+            }
+        }
+        tx["meta"]["preTokenBalances"] = json!([]);
+        tx["meta"]["postTokenBalances"] = json!([]);
+        tx["meta"]["err"] = json!({"InstructionError": [0, {"Custom": 1}]});
+    }
+    tx
+}
+
+#[test]
+fn unrelated_transactions_without_output_stay_only_in_the_retained_block() {
+    let (_dir, path) = db();
+    let slot = fixture()["result"]["slot"].as_u64().unwrap();
+    let mut related_failure = numbered(2, true);
+    related_failure["meta"]["err"] = json!({"InstructionError": [0, {"Custom": 1}]});
+    let txs = vec![numbered(1, true), related_failure, numbered(3, false)];
+    let mut source = source(vec![(slot, block(slot, slot - 1, txs))]);
+    let (coverage, metrics) = History::open(&path)
+        .unwrap()
+        .run(&mint(), slot, slot, &mut source, || false)
+        .unwrap();
+    assert!(coverage.complete);
+    assert_eq!(metrics.decoded_transactions, 3);
+    assert_eq!(Store::query(&path, Some(&mint()), 100).unwrap().len(), 2);
+    let mut db = path.test_client();
+    let stored: Vec<String> = db
+        .query("SELECT signature FROM captures ORDER BY signature", &[])
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    let mut expected: Vec<String> = [1, 2]
+        .map(|n| {
+            numbered(n, true)["transaction"]["signatures"][0]
+                .as_str()
+                .unwrap()
+                .into()
+        })
+        .into();
+    expected.sort();
+    assert_eq!(stored, expected);
+    let retained: i64 = db
+        .query_one("SELECT COUNT(*) FROM historical_inputs", &[])
+        .unwrap()
+        .get(0);
+    assert_eq!(retained, 1);
+}
+
+/// Local write throughput for historical blocks: `cargo test --release --test backfill
+/// historical_block_throughput -- --ignored --nocapture`. Prints, never asserts, rates
+/// for blocks where every transaction transfers the mint and where one in twenty does.
+#[test]
+#[ignore = "measurement: run explicitly against local PostgreSQL"]
+fn historical_block_throughput() {
+    const SLOTS: u64 = 8;
+    const PER_BLOCK: u64 = 1_000;
+    for related_every in [1, 20] {
+        let (_dir, path) = db();
+        let start = fixture()["result"]["slot"].as_u64().unwrap();
+        let blocks = (0..SLOTS)
+            .map(|n| {
+                let txs = (0..PER_BLOCK)
+                    .map(|i| numbered(n * PER_BLOCK + i, i % related_every == 0))
+                    .collect();
+                (start + n, block(start + n, start + n - 1, txs))
+            })
+            .collect();
+        let mut source = source(blocks);
+        let began = std::time::Instant::now();
+        let (coverage, metrics) = History::open(&path)
+            .unwrap()
+            .run(&mint(), start, start + SLOTS - 1, &mut source, || false)
+            .unwrap();
+        let seconds = began.elapsed().as_secs_f64();
+        assert!(coverage.complete);
+        assert_eq!(metrics.decoded_transactions, SLOTS * PER_BLOCK);
+        println!(
+            "historical_block_throughput: 1 in {related_every} related, {} tx in {seconds:.2} s = {:.0} tx/s",
+            SLOTS * PER_BLOCK,
+            (SLOTS * PER_BLOCK) as f64 / seconds
+        );
     }
 }

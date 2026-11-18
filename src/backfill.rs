@@ -583,6 +583,7 @@ impl History {
                     gate: &self.gate,
                     revision_repair: self.revision_repair,
                     capture_source: source.capture_source(),
+                    mint,
                 },
             );
             match outcome {
@@ -652,10 +653,14 @@ impl History {
         Ok((coverage, metrics))
     }
 }
+/// Transactions per historical write batch; the byte bound is shared with live intake.
+const BATCH_INPUTS: usize = 1_000;
+
 struct BlockContext<'a> {
     gate: &'a crate::coordinator::WriteGate,
     revision_repair: bool,
     capture_source: &'a str,
+    mint: &'a str,
 }
 fn process_block(
     raw: &[u8],
@@ -669,6 +674,7 @@ fn process_block(
         gate,
         revision_repair,
         capture_source,
+        mint,
     } = context;
     let value: Value = serde_json::from_slice(raw).map_err(|_| Error("invalid_block_json"))?;
     if value["jsonrpc"] != "2.0" || value["id"] != 1 || value.get("error").is_some() {
@@ -710,6 +716,12 @@ fn process_block(
     }
     let mut signatures = std::collections::HashSet::new();
     let mut failure = None;
+    // Outside revision repair, decoded transactions are written in bounded batches: one
+    // PostgreSQL transaction per batch instead of one per block transaction.
+    let mut pending = Vec::new();
+    let mut pending_bytes = 0;
+    // Counted into `metrics` only once every batch of the block is durable.
+    let (mut written_transactions, mut written_transfers) = (0, 0);
     for tx in transactions {
         if cancelled() {
             return Err(Error("cancelled"));
@@ -740,21 +752,43 @@ fn process_block(
             return Err(Error("duplicate_block_transaction"));
         }
         let decoded = decoder::decode(&parsed);
-        if decoded.is_ok() || revision_repair {
+        if !revision_repair {
+            match &decoded {
+                Ok(transfers) => {
+                    written_transactions += 1;
+                    written_transfers += transfers.len() as u64;
+                    // An unrelated transaction without output stays only in the retained
+                    // block; overlap compares exactly the inputs `touches_mint` selects.
+                    if transfers.is_empty() && !crate::replay::overlap::touches_mint(tx, mint) {
+                        continue;
+                    }
+                    pending_bytes += bytes.len();
+                    pending.push((parsed, bytes, decoded));
+                    if pending.len() >= BATCH_INPUTS || pending_bytes >= crate::live::BATCH_BYTES {
+                        persist_pending(store, gate, &mut pending)?;
+                        pending_bytes = 0;
+                    }
+                }
+                Err(e) => {
+                    metrics.decode_failures += 1;
+                    failure = Some(*e);
+                }
+            }
+            continue;
+        }
+        {
             let _permit = gate.historical()?;
             match store.persist(&parsed, &bytes, &decoded) {
-                Err(e) if revision_repair && e.0 == "decoder_revision_conflict" => {}
+                Err(e) if e.0 == "decoder_revision_conflict" => {}
                 result => {
                     result?;
                 }
             }
-            if revision_repair {
-                let corrected = store.correct(&parsed.result.transaction.signatures[0])?;
-                if let Some(error) = corrected.error {
-                    metrics.decode_failures += 1;
-                    failure = Some(error);
-                    continue;
-                }
+            let corrected = store.correct(&parsed.result.transaction.signatures[0])?;
+            if let Some(error) = corrected.error {
+                metrics.decode_failures += 1;
+                failure = Some(error);
+                continue;
             }
         }
         match decoded {
@@ -768,10 +802,48 @@ fn process_block(
             }
         }
     }
+    persist_pending(store, gate, &mut pending)?;
+    metrics.decoded_transactions += written_transactions;
+    metrics.decoded_transfers += written_transfers;
+    if cancelled() {
+        return Err(Error("cancelled"));
+    }
     if let Some(error) = failure {
         return Err(error);
     }
     Ok((parent, block["blockTime"].as_i64()))
+}
+
+type Pending = (
+    crate::model::Capture,
+    Vec<u8>,
+    Result<Vec<crate::model::Transfer>>,
+);
+
+/// Writes and clears `pending`, failing with the first item's error. Items written before
+/// a failure are durable; replaying them is a no-op, and the slot is not acknowledged.
+fn persist_pending(
+    store: &mut Store,
+    gate: &crate::coordinator::WriteGate,
+    pending: &mut Vec<Pending>,
+) -> Result<()> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let items: Vec<_> = pending
+        .iter()
+        .map(|(capture, raw, decoded)| crate::storage::BatchItem {
+            capture,
+            raw,
+            decoded,
+        })
+        .collect();
+    let results = {
+        let _permit = gate.historical()?;
+        store.persist_batch(&items)
+    };
+    pending.clear();
+    results.into_iter().try_for_each(|r| r.map(drop))
 }
 fn event(
     telemetry: &crate::telemetry::Telemetry,

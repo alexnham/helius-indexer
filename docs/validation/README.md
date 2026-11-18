@@ -18,6 +18,7 @@ dated report that holds the command, dataset, environment and full results.
 
 | Date | Run | Source | Headline result | Report |
 | --- | --- | --- | --- | --- |
+| 2026-11-18 | Historical block write throughput | local | Batched block writes: 118 → ~830 tx/s when every transaction transfers the mint, 151 → ~2,900 tx/s when 1 in 20 does | [report](2026-11-18-historical-block-throughput.md) |
 | 2026-11-14 | Kafka consumer-group throughput | local + hosted | Loopback 1,339 tx/s with one consumer; hosted PostgreSQL 65–72 tx/s, below the ~80 tx/s USDC load | [report](2026-11-14-kafka-consumer-throughput.md) |
 | 2026-11-14 | Hosted PostgreSQL TLS and latency | hosted | One writer 0.98 tx/s; batches of 100 reach 45 tx/s | [report](2026-11-14-hosted-postgres-tls.md) |
 | 2026-11-14 | Archive/replay routing and overlap | offline | Routing, archive batches and reconciliation pass offline; no provider measured | [report](2026-11-14-archive-routing.md) |
