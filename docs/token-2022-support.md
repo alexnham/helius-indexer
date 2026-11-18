@@ -15,6 +15,7 @@ JSON strings. No floating point or balance-delta reconstruction is used.
 | Transfer hooks, permanent delegate, memo / CPI guard | Supported when part of the supported successful transfer variants; extra accounts do not create additional edges |
 | WithdrawWithheldTokensFromMint (26, 2), WithdrawWithheldTokensFromAccounts (26, 3), HarvestWithheldTokensToMint (26, 4) | Recognized fee maintenance with validated length/account counts; emit no ordinary transfer edge |
 | UnwrapLamports (45), either token program | Recognized native SOL movement; excluded from token transfer edges |
+| InitializeMintCloseAuthority (25), InitializePermanentDelegate (35) | Recognized mint configuration; no transfer edge (v7) |
 | Fee configuration (26, 0 / 5), other extension instructions | Explicitly unsupported pending further coverage; not silently treated as transfers |
 | Confidential Transfer (27, 7), TransferWithFee (27, 13), current proof layout | Supported; explicit mint operand, hidden amount/fee null; see v6 boundary below |
 | Confidential configuration, deposit/withdraw within one account (27, 0–6 / 8–12 / 14) | Recognized current layouts; no transfer edge |
@@ -141,3 +142,15 @@ same-signature decoder revisions; use the explicit [repair procedure](decoder-re
 and reverify affected retained blocks. Back up the stopped session before repair;
 rollback to an older binary requires restoring the pre-v6 backup, including inputs,
 output and coverage. Stable transfer identities are unchanged.
+
+## Revision v7: Token-2022 mint setup
+
+Verified 2026-11-17 against the [Token-2022 instruction
+interface](https://github.com/solana-program/token-2022/blob/main/interface/src/instruction.rs)
+(`unpack` arms, `main` branch): tag 25 is `InitializeMintCloseAuthority` and tag 35 is
+`InitializePermanentDelegate`. Both configure a mint, have no sub-instructions and
+move no balances, so v7 emits no edge for them instead of rejecting the transaction.
+Found in the #31 overlap run, where three USDC transactions in slot 470015982 created
+a Token-2022 mint and a USDC account in one call; see `tests/fixtures/README.md`.
+Other standalone setup tags (29, 31, 32) and every extension family stay unsupported
+until captured. Repair follows the v6 procedure; identities are unchanged.
