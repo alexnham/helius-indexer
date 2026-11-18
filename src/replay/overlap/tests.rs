@@ -176,6 +176,22 @@ fn replay_omission_conflict_and_pending_are_distinct() {
 }
 
 #[test]
+fn a_failed_archive_transaction_is_not_a_replay_omission() {
+    // The replay filter excludes failed transactions, so their absence is expected.
+    let mut failed = archive_tx();
+    failed["transaction"]["signatures"][0] = json!(bs58::encode([7u8; 64]).into_string());
+    failed["meta"]["err"] = json!({"InstructionError":[0,{"Custom":1}]});
+    let db = setup();
+    deliver_replay(&db.0);
+    archive_all(
+        &db.0,
+        &mut Blocks([(SLOT, vec![archive_tx(), failed])].into()),
+    );
+    let report = reconcile(&db.0, "job", &mut Telemetry::default()).unwrap();
+    assert_eq!(report["outcomes"], json!({"consistent":2}));
+}
+
+#[test]
 fn differing_effects_conflict_and_a_decoder_revision_change_is_pending() {
     let db = setup();
     deliver_replay(&db.0);
