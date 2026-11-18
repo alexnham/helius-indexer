@@ -191,8 +191,9 @@ see [live validation](live-ingestion.md).
 
 ## Combined source validation
 
-The overlap command includes a terminal admission-gate snapshot: active writes,
-waiting live/historical operations, oldest wait age, admission counts and elapsed
+The overlap command includes a terminal admission-gate snapshot: whether any write
+is active, `active_writes` against `write_limit` (one permit per configured historical
+worker), waiting live/historical operations, oldest wait age, admission counts and elapsed
 wait sums. A gate operation is not a unique transaction; deduplicated counts and
 volume come from the storage summary. Existing source reports retain separate
 durable input, decoded output, and verified coverage progress. The public gate

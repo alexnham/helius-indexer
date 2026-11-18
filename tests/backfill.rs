@@ -726,7 +726,7 @@ fn numbered(n: u64, related: bool) -> Value {
 #[test]
 #[ignore = "measurement: run explicitly against local PostgreSQL"]
 fn historical_block_throughput() {
-    const SLOTS: u64 = 8;
+    const SLOTS: u64 = 32;
     const PER_BLOCK: u64 = 1_000;
     for related_every in [1, 20] {
         let (_dir, path) = db();
@@ -756,5 +756,215 @@ fn historical_block_throughput() {
             SLOTS * PER_BLOCK,
             (SLOTS * PER_BLOCK) as f64 / seconds
         );
+    }
+}
+
+/// Eight consecutive blocks of 30 transactions, one in three transferring the mint.
+fn parallel_blocks() -> (u64, Vec<(u64, Vec<u8>)>) {
+    let start = fixture()["result"]["slot"].as_u64().unwrap();
+    let blocks = (0..8)
+        .map(|n| {
+            let txs = (0..30).map(|i| numbered(n * 30 + i, i % 3 == 0)).collect();
+            (start + n, block(start + n, start + n - 1, txs))
+        })
+        .collect();
+    (start, blocks)
+}
+
+fn sorted_transfers(path: &Database) -> Vec<helius_indexer::model::Transfer> {
+    let mut transfers = Store::query(path, None, 1000).unwrap();
+    transfers.sort_by(|a, b| a.transfer_id.cmp(&b.transfer_id));
+    transfers
+}
+
+fn parallel_history(path: &Database, workers: usize) -> History {
+    let mut history = History::open(path).unwrap();
+    history.set_workers(workers).unwrap();
+    history
+}
+
+#[test]
+fn parallel_workers_store_what_a_single_worker_stores() {
+    let (start, blocks) = parallel_blocks();
+    let (_single_dir, single) = db();
+    let (coverage, one) = parallel_history(&single, 1)
+        .run(
+            &mint(),
+            start,
+            start + 7,
+            &mut source(blocks.clone()),
+            || false,
+        )
+        .unwrap();
+    assert!(coverage.complete);
+    let (_parallel_dir, parallel) = db();
+    let (coverage, four) = parallel_history(&parallel, 4)
+        .run(&mint(), start, start + 7, &mut source(blocks), || false)
+        .unwrap();
+    assert!(coverage.complete);
+    assert_eq!(coverage.contiguous_through, Some(start + 7));
+    assert_eq!(sorted_transfers(&parallel), sorted_transfers(&single));
+    assert_eq!(sorted_transfers(&parallel).len(), 8 * 10 * 2);
+    assert_eq!(four.decoded_transactions, one.decoded_transactions);
+    assert_eq!(four.decoded_transfers, one.decoded_transfers);
+    assert_eq!(four.unrelated_transactions, one.unrelated_transactions);
+    assert_eq!(four.storage.writes, one.storage.writes);
+}
+
+#[test]
+fn a_failed_slot_stops_the_checkpoint_while_later_slots_complete_out_of_order() {
+    let (start, blocks) = parallel_blocks();
+    let (_dir, path) = db();
+    let mut missing = source(blocks.clone());
+    missing.blocks.remove(&(start + 3));
+    let (coverage, metrics) = parallel_history(&path, 4)
+        .run(&mint(), start, start + 7, &mut missing, || false)
+        .unwrap();
+    assert!(!coverage.complete);
+    assert_eq!(coverage.contiguous_through, Some(start + 2));
+    assert_eq!(coverage.slots[3].status, "unknown");
+    assert!(coverage.slots[4..].iter().all(|s| s.status == "complete"));
+    assert_eq!(metrics.source_errors, 1);
+    let (coverage, metrics) = parallel_history(&path, 4)
+        .run(&mint(), start, start + 7, &mut source(blocks), || false)
+        .unwrap();
+    assert!(coverage.complete);
+    assert_eq!(metrics.source_attempts, 1);
+    assert_eq!(sorted_transfers(&path).len(), 8 * 10 * 2);
+}
+
+#[test]
+fn parallel_cancellation_claims_nothing_unverified_and_a_rerun_completes() {
+    let (start, blocks) = parallel_blocks();
+    let (_dir, path) = db();
+    let checks = Cell::new(0);
+    let (coverage, metrics) = parallel_history(&path, 4)
+        .run(
+            &mint(),
+            start,
+            start + 7,
+            &mut source(blocks.clone()),
+            || {
+                checks.set(checks.get() + 1);
+                checks.get() > 3
+            },
+        )
+        .unwrap();
+    assert!(metrics.cancelled);
+    assert!(!coverage.complete);
+    let mut client = path.test_client();
+    // Every acknowledged slot holds its whole block's output.
+    for slot in coverage.slots.iter().filter(|s| s.status == "complete") {
+        let transfers: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM transfers WHERE slot=$1",
+                &[&(slot.slot as i64)],
+            )
+            .unwrap()
+            .get(0);
+        assert_eq!(transfers, 20, "slot {}", slot.slot);
+    }
+    let (coverage, _) = parallel_history(&path, 4)
+        .run(&mint(), start, start + 7, &mut source(blocks), || false)
+        .unwrap();
+    assert!(coverage.complete);
+    assert_eq!(sorted_transfers(&path).len(), 8 * 10 * 2);
+}
+
+#[test]
+#[ignore = "subprocess helper for parallel process-exit recovery"]
+fn parallel_process_exit_child() {
+    let session = std::env::var("INDEXER_TEST_RECOVERY_DB").unwrap();
+    let path = &Database::new(TestDatabase::url(), &session).unwrap();
+    let (start, blocks) = parallel_blocks();
+    let mut history = History::open(path).unwrap();
+    history.set_workers(4).unwrap();
+    history
+        .run(&mint(), start, start + 7, &mut source(blocks), || {
+            // Exit as soon as any output is durable, with other blocks still in flight.
+            if !Store::query(path, None, 1).unwrap().is_empty() {
+                std::process::exit(77);
+            }
+            false
+        })
+        .unwrap();
+    std::process::exit(0);
+}
+
+#[test]
+fn parallel_process_exit_never_acknowledges_a_partial_block_and_a_rerun_recovers() {
+    let (_dir, path) = db();
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "parallel_process_exit_child", "--ignored"])
+        .env("INDEXER_TEST_RECOVERY_DB", path.session())
+        .output()
+        .unwrap()
+        .status;
+    assert_eq!(status.code(), Some(77));
+    let (start, blocks) = parallel_blocks();
+    let before = History::open(&path)
+        .unwrap()
+        .coverage(&mint(), start, start + 7)
+        .unwrap();
+    assert!(!before.complete);
+    let mut client = path.test_client();
+    for slot in before.slots.iter().filter(|s| s.status == "complete") {
+        let transfers: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM transfers WHERE slot=$1",
+                &[&(slot.slot as i64)],
+            )
+            .unwrap()
+            .get(0);
+        assert_eq!(transfers, 20, "slot {}", slot.slot);
+    }
+    let (coverage, _) = parallel_history(&path, 4)
+        .run(
+            &mint(),
+            start,
+            start + 7,
+            &mut source(blocks.clone()),
+            || false,
+        )
+        .unwrap();
+    assert!(coverage.complete);
+    let (_single_dir, single) = db();
+    parallel_history(&single, 1)
+        .run(&mint(), start, start + 7, &mut source(blocks), || false)
+        .unwrap();
+    assert_eq!(sorted_transfers(&path), sorted_transfers(&single));
+}
+
+#[test]
+fn parallel_workers_record_a_skipped_slot_from_its_childs_parent_link() {
+    let (start, mut blocks) = parallel_blocks();
+    let skipped = start + 3;
+    for (slot, raw) in &mut blocks {
+        if *slot == skipped {
+            *raw = serde_json::to_vec(
+                &json!({"jsonrpc":"2.0","id":1,"error":{"code":-32007,"message":"Slot was skipped"}}),
+            )
+            .unwrap();
+        } else if *slot == skipped + 1 {
+            let mut value: Value = serde_json::from_slice(raw).unwrap();
+            value["result"]["parentSlot"] = json!(skipped - 1);
+            *raw = serde_json::to_vec(&value).unwrap();
+        }
+    }
+    // Completion order is not controlled here; `finish` also keeps skip evidence when the
+    // child happens to finish before the skipped slot's own source error.
+    for _ in 0..3 {
+        let (_dir, path) = db();
+        let (coverage, _) = parallel_history(&path, 4)
+            .run(
+                &mint(),
+                start,
+                start + 7,
+                &mut source(blocks.clone()),
+                || false,
+            )
+            .unwrap();
+        assert_eq!(coverage.slots[3].status, "skipped");
+        assert!(coverage.complete);
     }
 }
