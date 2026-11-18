@@ -188,6 +188,65 @@ fn missing_metadata_null_blocks_and_rpc_skipped_errors_stay_retryable() {
 }
 
 #[test]
+fn retained_blocks_keep_unrelated_transactions_as_signatures_and_replay_offline() {
+    let usdc = fixture()["result"].clone();
+    let slot = usdc["slot"].as_u64().unwrap();
+    let unrelated = numbered(1, false);
+    let raw = block(slot, slot - 1, vec![usdc, unrelated.clone()]);
+    let expected = decoder::decode(
+        &decoder::parse_capture(include_bytes!("fixtures/mainnet-transfer.json")).unwrap(),
+    )
+    .unwrap();
+    for workers in [1, 2] {
+        let (_dir, path) = db();
+        let mut source = source(vec![(slot, raw.clone())]);
+        let checks = Cell::new(0);
+        let mut history = parallel_history(&path, workers);
+        let (_, metrics) = history
+            .run(&mint(), slot, slot, &mut source, || {
+                checks.set(checks.get() + 1);
+                checks.get() > 1
+            })
+            .unwrap();
+        assert!(metrics.cancelled);
+        let row = path
+            .test_client()
+            .query_one("SELECT pruned,response FROM historical_inputs", &[])
+            .unwrap();
+        assert!(row.get::<_, bool>(0));
+        let stored: Value = serde_json::from_slice(&row.get::<_, Vec<u8>>(1)).unwrap();
+        let txs = stored["result"]["transactions"].as_array().unwrap();
+        assert_eq!(txs[0]["meta"], fixture()["result"]["meta"]);
+        assert_eq!(
+            txs[1],
+            json!({"transaction":{"signatures":unrelated["transaction"]["signatures"]}})
+        );
+        assert_eq!(
+            stored["result"]["blockhash"],
+            json!(bs58::encode([7; 32]).into_string())
+        );
+        assert!(metrics.retained_bytes > 0 && metrics.retained_bytes < metrics.input_bytes);
+        // The pruned block alone completes the slot: same transfers, same block identity.
+        source.blocks.clear();
+        let (coverage, metrics) = parallel_history(&path, workers)
+            .run(&mint(), slot, slot, &mut source, || false)
+            .unwrap();
+        assert!(coverage.complete);
+        assert_eq!(metrics.source_attempts, 0);
+        assert_eq!(metrics.unrelated_transactions, 1);
+        assert_eq!(Store::query(&path, None, 1000).unwrap(), expected);
+        let marked: Vec<bool> = path
+            .test_client()
+            .query("SELECT pruned FROM historical_inputs ORDER BY attempt", &[])
+            .unwrap()
+            .iter()
+            .map(|r| r.get(0))
+            .collect();
+        assert_eq!(marked, [true, true], "a reused pruned block stays marked");
+    }
+}
+
+#[test]
 fn cancellation_after_raw_ack_replays_durable_input_without_source() {
     let (_dir, path) = db();
     let slot = fixture()["result"]["slot"].as_u64().unwrap();
@@ -751,10 +810,18 @@ fn historical_block_throughput() {
             metrics.decoded_transactions + metrics.unrelated_transactions,
             SLOTS * PER_BLOCK
         );
+        let stored: i64 = path
+            .test_client()
+            .query_one("SELECT pg_total_relation_size('historical_inputs')", &[])
+            .unwrap()
+            .get(0);
         println!(
-            "historical_block_throughput: 1 in {related_every} related, {} tx in {seconds:.2} s = {:.0} tx/s",
+            "historical_block_throughput: 1 in {related_every} related, {} tx in {seconds:.2} s = {:.0} tx/s; raw {} MiB fetched, {} MiB retained, historical_inputs {} MiB on disk",
             SLOTS * PER_BLOCK,
-            (SLOTS * PER_BLOCK) as f64 / seconds
+            (SLOTS * PER_BLOCK) as f64 / seconds,
+            metrics.input_bytes >> 20,
+            metrics.retained_bytes >> 20,
+            stored >> 20
         );
     }
 }

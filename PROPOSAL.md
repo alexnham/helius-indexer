@@ -92,6 +92,8 @@ Block-time policy (reviewed 2026-11-14):
 
 Provisionally retain matched raw transactions for 37 days: 30 days of query history plus a seven-day repair margin. Compressed object storage is the candidate raw store. Preserve instructions, inner instructions, relevant execution metadata, source provenance, and schema/version information needed to repeat decoding. Size and validate this policy before production.
 
+Requirements change (2026-11-18): historical block responses are retained pruned. The block header, every transaction's signatures and each transaction that touches the job's mint (decodable or not) are kept; other transactions keep only their signatures. Block identity, skip evidence, retries and decoder repair still run offline from the pruned block. Correcting the mint filter itself requires fetching the affected blocks again from the source. Archive/RPC bridge evidence still retains whole blocks, because it compares them.
+
 The initial API provides:
 
 - Transfer listings filtered by mint and time, with deterministic ordering and pagination.
@@ -320,8 +322,8 @@ reported independently of sampling, and the sample describes only the coverage
 actually established. It does not satisfy the exact 30-day index (#70) or reduce
 provider traffic or decoder work.
 
-For this demo, retain all fetched raw inputs, including those whose decoded
-transfers are excluded, for the lifetime of the isolated dataset. Corrections
+For this demo, retain all fetched raw inputs (historical blocks pruned as described
+under retention), including those whose decoded transfers are excluded, for the lifetime of the isolated dataset. Corrections
 redecode retained inputs; after the dataset is deleted, recovery requires a
 suitable historical provider or backup and is not guaranteed. Count-based pruning
 is refused on a sampled dataset. Sampling saves transfer rows only; raw-input
