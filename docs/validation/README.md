@@ -18,7 +18,7 @@ dated report that holds the command, dataset, environment and full results.
 
 | Date | Run | Source | Headline result | Report |
 | --- | --- | --- | --- | --- |
-| 2026-11-18 | Archive bridge throughput baseline | provider + local | 200 slots, 8 workers: cold 11 slots/s, 5.6 when one request stalls; warm ~32 slots/s; stalled pieces now retried instead of failing a slot; 8 concurrent piece streams: 14.8 → 12.9 s per cold batch | [report](2026-11-18-archive-throughput-baseline.md) |
+| 2026-11-18 | Archive bridge throughput baseline | provider + local | 200 slots, 8 workers: cold 11 slots/s, 5.6 when one request stalls; warm ~32 slots/s; stalled pieces now retried instead of failing a slot; 8 concurrent piece streams: 14.8 → 12.9 s per cold batch; pruning in decode: 12.7 → 9.7 s cold, 6.0 → 2.8 s warm (~71 slots/s) | [report](2026-11-18-archive-throughput-baseline.md) |
 | 2026-11-18 | One-hour 10% USDC sample (#72) | provider + local | 9,000 slots in 3 h 14 min (3.2× slower than real time); 1.4 MB/slot, mostly raw archive blocks; 8,282 slots `consistent`, 0 conflicts; 0.30% of inputs unresolved | [report](2026-11-18-sample-one-hour.md) |
 | 2026-11-18 | Pruned historical blocks | local | 1 in 20 transactions transfer the mint: retained raw block bytes 120 → 17 MiB (−86%), `historical_inputs` ~47 → 7 MiB on disk; throughput change within noise on a loaded laptop | [report](2026-11-18-pruned-historical-blocks.md) |
 | 2026-11-18 | Capture payload stored once (#65) | local | 8 workers, uncapped local PostgreSQL: WAL −18–29%; ~1,700 → ~2,150 tx/s when every transaction transfers the mint, ~10,000 → ~11,900 tx/s when 1 in 20 does | [report](2026-11-18-capture-payload-once.md) |

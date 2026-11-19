@@ -374,7 +374,7 @@ fn a_planned_window_decodes_in_parallel_to_the_same_blocks_and_errors() {
     let mut sequential = ArchiveSource::new(dir.path(), false, Limits::default()).unwrap();
     let expected: Vec<_> = slots.iter().map(|&x| sequential.block(x)).collect();
     let mut windowed = ArchiveSource::new(dir.path(), false, Limits::default()).unwrap();
-    windowed.plan(s - 1, s + 3);
+    windowed.plan(crate::live::USDC, s - 1, s + 3);
     windowed.threads = 4;
     let actual: Vec<_> = slots.iter().map(|&x| windowed.block(x)).collect();
     assert_eq!(actual, expected);
@@ -383,6 +383,59 @@ fn a_planned_window_decodes_in_parallel_to_the_same_blocks_and_errors() {
     assert_eq!(
         child["result"]["previousBlockhash"],
         bs58::encode([4u8; 32]).into_string()
+    );
+}
+
+#[test]
+fn a_pruned_decode_equals_the_pruned_full_decode_for_either_mint() {
+    let value = fixture();
+    let slot = value["result"]["slot"].as_u64().unwrap();
+    let raw = slot_range(&value, slot, slot - 1, 7, true);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let full = runtime.block_on(decode_slot(&raw, slot)).unwrap();
+    let wrapped = serde_json::to_vec(&json!({ "result": full.0 })).unwrap();
+    // The fixture's own mint keeps the transaction whole; another mint reduces it to
+    // exactly what `prune` stores.
+    for (mint, expected) in [
+        (crate::live::USDC, full.0.clone()),
+        (
+            "So11111111111111111111111111111111111111112",
+            serde_json::from_slice::<Value>(
+                &crate::backfill::prune(&wrapped, "So11111111111111111111111111111111111111112")
+                    .unwrap(),
+            )
+            .unwrap()["result"]
+                .clone(),
+        ),
+    ] {
+        let pruned = runtime
+            .block_on(super::decode::decode_pruned(&raw, slot, Some(mint)))
+            .unwrap();
+        assert_eq!((pruned.1, &pruned.2), (full.1, &full.2));
+        assert_eq!(pruned.0, expected);
+    }
+    // A planned window prunes; the same slot outside any plan (boundary evidence) does not.
+    let dir = tempfile::tempdir().unwrap();
+    put_cache(dir.path(), slot, &raw);
+    put_cache(
+        dir.path(),
+        slot - 1,
+        &slot_range(&value, slot - 1, slot - 2, 6, false),
+    );
+    let mut source = ArchiveSource::new(dir.path(), false, Limits::default()).unwrap();
+    let whole: Value = serde_json::from_slice(&source.block(slot).unwrap()).unwrap();
+    source.plan("So11111111111111111111111111111111111111112", slot, slot);
+    let planned: Value = serde_json::from_slice(&source.block(slot).unwrap()).unwrap();
+    assert_eq!(whole["result"]["transactions"], full.0["transactions"]);
+    assert_eq!(
+        planned["result"]["transactions"][0]
+            .as_object()
+            .unwrap()
+            .len(),
+        1
     );
 }
 

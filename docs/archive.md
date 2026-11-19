@@ -46,7 +46,13 @@ on 8 concurrent streams; one stream gets ~4–11 MiB/s and the total levels off 
 requested once more, within the same limits; the source diagnostics count these
 as `retries`. Each slot is still cached with its own receipt, so a
 128-slot window takes about 17 requests instead of about 260. The planned window's
-blocks are then decoded on `INDEXER_HISTORICAL_WORKERS` threads.
+blocks are then decoded on `INDEXER_HISTORICAL_WORKERS` threads. A planned
+window knows the run's mint, so a transaction that does not touch it is parsed and
+validated but not normalized: it is decoded straight to the signature-only form
+`backfill::prune` stores (about 9 in 10 USDC block transactions, 5× less decode
+time). An unrelated transaction that the live normalizer would reject therefore no
+longer fails its block. Slots outside a planned range, such as the bridge's
+boundary evidence, are always decoded whole.
 The bridge additionally allows at most eight 64 MiB RPC block responses.
 Normalized blocks and metadata decompression have explicit size limits.
 `BACKFILL_CANCEL_FILE` stops scheduling at slot boundaries; an in-flight request

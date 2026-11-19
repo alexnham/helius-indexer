@@ -91,3 +91,30 @@ slots/s on a clean cold batch.
 
 What is left: each subrange is downloaded completely before its blocks are decoded, so
 download and decode still take turns. Overlapping them is the next download change.
+
+## Unrelated transactions pruned during decode (`codex/archive-prune-in-decode`)
+
+Timing the decode of the 202 cached blocks on one thread: parsing the CAR nodes takes
+0.53 s and the full decode 13.3 s, so ~96% is per-transaction normalization (live
+`normalize` to JSON, parsed back and serialized again), while ~91% of transactions are
+then pruned to signatures as unrelated. Inside a planned window, the decoder now checks
+the mint against the fields `touches_mint` reads (static keys, loaded addresses,
+token-balance mints) right after validation and emits the signature-only form directly.
+
+Equivalence on real data (scratch harness, not committed): for all 48,809 transactions
+of the 202 cached blocks, the pruned decode equals `backfill::prune` of the full decode,
+transaction for transaction (0 mismatches), with the same block hash and parent;
+4,519 transactions kept. Single-thread decode: 13.11 s → 2.61 s.
+
+Alternating runs against the concurrent-pieces branch (A):
+
+| | A | B (this branch) |
+| --- | --- | --- |
+| Cold, 5 + 5, median | 12.7 s (11.9–13.9) | **9.7 s** (8.3–10.8) |
+| Warm, 3 + 3, median | 6.0 s | **2.8 s** |
+| Time in `block` calls, warm | 4.6–4.8 s | 1.5–1.6 s |
+
+4,459 transactions decoded and 0 failed slots in every run. Against the main baseline
+(18.1 s cold when clean, 6.1 s warm), the three changes together take a clean cold
+200-slot batch from 11 to ~20.6 slots/s and the warm ceiling from ~32 to ~71 slots/s.
+A cold batch is now mostly download (~7 of ~8.4 s in `block` calls).
