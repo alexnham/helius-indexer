@@ -28,6 +28,10 @@ pub trait BlockSource {
     fn block(&mut self, slot: u64) -> Result<Vec<u8>>;
     /// The run's slot range, before its first `block`, so a source can fetch ahead.
     fn plan(&mut self, _start: u64, _end: u64) {}
+    /// Bridge evidence compares whole blocks; other sources retain pruned blocks.
+    fn keeps_full_blocks(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Default)]
@@ -216,6 +220,8 @@ pub struct Coverage {
 #[derive(Debug, Default, Serialize)]
 pub struct Metrics {
     pub input_bytes: u64,
+    /// Raw block bytes written to `historical_inputs`, after pruning unrelated transactions.
+    pub retained_bytes: u64,
     pub archive_input: bool,
     pub corroborated_input: bool,
     pub source_diagnostics: Value,
@@ -258,8 +264,8 @@ impl Metrics {
                 ))
         );
         output.push_str(&format!(
-            "indexer_historical_cached_blocks_total {}\nindexer_historical_unrelated_transactions_total {}\n",
-            self.cached_blocks, self.unrelated_transactions
+            "indexer_historical_cached_blocks_total {}\nindexer_historical_unrelated_transactions_total {}\nindexer_historical_retained_bytes_total {}\n",
+            self.cached_blocks, self.unrelated_transactions, self.retained_bytes
         ));
         let progress = &coverage.progress;
         output.push_str(&format!(
@@ -528,16 +534,20 @@ impl History {
                 let Some((raw, attempt)) = self.fetch(mint, slot, source, &mut metrics)? else {
                     continue;
                 };
-                retain(
+                let retained = retain(
                     &self.db,
                     &self.gate,
                     mint,
                     slot,
                     attempt,
                     source.provenance(),
+                    source.keeps_full_blocks(),
                     &raw,
                 )?;
-                let mut block = Metrics::default();
+                let mut block = Metrics {
+                    retained_bytes: retained.len() as u64,
+                    ..Metrics::default()
+                };
                 let outcome = process_block(
                     &raw,
                     slot,
@@ -549,6 +559,7 @@ impl History {
                         revision_repair: self.revision_repair,
                         capture_source: source.capture_source(),
                         mint,
+                        retained: &retained,
                     },
                 );
                 if self.finish(mint, start, slot, outcome, &block, &mut metrics)? {
@@ -594,10 +605,11 @@ impl History {
                 ))
             })
             .collect::<Result<Vec<_>>>()?;
-        let (gate, capture_source, provenance, stop) = (
+        let (gate, capture_source, provenance, full, stop) = (
             &*self.gate,
             source.capture_source(),
             source.provenance(),
+            source.keeps_full_blocks(),
             &AtomicBool::new(false),
         );
         std::thread::scope(|scope| -> Result<()> {
@@ -617,22 +629,25 @@ impl History {
                                 break;
                             };
                             let mut block = Metrics::default();
-                            let outcome = retain(&log, gate, mint, slot, attempt, provenance, &raw)
-                                .and_then(|()| {
-                                    process_block(
-                                        &raw,
-                                        slot,
-                                        &mut store,
-                                        &mut block,
-                                        &stopped,
-                                        BlockContext {
-                                            gate,
-                                            revision_repair: false,
-                                            capture_source,
-                                            mint,
-                                        },
-                                    )
-                                });
+                            let outcome =
+                                retain(&log, gate, mint, slot, attempt, provenance, full, &raw)
+                                    .and_then(|retained| {
+                                        block.retained_bytes = retained.len() as u64;
+                                        process_block(
+                                            &raw,
+                                            slot,
+                                            &mut store,
+                                            &mut block,
+                                            &stopped,
+                                            BlockContext {
+                                                gate,
+                                                revision_repair: false,
+                                                capture_source,
+                                                mint,
+                                                retained: &retained,
+                                            },
+                                        )
+                                    });
                             if done.send((slot, outcome, block)).is_err() {
                                 break;
                             }
@@ -784,6 +799,7 @@ impl History {
         metrics.decoded_transfers += block.decoded_transfers;
         metrics.decode_failures += block.decode_failures;
         metrics.unrelated_transactions += block.unrelated_transactions;
+        metrics.retained_bytes += block.retained_bytes;
         match outcome {
             Ok((parent, time)) => {
                 // A finalized child links directly to its parent; intermediate slots are skipped.
@@ -846,6 +862,8 @@ impl History {
     }
 }
 /// Raw input acknowledgment precedes decoding. Every failed attempt remains reproducible.
+/// Returns the bytes stored: the response itself, or its pruned form.
+#[allow(clippy::too_many_arguments)]
 fn retain(
     db: &HistoryLog,
     gate: &crate::coordinator::WriteGate,
@@ -853,10 +871,47 @@ fn retain(
     slot: u64,
     attempt: u64,
     provenance: &str,
+    full: bool,
     raw: &[u8],
-) -> Result<()> {
+) -> Result<Vec<u8>> {
+    let pruned = if full { None } else { prune(raw, mint) };
     let _permit = gate.historical()?;
-    db.retain_input(mint, slot, attempt, provenance, now(), raw)
+    db.retain_input(
+        mint,
+        slot,
+        attempt,
+        provenance,
+        now(),
+        pruned.as_deref().unwrap_or(raw),
+        pruned.is_some(),
+    )?;
+    Ok(pruned.unwrap_or_else(|| raw.to_vec()))
+}
+
+/// A block response with every transaction that does not touch `mint` reduced to its
+/// signatures: block identity and skip evidence still verify, and the mint's candidates
+/// (including undecodable ones) stay replayable. None when the response holds no
+/// signature-only transaction, including after pruning; a reused pruned block stays marked.
+pub(crate) fn prune(raw: &[u8], mint: &str) -> Option<Vec<u8>> {
+    let mut value: Value = serde_json::from_slice(raw).ok()?;
+    let (mut removed, mut pruned) = (false, false);
+    for tx in value
+        .pointer_mut("/result/transactions")?
+        .as_array_mut()?
+        .iter_mut()
+    {
+        if tx.as_object().is_some_and(|o| o.len() == 1) {
+            pruned = true;
+        } else if !crate::replay::overlap::touches_mint(tx, mint) {
+            *tx = json!({"transaction":{"signatures":tx["transaction"]["signatures"].take()}});
+            removed = true;
+        }
+    }
+    if removed {
+        serde_json::to_vec(&value).ok()
+    } else {
+        pruned.then(|| raw.to_vec())
+    }
 }
 
 /// Transactions per historical write batch; the byte bound is shared with live intake.
@@ -867,6 +922,8 @@ struct BlockContext<'a> {
     revision_repair: bool,
     capture_source: &'a str,
     mint: &'a str,
+    /// The bytes `retain` stored, so the identity scan skips that row.
+    retained: &'a [u8],
 }
 fn process_block(
     raw: &[u8],
@@ -881,6 +938,7 @@ fn process_block(
         revision_repair,
         capture_source,
         mint,
+        retained,
     } = context;
     let value: Value = serde_json::from_slice(raw).map_err(|_| Error("invalid_block_json"))?;
     if value["jsonrpc"] != "2.0" || value["id"] != 1 || value.get("error").is_some() {
@@ -918,7 +976,7 @@ fn process_block(
     }
     {
         let _permit = gate.historical()?;
-        store.observe_retained_block_identity(slot, block, transactions, raw)?;
+        store.observe_retained_block_identity(slot, block, transactions, retained)?;
     }
     let mut signatures = std::collections::HashSet::new();
     let mut failure = None;

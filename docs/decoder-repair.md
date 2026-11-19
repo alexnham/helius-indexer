@@ -46,6 +46,9 @@ no network fallback: missing retained blocks remain unknown with
 apply, and one historical worker processes the range serially. History can reuse
 retained block bytes across revisions; reports distinguish cached blocks from
 source attempts. This is a separate full-block workload, not a 100-capture batch.
+Since 2026-11-18, retained blocks keep only signatures for transactions that do not
+touch the mint, so this replay covers decoder changes for the mint's candidates; a
+correction to the mint filter itself needs those blocks fetched again from the source.
 
 A capture-only repair does not acknowledge `live_raw` input statuses. Existing
 `live-retry` replays retained protobuf through the current decoder and updates
