@@ -236,6 +236,8 @@ pub struct Metrics {
     pub unrelated_transactions: u64,
     pub decode_failures: u64,
     pub elapsed_seconds: f64,
+    /// Time spent in the source's `block` calls (fetching and, for the archive, decoding).
+    pub source_seconds: f64,
     /// Successful decode attempts per elapsed second; not a benchmark result.
     pub transactions_per_second: f64,
     pub cancelled: bool,
@@ -264,8 +266,8 @@ impl Metrics {
                 ))
         );
         output.push_str(&format!(
-            "indexer_historical_cached_blocks_total {}\nindexer_historical_unrelated_transactions_total {}\nindexer_historical_retained_bytes_total {}\n",
-            self.cached_blocks, self.unrelated_transactions, self.retained_bytes
+            "indexer_historical_cached_blocks_total {}\nindexer_historical_unrelated_transactions_total {}\nindexer_historical_retained_bytes_total {}\nindexer_historical_source_seconds {}\n",
+            self.cached_blocks, self.unrelated_transactions, self.retained_bytes, self.source_seconds
         ));
         let progress = &coverage.progress;
         output.push_str(&format!(
@@ -756,7 +758,10 @@ impl History {
             }
             None => {
                 metrics.source_attempts += 1;
-                source.block(slot)
+                let began = Instant::now();
+                let block = source.block(slot);
+                metrics.source_seconds += began.elapsed().as_secs_f64();
+                block
             }
         };
         let raw = match response {

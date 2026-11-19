@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeMap,
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -15,6 +16,8 @@ const MAX_CHUNK: usize = 16 * 1024 * 1024;
 /// Slots whose index records one prefetch reads in a single request (12 bytes each).
 const PREFETCH_SLOTS: u64 = 64;
 const EPOCH_SLOTS: u64 = 432000;
+/// Largest range one prefetch request covers; pieces of a window download concurrently.
+const PIECE_BYTES: usize = 8 * 1024 * 1024;
 /// (slot, CAR offset, length, 12-byte index record).
 type IndexEntry = (u64, u64, u32, Vec<u8>);
 static FILE_ID: AtomicU64 = AtomicU64::new(0);
@@ -61,6 +64,12 @@ pub struct ArchiveSource {
     agent: ureq::Agent,
     /// The run's slot range; a cache miss inside it prefetches the adjacent slots.
     planned: Option<(u64, u64)>,
+    /// Blocks decoded at once inside the planned range (`INDEXER_HISTORICAL_WORKERS`).
+    pub(super) threads: u64,
+    /// Normalized blocks decoded ahead of their `block` call.
+    ready: BTreeMap<u64, Result<Vec<u8>>>,
+    /// Recently decoded slots' own block hashes, so a child needs no second parse of its parent.
+    hashes: BTreeMap<u64, String>,
     pub stats: Stats,
 }
 impl ArchiveSource {
@@ -89,6 +98,9 @@ impl ArchiveSource {
                 .build()
                 .into(),
             planned: None,
+            threads: 1,
+            ready: BTreeMap::new(),
+            hashes: BTreeMap::new(),
             stats: Stats::default(),
         })
     }
@@ -100,63 +112,31 @@ impl ArchiveSource {
             .map(|d| d.min(Duration::from_secs(20)))
             .ok_or(Error("archive_time_limit"))
     }
-    fn fetch(&mut self, path: &str, offset: u64, length: usize) -> Result<Vec<u8>> {
+    /// Counts one request of `length` bytes against the limits, beyond `reserved` bytes
+    /// already admitted but not yet read, and returns its deadline.
+    fn admit(&mut self, offset: u64, length: usize, reserved: u64) -> Result<Duration> {
         if !self.network {
             return Err(Error("archive_cache_miss"));
         }
         if length == 0
             || length > MAX_CHUNK
             || self.stats.requests >= self.limits.requests
-            || self.stats.response_body_bytes + length as u64 + 1 > self.limits.bytes
+            || self.stats.response_body_bytes + reserved + length as u64 + 1 > self.limits.bytes
         {
             return Err(Error("archive_download_limit"));
         }
         let timeout = self.request_timeout()?;
-        let end = offset
+        offset
             .checked_add(length as u64 - 1)
             .ok_or(Error("archive_invalid_range"))?;
         self.stats.requests += 1;
-        let mut response = self
-            .agent
-            .get(format!("{ORIGIN}/{path}"))
-            .header("Range", format!("bytes={offset}-{end}"))
-            .header("Accept-Encoding", "identity")
-            .config()
-            .timeout_global(Some(timeout))
-            .build()
-            .call()
-            .map_err(|_| Error("archive_request_failed"))?;
-        match response.status().as_u16() {
-            403 => return Err(Error("archive_access_denied")),
-            404 => return Err(Error("archive_object_unavailable")),
-            206 => {}
-            _ => return Err(Error("archive_range_not_honored")),
-        }
-        let range = response
-            .headers()
-            .get("content-range")
-            .and_then(|h| h.to_str().ok())
-            .ok_or(Error("archive_invalid_content_range"))?;
-        validate_range(range, offset, end)?;
-        if response
-            .headers()
-            .get("content-encoding")
-            .is_some_and(|h| h != "identity")
-        {
-            return Err(Error("archive_unexpected_encoding"));
-        }
-        let mut bytes = Vec::new();
-        let read = response
-            .body_mut()
-            .as_reader()
-            .take(length as u64 + 1)
-            .read_to_end(&mut bytes);
-        self.stats.response_body_bytes += bytes.len() as u64;
-        read.map_err(|_| Error("archive_read_failed"))?;
-        if bytes.len() != length {
-            return Err(Error("archive_truncated_range"));
-        }
-        Ok(bytes)
+        Ok(timeout)
+    }
+    fn fetch(&mut self, path: &str, offset: u64, length: usize) -> Result<Vec<u8>> {
+        let timeout = self.admit(offset, length, 0)?;
+        let (bytes, read) = get(&self.agent, path, offset, length, timeout);
+        self.stats.response_body_bytes += read;
+        bytes
     }
     pub(super) fn probe_epoch(&mut self, epoch: u64) -> Result<bool> {
         if !self.network {
@@ -201,11 +181,7 @@ impl ArchiveSource {
     }
     pub(super) fn tip_time(&mut self, slot: u64) -> Result<i64> {
         let (raw, _) = self.chunk(slot)?;
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|_| Error("archive_runtime_failed"))?;
-        runtime.block_on(super::decode::block_time(&raw, slot))
+        runtime()?.block_on(super::decode::block_time(&raw, slot))
     }
     fn paths(&self, slot: u64) -> (PathBuf, PathBuf) {
         let stem = format!("epoch-{}-slot-{slot}", slot / EPOCH_SLOTS);
@@ -311,21 +287,69 @@ impl ArchiveSource {
                 wanted.push((s, offset, length, record.to_vec()));
             }
         }
-        for run in contiguous_runs(wanted) {
+        // Pieces are admitted in order against the budget, then downloaded concurrently.
+        let path = format!("{epoch}/epoch-{epoch}.car");
+        let (mut admitted, mut refused, mut reserved) = (Vec::new(), None, 0);
+        for run in contiguous_runs(wanted, PIECE_BYTES) {
             let base = run[0].1;
-            let span = run.last().map(|e| e.1 + u64::from(e.2) - base).unwrap();
-            let bytes = self.fetch(&format!("{epoch}/epoch-{epoch}.car"), base, span as usize)?;
-            for (s, offset, length, record) in run {
-                let at = (offset - base) as usize;
-                self.store(s, offset, length, record, &bytes[at..at + length as usize])?;
+            let span = run.last().map(|e| e.1 + u64::from(e.2) - base).unwrap() as usize;
+            match self.admit(base, span, reserved) {
+                Ok(timeout) => {
+                    reserved += span as u64;
+                    admitted.push((base, span, timeout, run));
+                }
+                Err(error) => {
+                    refused = Some(error);
+                    break;
+                }
             }
         }
-        Ok(())
+        // Each piece's thread also caches its slots, so their file syncs overlap.
+        let this = &*self;
+        let path = &path;
+        let pieces: Vec<(Result<()>, u64)> = std::thread::scope(|scope| {
+            let handles: Vec<_> = admitted
+                .into_iter()
+                .map(|(base, span, timeout, run)| {
+                    scope.spawn(move || {
+                        let (bytes, read) = get(&this.agent, path, base, span, timeout);
+                        let stored = bytes.and_then(|bytes| {
+                            run.into_iter().try_for_each(|(s, offset, length, record)| {
+                                let at = (offset - base) as usize;
+                                let raw = &bytes[at..at + length as usize];
+                                this.store(s, offset, length, record, raw).map(drop)
+                            })
+                        });
+                        (stored, read)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| {
+                    h.join()
+                        .unwrap_or((Err(Error("archive_request_failed")), 0))
+                })
+                .collect()
+        });
+        let mut first_error = None;
+        for (stored, read) in pieces {
+            self.stats.response_body_bytes += read;
+            if let Err(error) = stored {
+                first_error.get_or_insert(error);
+            }
+        }
+        match first_error.or(refused) {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 }
 impl BlockSource for ArchiveSource {
     fn plan(&mut self, start: u64, end: u64) {
         self.planned = Some((start, end));
+        self.threads = crate::backfill::historical_workers().unwrap_or(1) as u64;
+        self.ready.clear();
     }
     fn diagnostics(&self) -> serde_json::Value {
         serde_json::json!({"jetstreamer_revision":JETSTREAMER_REVISION,"response_body_bytes":self.stats.response_body_bytes,"requests":self.stats.requests,"cached_chunks":self.stats.cached_chunks,"limits":{"response_body_bytes":self.limits.bytes,"requests":self.limits.requests,"seconds":self.limits.seconds}})
@@ -336,23 +360,158 @@ impl BlockSource for ArchiveSource {
     fn capture_source(&self) -> &'static str {
         super::SOURCE
     }
+    /// Inside the planned range, decodes the next `threads` slots at once and serves them
+    /// in order. Cache reads and downloads stay sequential, so limits and stats are exact.
     fn block(&mut self, slot: u64) -> Result<Vec<u8>> {
-        let (raw, receipt) = self.chunk(slot)?;
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|_| Error("archive_runtime_failed"))?;
-        let (mut block, parent, _) = runtime.block_on(decode_slot(&raw, slot))?;
-        let (parent_raw, _) = self.chunk(parent)?;
-        let parent_hash = runtime.block_on(super::decode::parent_hash(&parent_raw, parent))?;
-        block["previousBlockhash"] = json!(parent_hash);
-        let bytes = serde_json::to_vec(&json!({"jsonrpc":"2.0","id":1,"result":block,"archive_provenance":{"jetstreamer_revision":receipt.jetstreamer_revision,"epoch":receipt.epoch,"slot":slot,"car_offset":receipt.offset,"car_length":receipt.length,"car_sha256":receipt.sha256}}))
-            .map_err(|_| Error("serialization_failed"))?;
-        if bytes.len() > crate::backfill::MAX_BLOCK_BYTES {
-            return Err(Error("archive_normalized_block_limit"));
+        if let Some(done) = self.ready.remove(&slot) {
+            return done;
         }
-        Ok(bytes)
+        // shortcut: a window may read (or download) slots the run then skips as complete; fine while windows stay at most 16 slots.
+        let last = match self.planned {
+            Some((start, end)) if (start..=end).contains(&slot) => {
+                end.min(slot + self.threads.max(1) - 1)
+            }
+            _ => slot,
+        };
+        self.ready.clear();
+        self.hashes
+            .retain(|s, _| *s + PREFETCH_SLOTS >= slot && *s < slot);
+        let chunks: Vec<_> = (slot..=last).map(|s| (s, self.chunk(s))).collect();
+        let decoded = parallel(chunks, |s, chunk| {
+            let (raw, receipt) = chunk?;
+            decode(&raw, s).map(|d| (d, receipt))
+        });
+        for (s, result) in &decoded {
+            if let Ok(((_, _, hash), _)) = result {
+                self.hashes.insert(*s, hash.clone());
+            }
+        }
+        let mut linked = Vec::new();
+        for (s, result) in decoded {
+            linked.push((
+                s,
+                result.and_then(|((block, parent, _), receipt)| {
+                    let hash = match self.hashes.get(&parent) {
+                        Some(hash) => hash.clone(),
+                        None => {
+                            let (raw, _) = self.chunk(parent)?;
+                            runtime()?.block_on(super::decode::parent_hash(&raw, parent))?
+                        }
+                    };
+                    Ok((block, hash, receipt))
+                }),
+            ));
+        }
+        self.ready = parallel(linked, |s, linked| {
+            let (block, hash, receipt) = linked?;
+            normalized(block, hash, s, &receipt)
+        })
+        .into_iter()
+        .collect();
+        self.ready
+            .remove(&slot)
+            .unwrap_or(Err(Error("archive_decode_failed")))
     }
+}
+fn runtime() -> Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| Error("archive_runtime_failed"))
+}
+fn decode(raw: &[u8], slot: u64) -> Result<(serde_json::Value, u64, String)> {
+    runtime()?.block_on(decode_slot(raw, slot))
+}
+/// Runs `work` on each item on its own thread; a panic becomes that slot's error.
+fn parallel<T: Send, U: Send>(
+    items: Vec<(u64, T)>,
+    work: impl Fn(u64, T) -> Result<U> + Sync,
+) -> Vec<(u64, Result<U>)> {
+    let work = &work;
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = items
+            .into_iter()
+            .map(|(s, item)| (s, scope.spawn(move || work(s, item))))
+            .collect();
+        handles
+            .into_iter()
+            .map(|(s, h)| (s, h.join().unwrap_or(Err(Error("archive_decode_failed")))))
+            .collect()
+    })
+}
+fn normalized(
+    mut block: serde_json::Value,
+    parent_hash: String,
+    slot: u64,
+    receipt: &Receipt,
+) -> Result<Vec<u8>> {
+    block["previousBlockhash"] = json!(parent_hash);
+    let bytes = serde_json::to_vec(&json!({"jsonrpc":"2.0","id":1,"result":block,"archive_provenance":{"jetstreamer_revision":receipt.jetstreamer_revision,"epoch":receipt.epoch,"slot":slot,"car_offset":receipt.offset,"car_length":receipt.length,"car_sha256":receipt.sha256}}))
+        .map_err(|_| Error("serialization_failed"))?;
+    if bytes.len() > crate::backfill::MAX_BLOCK_BYTES {
+        return Err(Error("archive_normalized_block_limit"));
+    }
+    Ok(bytes)
+}
+/// One admitted range request; also returns the response body bytes read, for the stats.
+fn get(
+    agent: &ureq::Agent,
+    path: &str,
+    offset: u64,
+    length: usize,
+    timeout: Duration,
+) -> (Result<Vec<u8>>, u64) {
+    let end = offset + length as u64 - 1;
+    let response = agent
+        .get(format!("{ORIGIN}/{path}"))
+        .header("Range", format!("bytes={offset}-{end}"))
+        .header("Accept-Encoding", "identity")
+        .config()
+        .timeout_global(Some(timeout))
+        .build()
+        .call();
+    let mut response = match response {
+        Ok(response) => response,
+        Err(_) => return (Err(Error("archive_request_failed")), 0),
+    };
+    let checked = match response.status().as_u16() {
+        403 => Err(Error("archive_access_denied")),
+        404 => Err(Error("archive_object_unavailable")),
+        206 => response
+            .headers()
+            .get("content-range")
+            .and_then(|h| h.to_str().ok())
+            .ok_or(Error("archive_invalid_content_range"))
+            .and_then(|range| validate_range(range, offset, end)),
+        _ => Err(Error("archive_range_not_honored")),
+    }
+    .and_then(|()| {
+        if response
+            .headers()
+            .get("content-encoding")
+            .is_some_and(|h| h != "identity")
+        {
+            Err(Error("archive_unexpected_encoding"))
+        } else {
+            Ok(())
+        }
+    });
+    if let Err(error) = checked {
+        return (Err(error), 0);
+    }
+    let mut bytes = Vec::new();
+    let read = response
+        .body_mut()
+        .as_reader()
+        .take(length as u64 + 1)
+        .read_to_end(&mut bytes);
+    let count = bytes.len() as u64;
+    let result = match read {
+        Err(_) => Err(Error("archive_read_failed")),
+        Ok(_) if bytes.len() != length => Err(Error("archive_truncated_range")),
+        Ok(_) => Ok(bytes),
+    };
+    (result, count)
 }
 fn read_bounded(path: &Path, max: usize) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
@@ -403,14 +562,15 @@ fn decode_index(record: &[u8]) -> Result<(u64, u32)> {
     Ok((offset, length))
 }
 /// Groups (slot, offset, length, record) entries into runs fetched with one request: each
-/// block starts where the previous one ended, and a run spans at most 16 MiB.
-fn contiguous_runs(entries: Vec<IndexEntry>) -> Vec<Vec<IndexEntry>> {
+/// block starts where the previous one ended, and a run spans at most `max_span` bytes
+/// (a single larger block, up to 16 MiB, is its own run).
+fn contiguous_runs(entries: Vec<IndexEntry>, max_span: usize) -> Vec<Vec<IndexEntry>> {
     let mut runs: Vec<Vec<IndexEntry>> = Vec::new();
     for entry in entries {
         match runs.last_mut() {
             Some(run)
                 if run.last().is_some_and(|p| p.1 + u64::from(p.2) == entry.1)
-                    && entry.1 + u64::from(entry.2) - run[0].1 <= MAX_CHUNK as u64 =>
+                    && entry.1 + u64::from(entry.2) - run[0].1 <= max_span as u64 =>
             {
                 run.push(entry)
             }
@@ -445,21 +605,27 @@ mod tests {
         assert!(decode_index(&[1; 11]).is_err());
     }
     #[test]
-    fn only_adjacent_blocks_share_a_request_and_a_run_stays_under_16_mib() {
+    fn only_adjacent_blocks_share_a_request_and_a_run_stays_within_a_piece() {
         let e = |slot, offset, length: usize| (slot, offset, length as u32, vec![]);
         let starts = |runs: Vec<Vec<IndexEntry>>| {
             runs.iter()
                 .map(|r| r.iter().map(|e| e.0).collect::<Vec<_>>())
                 .collect::<Vec<_>>()
         };
-        // 1-2 adjacent; 3 leaves a gap; 4 is adjacent to 3 but would pass 16 MiB.
-        let runs = contiguous_runs(vec![
-            e(1, 100, 10),
-            e(2, 110, 5),
-            e(3, 200, MAX_CHUNK - 10),
-            e(4, 200 + MAX_CHUNK as u64 - 10, 11),
-        ]);
-        assert_eq!(starts(runs), vec![vec![1, 2], vec![3], vec![4]]);
+        // 1-2 adjacent; 3 leaves a gap; 4 is adjacent to 3 but would pass the piece size;
+        // 5 is larger than a piece on its own and still gets a run.
+        let piece = PIECE_BYTES as u64;
+        let runs = contiguous_runs(
+            vec![
+                e(1, 100, 10),
+                e(2, 110, 5),
+                e(3, 200, PIECE_BYTES - 10),
+                e(4, 200 + piece - 10, 11),
+                e(5, 201 + piece, PIECE_BYTES + 1),
+            ],
+            PIECE_BYTES,
+        );
+        assert_eq!(starts(runs), vec![vec![1, 2], vec![3], vec![4], vec![5]]);
     }
     #[test]
     fn offline_cache_miss_never_attempts_a_network() {

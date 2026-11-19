@@ -352,6 +352,41 @@ fn cached_car_source_replays_through_real_storage_and_both_source_orders() {
 }
 
 #[test]
+fn a_planned_window_decodes_in_parallel_to_the_same_blocks_and_errors() {
+    let value = fixture();
+    let s = value["result"]["slot"].as_u64().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    // s-2 <- s-1 <- s <- s+1 <- s+3; s+2 is not cached (offline cache miss).
+    for (slot, parent, hash) in [
+        (s - 2, s - 3, 1),
+        (s - 1, s - 2, 2),
+        (s, s - 1, 3),
+        (s + 1, s, 4),
+        (s + 3, s + 1, 5),
+    ] {
+        put_cache(
+            dir.path(),
+            slot,
+            &slot_range(&value, slot, parent, hash, true),
+        );
+    }
+    let slots = [s - 1, s, s + 1, s + 2, s + 3];
+    let mut sequential = ArchiveSource::new(dir.path(), false, Limits::default()).unwrap();
+    let expected: Vec<_> = slots.iter().map(|&x| sequential.block(x)).collect();
+    let mut windowed = ArchiveSource::new(dir.path(), false, Limits::default()).unwrap();
+    windowed.plan(s - 1, s + 3);
+    windowed.threads = 4;
+    let actual: Vec<_> = slots.iter().map(|&x| windowed.block(x)).collect();
+    assert_eq!(actual, expected);
+    assert_eq!(actual[3], Err(Error("archive_cache_miss")));
+    let child: Value = serde_json::from_slice(actual[4].as_ref().unwrap()).unwrap();
+    assert_eq!(
+        child["result"]["previousBlockhash"],
+        bs58::encode([4u8; 32]).into_string()
+    );
+}
+
+#[test]
 fn corrupt_truncated_or_incomplete_archives_cannot_prove_empty_coverage() {
     let value = fixture();
     let slot = value["result"]["slot"].as_u64().unwrap();
