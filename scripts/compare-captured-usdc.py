@@ -6,7 +6,8 @@ Reads the session through the read-only `comparison-input` CLI command (binary f
 INDEXER_BINARY, default `helius-indexer`): at most 16 retained blocks with --sample
 (33 observations otherwise), 64 MiB, and 100,000 stored USDC rows.
 The independent parser excludes transactions with runtime failure evidence.
-It does not certify Token-2022 transfers or full-chain/provider completeness.
+It does not certify Token-2022 transfers or full-chain/provider completeness, and it
+cannot re-check the mint filter on pruned transactions (signatures only).
 """
 import json
 import os
@@ -54,6 +55,9 @@ def compare(exported):
     expected = {}
     for slot, block in blocks.items():
         for tx in block["transactions"]:
+            if "meta" not in tx:
+                # Pruned at retention: the indexer found it does not touch the mint.
+                continue
             meta = tx["meta"]
             if meta["err"] is not None or any(
                 runtime_failure(line) for line in meta.get("logMessages") or []

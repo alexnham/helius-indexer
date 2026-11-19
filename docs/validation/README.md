@@ -18,6 +18,7 @@ dated report that holds the command, dataset, environment and full results.
 
 | Date | Run | Source | Headline result | Report |
 | --- | --- | --- | --- | --- |
+| 2026-11-18 | Pruned historical blocks | local | 1 in 20 transactions transfer the mint: retained raw block bytes 120 → 17 MiB (−86%), `historical_inputs` ~47 → 7 MiB on disk; throughput change within noise on a loaded laptop | [report](2026-11-18-pruned-historical-blocks.md) |
 | 2026-11-18 | Capture payload stored once (#65) | local | 8 workers, uncapped local PostgreSQL: WAL −18–29%; ~1,700 → ~2,150 tx/s when every transaction transfers the mint, ~10,000 → ~11,900 tx/s when 1 in 20 does | [report](2026-11-18-capture-payload-once.md) |
 | 2026-11-18 | Parallel historical block workers | local | 8 workers on uncapped local PostgreSQL: ~800 → ~1,600 tx/s when every transaction transfers the mint, ~3,300 → ~8,500 tx/s when 1 in 20 does | [report](2026-11-18-parallel-historical-workers.md) |
 | 2026-11-18 | Historical block write throughput | local | Batched block writes: 97 → 723–995 tx/s when every transaction transfers the mint, 1,223 → 2,721–3,650 tx/s when 1 in 20 does | [report](2026-11-18-historical-block-throughput.md) |

@@ -44,6 +44,9 @@ impl BlockSource for Corroborated {
         }
         Ok(self.raw.clone())
     }
+    fn keeps_full_blocks(&self) -> bool {
+        true
+    }
 }
 pub(crate) fn ingest(
     history: &mut History,
