@@ -8,23 +8,36 @@ use std::{
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 const ORIGIN: &str = "https://files.old-faithful.net";
 const MAX_CHUNK: usize = 16 * 1024 * 1024;
-/// Slots whose index records one prefetch reads in a single request (12 bytes each).
-const PREFETCH_SLOTS: u64 = 64;
+/// Slots whose index records one prefetch reads in a single request (12 bytes each): a
+/// whole bridge subrange.
+const PREFETCH_SLOTS: u64 = 128;
 const EPOCH_SLOTS: u64 = 432000;
 /// Largest range one prefetch request covers; pieces of a window download concurrently.
 const PIECE_BYTES: usize = 8 * 1024 * 1024;
+/// Concurrent piece downloads. One archive stream gets ~4-11 MiB/s and the total levels
+/// off at 8-16 streams (docs/validation/2026-11-18-archive-throughput-baseline.md).
+const STREAMS: usize = 8;
+/// Pieces per window: small pieces keep a stalled piece's deadline short.
+const PIECES: u32 = 2 * STREAMS as u32;
+/// A window is split into about `pieces` pieces of 1 MiB to `PIECE_BYTES` each.
+fn piece_span(window: u64, pieces: u32) -> usize {
+    (window / u64::from(pieces.max(1))).clamp(1024 * 1024, PIECE_BYTES as u64) as usize
+}
 /// A read that waits this long for bytes fails, so a stalled stream is retried instead of
 /// holding its window until the 20-second deadline.
 const STALL: Duration = Duration::from_secs(3);
 /// Slowest per-stream rate a piece may take before it is retried, so a trickling stream
 /// costs seconds rather than the full deadline.
-// shortcut: assumes each archive stream gets at least 2 MiB/s; a slower link fails pieces twice, make it configurable then.
-const MIN_PIECE_RATE: u64 = 2 * 1024 * 1024;
+// shortcut: assumes each of the `STREAMS` gets at least 1 MiB/s; a slower link fails pieces twice, make it configurable then.
+const MIN_PIECE_RATE: u64 = 1024 * 1024;
 /// Deadline for one piece of `span` bytes: 2 seconds plus its size at `MIN_PIECE_RATE`.
 fn piece_deadline(span: usize) -> Duration {
     Duration::from_secs(2) + Duration::from_secs_f64(span as f64 / MIN_PIECE_RATE as f64)
@@ -92,7 +105,7 @@ impl ArchiveSource {
         if limits.bytes == 0
             || limits.bytes > 128 * 1024 * 1024
             || limits.requests == 0
-            || limits.requests > 32
+            || limits.requests > 128
             || limits.seconds == 0
             || limits.seconds > 120
         {
@@ -285,8 +298,9 @@ impl ArchiveSource {
     }
     /// Caches the uncached slots of the planned range near `slot` (from its predecessor,
     /// usually its parent) with one index request and one request per contiguous run of
-    /// blocks up to 16 MiB. Each slot keeps its own receipt; slots without an index entry
-    /// are left for `chunk` to report.
+    /// blocks, about `PIECES` runs per window, at most `STREAMS` at once. Each slot keeps
+    /// its own receipt; slots without an index entry, or whose piece is lost, are left for
+    /// `chunk` to fetch or report.
     fn prefetch(&mut self, slot: u64, start: u64, end: u64) -> Result<()> {
         let epoch = slot / EPOCH_SLOTS;
         let first = slot.saturating_sub(1).max(start).max(epoch * EPOCH_SLOTS);
@@ -308,8 +322,16 @@ impl ArchiveSource {
         // Pieces are admitted in order against the budget, then downloaded concurrently. A
         // piece that stalls or drops is requested once more, also within the budget.
         let url = format!("{}/{epoch}/epoch-{epoch}.car", self.origin);
-        let (mut pending, mut refused, mut first_error) =
-            (contiguous_runs(wanted, PIECE_BYTES), None, None);
+        // Up to `PIECES` pieces, using at most half the requests left so retries and the
+        // run's later windows still fit the command's request limit.
+        let window = wanted.iter().map(|e| u64::from(e.2)).sum();
+        let left = self.limits.requests.saturating_sub(self.stats.requests);
+        let pieces = (left / 2).min(PIECES);
+        let (mut pending, mut refused, mut first_error) = (
+            contiguous_runs(wanted, piece_span(window, pieces)),
+            None,
+            None,
+        );
         for round in 0..2 {
             let (mut admitted, mut reserved) = (Vec::new(), 0);
             for run in pending {
@@ -326,36 +348,41 @@ impl ArchiveSource {
                     }
                 }
             }
-            // Each piece's thread also caches its slots, so their file syncs overlap.
-            let this = &*self;
-            let url = &url;
-            let pieces: Vec<(Result<()>, u64, Vec<IndexEntry>)> = std::thread::scope(|scope| {
-                let handles: Vec<_> = admitted
-                    .into_iter()
-                    .map(|(base, span, timeout, run)| {
-                        scope.spawn(move || {
-                            let (bytes, read) =
-                                get(&this.agent, url, base, span, timeout, this.stall);
-                            let stored = bytes.and_then(|bytes| {
-                                run.iter().try_for_each(|(s, offset, length, record)| {
-                                    let at = (offset - base) as usize;
-                                    let raw = &bytes[at..at + *length as usize];
-                                    this.store(*s, *offset, *length, record.clone(), raw)
-                                        .map(drop)
-                                })
-                            });
-                            (stored, read, run)
+            // Each stream also caches its pieces' slots, so their file syncs overlap.
+            admitted.reverse();
+            let (queue, done) = (Mutex::new(admitted), Mutex::new(Vec::new()));
+            let (this, url) = (&*self, &url);
+            std::thread::scope(|scope| {
+                let streams: Vec<_> = (0..STREAMS)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            while let Some((base, span, timeout, run)) =
+                                queue.lock().ok().and_then(|mut q| q.pop())
+                            {
+                                let (bytes, read) =
+                                    get(&this.agent, url, base, span, timeout, this.stall);
+                                let stored = bytes.and_then(|bytes| {
+                                    run.iter().try_for_each(|(s, offset, length, record)| {
+                                        let at = (offset - base) as usize;
+                                        let raw = &bytes[at..at + *length as usize];
+                                        this.store(*s, *offset, *length, record.clone(), raw)
+                                            .map(drop)
+                                    })
+                                });
+                                if let Ok(mut done) = done.lock() {
+                                    done.push((stored, read, run));
+                                }
+                            }
                         })
                     })
                     .collect();
-                handles
-                    .into_iter()
-                    .map(|h| {
-                        h.join()
-                            .unwrap_or((Err(Error("archive_request_failed")), 0, Vec::new()))
-                    })
-                    .collect()
+                // A panicked stream loses its piece; those slots are fetched one by one later.
+                for stream in streams {
+                    let _ = stream.join();
+                }
             });
+            let pieces: Vec<(Result<()>, u64, Vec<IndexEntry>)> =
+                done.into_inner().unwrap_or_default();
             pending = Vec::new();
             for (stored, read, run) in pieces {
                 self.stats.response_body_bytes += read;
@@ -668,6 +695,13 @@ mod tests {
             PIECE_BYTES,
         );
         assert_eq!(starts(runs), vec![vec![1, 2], vec![3], vec![4], vec![5]]);
+        // A 64 MiB window becomes 16 pieces of 4 MiB; small and huge windows stay bounded.
+        let mib = 1024 * 1024;
+        assert_eq!(piece_span(64 * mib, 16), 4 * mib as usize);
+        assert_eq!(piece_span(64 * mib, 8), 8 * mib as usize);
+        assert_eq!(piece_span(3 * mib, 16), mib as usize);
+        assert_eq!(piece_span(1024 * mib, 16), PIECE_BYTES);
+        assert_eq!(piece_span(2 * mib, 0), 2 * mib as usize);
     }
     /// Serves `index` and `car` for epoch 0 Range requests. The first `stalls` block requests
     /// send nothing and are dropped or, with `trickle`, send one byte every 150 ms. Returns
@@ -779,7 +813,7 @@ mod tests {
         assert_eq!(slow.chunk(10).unwrap().0, car[100..110]);
         assert_eq!(slow.stats.retries, 1);
         assert!(began.elapsed() < Duration::from_secs(4));
-        assert_eq!(piece_deadline(PIECE_BYTES), Duration::from_secs(6));
+        assert_eq!(piece_deadline(4 * 1024 * 1024), Duration::from_secs(6));
     }
     #[test]
     fn offline_cache_miss_never_attempts_a_network() {
