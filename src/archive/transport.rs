@@ -12,6 +12,11 @@ use std::{
 };
 const ORIGIN: &str = "https://files.old-faithful.net";
 const MAX_CHUNK: usize = 16 * 1024 * 1024;
+/// Slots whose index records one prefetch reads in a single request (12 bytes each).
+const PREFETCH_SLOTS: u64 = 64;
+const EPOCH_SLOTS: u64 = 432000;
+/// (slot, CAR offset, length, 12-byte index record).
+type IndexEntry = (u64, u64, u32, Vec<u8>);
 static FILE_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy)]
@@ -52,6 +57,10 @@ pub struct ArchiveSource {
     network: bool,
     limits: Limits,
     began: Instant,
+    /// One agent per source, so requests reuse its connection to the archive.
+    agent: ureq::Agent,
+    /// The run's slot range; a cache miss inside it prefetches the adjacent slots.
+    planned: Option<(u64, u64)>,
     pub stats: Stats,
 }
 impl ArchiveSource {
@@ -74,8 +83,22 @@ impl ArchiveSource {
             network,
             limits,
             began: Instant::now(),
+            agent: ureq::Agent::config_builder()
+                .max_redirects(0)
+                .http_status_as_error(false)
+                .build()
+                .into(),
+            planned: None,
             stats: Stats::default(),
         })
+    }
+    /// Time left for one request: the command budget, at most 20 seconds.
+    fn request_timeout(&self) -> Result<Duration> {
+        Duration::from_secs(self.limits.seconds)
+            .checked_sub(self.began.elapsed())
+            .filter(|d| !d.is_zero())
+            .map(|d| d.min(Duration::from_secs(20)))
+            .ok_or(Error("archive_time_limit"))
     }
     fn fetch(&mut self, path: &str, offset: u64, length: usize) -> Result<Vec<u8>> {
         if !self.network {
@@ -88,24 +111,19 @@ impl ArchiveSource {
         {
             return Err(Error("archive_download_limit"));
         }
-        let remaining = Duration::from_secs(self.limits.seconds)
-            .checked_sub(self.began.elapsed())
-            .filter(|d| !d.is_zero())
-            .ok_or(Error("archive_time_limit"))?;
+        let timeout = self.request_timeout()?;
         let end = offset
             .checked_add(length as u64 - 1)
             .ok_or(Error("archive_invalid_range"))?;
-        let agent: ureq::Agent = ureq::Agent::config_builder()
-            .timeout_global(Some(remaining.min(Duration::from_secs(20))))
-            .max_redirects(0)
-            .http_status_as_error(false)
-            .build()
-            .into();
         self.stats.requests += 1;
-        let mut response = agent
+        let mut response = self
+            .agent
             .get(format!("{ORIGIN}/{path}"))
             .header("Range", format!("bytes={offset}-{end}"))
             .header("Accept-Encoding", "identity")
+            .config()
+            .timeout_global(Some(timeout))
+            .build()
             .call()
             .map_err(|_| Error("archive_request_failed"))?;
         match response.status().as_u16() {
@@ -147,19 +165,14 @@ impl ArchiveSource {
         if self.stats.requests >= self.limits.requests {
             return Err(Error("archive_download_limit"));
         }
-        let remaining = Duration::from_secs(self.limits.seconds)
-            .checked_sub(self.began.elapsed())
-            .filter(|d| !d.is_zero())
-            .ok_or(Error("archive_time_limit"))?;
-        let agent: ureq::Agent = ureq::Agent::config_builder()
-            .timeout_global(Some(remaining.min(Duration::from_secs(20))))
-            .max_redirects(0)
-            .http_status_as_error(false)
-            .build()
-            .into();
+        let timeout = self.request_timeout()?;
         self.stats.requests += 1;
-        let response = agent
+        let response = self
+            .agent
             .head(format!("{ORIGIN}/{epoch}/epoch-{epoch}.car"))
+            .config()
+            .timeout_global(Some(timeout))
+            .build()
             .call()
             .map_err(|_| Error("archive_request_failed"))?;
         match response.status().as_u16() {
@@ -194,11 +207,22 @@ impl ArchiveSource {
             .map_err(|_| Error("archive_runtime_failed"))?;
         runtime.block_on(super::decode::block_time(&raw, slot))
     }
+    fn paths(&self, slot: u64) -> (PathBuf, PathBuf) {
+        let stem = format!("epoch-{}-slot-{slot}", slot / EPOCH_SLOTS);
+        (
+            self.cache.join(format!("{stem}.json")),
+            self.cache.join(format!("{stem}.car-range")),
+        )
+    }
     fn chunk(&mut self, slot: u64) -> Result<(Vec<u8>, Receipt)> {
-        let epoch = slot / 432000;
-        let stem = format!("epoch-{epoch}-slot-{slot}");
-        let manifest = self.cache.join(format!("{stem}.json"));
-        let file = self.cache.join(format!("{stem}.car-range"));
+        if let Some((start, end)) = self.planned
+            && (start..=end).contains(&slot)
+            && !self.paths(slot).0.exists()
+        {
+            self.prefetch(slot, start, end)?;
+        }
+        let epoch = slot / EPOCH_SLOTS;
+        let (manifest, file) = self.paths(slot);
         if manifest.exists() {
             let bytes = read_bounded(&manifest, 4096)?;
             let receipt: Receipt =
@@ -236,25 +260,73 @@ impl ArchiveSource {
             offset,
             length as usize,
         )?;
+        let receipt = self.store(slot, offset, length, record, &raw)?;
+        Ok((raw, receipt))
+    }
+    fn store(
+        &self,
+        slot: u64,
+        offset: u64,
+        length: u32,
+        index_record: Vec<u8>,
+        raw: &[u8],
+    ) -> Result<Receipt> {
         let receipt = Receipt {
             schema_version: 1,
             jetstreamer_revision: JETSTREAMER_REVISION.into(),
-            epoch,
+            epoch: slot / EPOCH_SLOTS,
             slot,
             offset,
             length,
-            index_record: record,
-            sha256: hex(&Sha256::digest(&raw)),
+            index_record,
+            sha256: hex(&Sha256::digest(raw)),
         };
-        atomic_write(&file, &raw)?;
+        let (manifest, file) = self.paths(slot);
+        atomic_write(&file, raw)?;
         atomic_write(
             &manifest,
             &serde_json::to_vec(&receipt).map_err(|_| Error("serialization_failed"))?,
         )?;
-        Ok((raw, receipt))
+        Ok(receipt)
+    }
+    /// Caches the uncached slots of the planned range near `slot` (from its predecessor,
+    /// usually its parent) with one index request and one request per contiguous run of
+    /// blocks up to 16 MiB. Each slot keeps its own receipt; slots without an index entry
+    /// are left for `chunk` to report.
+    fn prefetch(&mut self, slot: u64, start: u64, end: u64) -> Result<()> {
+        let epoch = slot / EPOCH_SLOTS;
+        let first = slot.saturating_sub(1).max(start).max(epoch * EPOCH_SLOTS);
+        let last = end
+            .min(first + PREFETCH_SLOTS - 1)
+            .min(epoch * EPOCH_SLOTS + EPOCH_SLOTS - 1);
+        let records = self.fetch(
+            &format!("{epoch}/epoch-{epoch}-slot-ranges.raw"),
+            (first % EPOCH_SLOTS) * 12,
+            ((last - first + 1) * 12) as usize,
+        )?;
+        let mut wanted = Vec::new();
+        for (s, record) in (first..=last).zip(records.as_chunks::<12>().0) {
+            if let (false, Ok((offset, length))) = (self.paths(s).0.exists(), decode_index(record))
+            {
+                wanted.push((s, offset, length, record.to_vec()));
+            }
+        }
+        for run in contiguous_runs(wanted) {
+            let base = run[0].1;
+            let span = run.last().map(|e| e.1 + u64::from(e.2) - base).unwrap();
+            let bytes = self.fetch(&format!("{epoch}/epoch-{epoch}.car"), base, span as usize)?;
+            for (s, offset, length, record) in run {
+                let at = (offset - base) as usize;
+                self.store(s, offset, length, record, &bytes[at..at + length as usize])?;
+            }
+        }
+        Ok(())
     }
 }
 impl BlockSource for ArchiveSource {
+    fn plan(&mut self, start: u64, end: u64) {
+        self.planned = Some((start, end));
+    }
     fn diagnostics(&self) -> serde_json::Value {
         serde_json::json!({"jetstreamer_revision":JETSTREAMER_REVISION,"response_body_bytes":self.stats.response_body_bytes,"requests":self.stats.requests,"cached_chunks":self.stats.cached_chunks,"limits":{"response_body_bytes":self.limits.bytes,"requests":self.limits.requests,"seconds":self.limits.seconds}})
     }
@@ -330,6 +402,23 @@ fn decode_index(record: &[u8]) -> Result<(u64, u32)> {
     }
     Ok((offset, length))
 }
+/// Groups (slot, offset, length, record) entries into runs fetched with one request: each
+/// block starts where the previous one ended, and a run spans at most 16 MiB.
+fn contiguous_runs(entries: Vec<IndexEntry>) -> Vec<Vec<IndexEntry>> {
+    let mut runs: Vec<Vec<IndexEntry>> = Vec::new();
+    for entry in entries {
+        match runs.last_mut() {
+            Some(run)
+                if run.last().is_some_and(|p| p.1 + u64::from(p.2) == entry.1)
+                    && entry.1 + u64::from(entry.2) - run[0].1 <= MAX_CHUNK as u64 =>
+            {
+                run.push(entry)
+            }
+            _ => runs.push(vec![entry]),
+        }
+    }
+    runs
+}
 fn validate_range(value: &str, start: u64, end: u64) -> Result<()> {
     let (range, total) = value
         .strip_prefix("bytes ")
@@ -354,6 +443,23 @@ mod tests {
             "archive_slot_unavailable"
         );
         assert!(decode_index(&[1; 11]).is_err());
+    }
+    #[test]
+    fn only_adjacent_blocks_share_a_request_and_a_run_stays_under_16_mib() {
+        let e = |slot, offset, length: usize| (slot, offset, length as u32, vec![]);
+        let starts = |runs: Vec<Vec<IndexEntry>>| {
+            runs.iter()
+                .map(|r| r.iter().map(|e| e.0).collect::<Vec<_>>())
+                .collect::<Vec<_>>()
+        };
+        // 1-2 adjacent; 3 leaves a gap; 4 is adjacent to 3 but would pass 16 MiB.
+        let runs = contiguous_runs(vec![
+            e(1, 100, 10),
+            e(2, 110, 5),
+            e(3, 200, MAX_CHUNK - 10),
+            e(4, 200 + MAX_CHUNK as u64 - 10, 11),
+        ]);
+        assert_eq!(starts(runs), vec![vec![1, 2], vec![3], vec![4]]);
     }
     #[test]
     fn offline_cache_miss_never_attempts_a_network() {

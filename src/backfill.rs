@@ -26,6 +26,8 @@ pub trait BlockSource {
         "solana-mainnet-rpc"
     }
     fn block(&mut self, slot: u64) -> Result<Vec<u8>>;
+    /// The run's slot range, before its first `block`, so a source can fetch ahead.
+    fn plan(&mut self, _start: u64, _end: u64) {}
     /// Bridge evidence compares whole blocks; other sources retain pruned blocks.
     fn keeps_full_blocks(&self) -> bool {
         false
@@ -497,6 +499,7 @@ impl History {
     ) -> Result<(Coverage, Metrics)> {
         scope(mint, start, end)?;
         self.active_source = source.provenance();
+        source.plan(start, end);
         for slot in start..=end {
             let _permit = self.gate.historical()?;
             self.db.schedule(mint, slot, now())?;
