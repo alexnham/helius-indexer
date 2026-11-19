@@ -191,8 +191,9 @@ see [live validation](live-ingestion.md).
 
 ## Combined source validation
 
-The overlap command includes a terminal admission-gate snapshot: active writes,
-waiting live/historical operations, oldest wait age, admission counts and elapsed
+The overlap command includes a terminal admission-gate snapshot: whether any write
+is active, `active_writes` against `write_limit` (one permit per configured historical
+worker), waiting live/historical operations, oldest wait age, admission counts and elapsed
 wait sums. A gate operation is not a unique transaction; deduplicated counts and
 volume come from the storage summary. Existing source reports retain separate
 durable input, decoded output, and verified coverage progress. The public gate
@@ -233,7 +234,10 @@ block re-verification uses source `retained_block` and shared run correlation.
 `indexer_historical_cached_blocks_total` counts reused blocks separately from
 source requests. `indexer_historical_unrelated_transactions_total` (report field
 `unrelated_transactions`) counts block transactions that do not touch the job's mint:
-read for slot evidence, neither decoded nor stored. No per-signature metric labels are introduced.
+read for slot evidence, neither decoded nor stored. `indexer_historical_retained_bytes_total`
+(report field `retained_bytes`) counts block bytes written to `historical_inputs` after
+unrelated transactions are pruned to their signatures; compare it with
+`indexer_input_bytes_total`. No per-signature metric labels are introduced.
 
 `repair_complete` never means verified full-slot coverage. Failed corrections hide
 prior output from normal reads while preserving it physically. Summary fields

@@ -72,7 +72,9 @@ impl HistoryLog {
         Ok(())
     }
 
-    /// Raw input acknowledgment; every attempt is retained for reproduction.
+    /// Raw input acknowledgment; every attempt is retained for reproduction. `pruned` marks
+    /// a response whose unrelated transactions were reduced to their signatures.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn retain_input(
         &self,
         mint: &str,
@@ -81,6 +83,7 @@ impl HistoryLog {
         source: &str,
         received_at: u64,
         raw: &[u8],
+        pruned: bool,
     ) -> Result<()> {
         // Recorded once so skip evidence never parses stored bytes again.
         let produced_block =
@@ -88,7 +91,7 @@ impl HistoryLog {
         self.0
             .borrow_mut()
             .execute(
-                "INSERT INTO historical_inputs VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+                "INSERT INTO historical_inputs(mint,decoder,slot,attempt,source_kind,received_at,produced_block,response,pruned) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
                 &[
                     &mint,
                     &DECODER_VERSION,
@@ -98,6 +101,7 @@ impl HistoryLog {
                     &(received_at as i64),
                     &produced_block,
                     &raw,
+                    &pruned,
                 ],
             )
             .map_err(write_error)?;
@@ -114,7 +118,8 @@ impl HistoryLog {
         Ok(self.0.borrow_mut().query_opt("SELECT response FROM historical_inputs WHERE mint=$1 AND slot=$2 AND source_kind=$3 ORDER BY received_at DESC,attempt DESC LIMIT 1",&[&mint,&(slot as i64),&source]).map_err(read_error)?.map(|r| r.get(0)))
     }
 
-    /// Like `latest_input` but refuses to load responses over 64 MiB: `Some(None)`.
+    /// Like `latest_input` but refuses to load responses over 64 MiB: `Some(None)`. Bridge
+    /// evidence compares whole blocks, so pruned responses are not candidates.
     #[cfg(feature = "archive")]
     pub(crate) fn bounded_input(
         &self,
@@ -122,7 +127,7 @@ impl HistoryLog {
         slot: u64,
         source: &str,
     ) -> Result<Option<Option<Vec<u8>>>> {
-        Ok(self.0.borrow_mut().query_opt("SELECT CASE WHEN octet_length(response)<=67108864 THEN response END FROM historical_inputs WHERE mint=$1 AND slot=$2 AND source_kind=$3 ORDER BY received_at DESC,attempt DESC,decoder DESC LIMIT 1",&[&mint,&(slot as i64),&source]).map_err(read_error)?.map(|r| r.get(0)))
+        Ok(self.0.borrow_mut().query_opt("SELECT CASE WHEN octet_length(response)<=67108864 THEN response END FROM historical_inputs WHERE mint=$1 AND slot=$2 AND source_kind=$3 AND NOT pruned ORDER BY received_at DESC,attempt DESC,decoder DESC LIMIT 1",&[&mint,&(slot as i64),&source]).map_err(read_error)?.map(|r| r.get(0)))
     }
 
     /// Any source returned a produced block for this slot, so it must never be marked skipped.

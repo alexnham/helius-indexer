@@ -454,7 +454,8 @@ impl JobLog {
         Ok(self
             .0
             .query(
-                "SELECT signature,capture_json,status FROM capture_inputs WHERE slot=$1 AND source=$2 AND octet_length(capture_json)<=16777216 ORDER BY signature,result_digest",
+                // A NULL input payload is the captures payload (migration 0013).
+                "SELECT i.signature,COALESCE(i.capture_json,c.capture_json),i.status FROM capture_inputs i LEFT JOIN captures c ON c.signature=i.signature WHERE i.slot=$1 AND i.source=$2 AND octet_length(COALESCE(i.capture_json,c.capture_json))<=16777216 ORDER BY i.signature,i.result_digest",
                 &[&(slot as i64), &source],
             )
             .map_err(read_failed)?

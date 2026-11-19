@@ -64,7 +64,17 @@ Each native command may take up to 360 s. The native worker shares a cooperative
 `CANCEL` file left from an earlier stop and reports `cleared_stale_cancel`; create
 the file again to stop a run in progress. Raw archive cache, normalized blocks and captures are all retained for
 repair. Each block's decoded transactions are written in batches of up to 1,000
-(16 MiB), not one PostgreSQL transaction each. A 10% transfer sample saves no raw-input bytes or network/decoding work.
+(16 MiB), not one PostgreSQL transaction each.
+
+`INDEXER_HISTORICAL_WORKERS` (1–16, default 1; the wrapper passes its environment
+through) runs that many block workers per historical run, each on its own PostgreSQL
+connection. The run's thread still fetches blocks and records slot status; workers
+retain the raw block (transactions that do not touch the mint are reduced to their
+signatures), decode it and write its output. Slots can complete out of
+order; the contiguous checkpoint covers only slots whose output is durable. At most
+two blocks per worker are held in memory, so allow 128 MiB per worker on top of the
+batch reservation. Revision repair always uses one worker. More workers help only
+when PostgreSQL has spare CPUs: the Compose database is limited to one. A 10% transfer sample saves no raw-input bytes or network/decoding work.
 Monitor the PostgreSQL disk as well as the cache filesystem, especially if they
 are on different hosts or volumes. The local dashboard shows actual sample
 counts, remaining scope and uncertainty; it does not extrapolate a full total.

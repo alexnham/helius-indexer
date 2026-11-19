@@ -71,7 +71,8 @@ impl Store {
             let mut reference: Value =
                 serde_json::from_str(&reference).map_err(|_| Error("stored_record_invalid"))?;
             // Audit receipts may contain compatible execution metadata received after the old decoder failed.
-            let observations = tx.query("SELECT CASE WHEN octet_length(result_json)<=16777216 THEN result_json END FROM capture_inputs WHERE signature=$1 AND status<>'capture_conflict' ORDER BY source,result_digest LIMIT 33", &[&signature])
+            // A NULL input payload is the captures payload (migration 0013).
+            let observations = tx.query("SELECT CASE WHEN octet_length(COALESCE(i.result_json,c.result_json))<=16777216 THEN COALESCE(i.result_json,c.result_json) END FROM capture_inputs i LEFT JOIN captures c ON c.signature=i.signature WHERE i.signature=$1 AND i.status<>'capture_conflict' ORDER BY i.source,i.result_digest LIMIT 33", &[&signature])
                 .map_err(read_failed)?;
             let mut total = 0;
             for (count, observation) in observations.iter().enumerate() {
@@ -160,6 +161,7 @@ impl Store {
                 .map_err(write_failed)?;
             tx.execute("UPDATE decoder_repairs SET status='superseded',error_class=NULL WHERE signature=$1 AND target_decoder<>$2", &[&signature,&decoder::DECODER_VERSION])
                 .map_err(write_failed)?;
+            crate::storage::materialize_inputs(&mut tx, signature)?;
             tx.execute(
                 "UPDATE captures SET decoder_version=$1,status=$2,result_json=$4 WHERE signature=$3",
                 &[

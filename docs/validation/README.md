@@ -19,6 +19,9 @@ dated report that holds the command, dataset, environment and full results.
 | Date | Run | Source | Headline result | Report |
 | --- | --- | --- | --- | --- |
 | 2026-11-18 | One-hour 10% USDC sample (#72) | provider + local | 9,000 slots in 3 h 14 min (3.2× slower than real time); 1.4 MB/slot, mostly raw archive blocks; 8,282 slots `consistent`, 0 conflicts; 0.30% of inputs unresolved | [report](2026-11-18-sample-one-hour.md) |
+| 2026-11-18 | Pruned historical blocks | local | 1 in 20 transactions transfer the mint: retained raw block bytes 120 → 17 MiB (−86%), `historical_inputs` ~47 → 7 MiB on disk; throughput change within noise on a loaded laptop | [report](2026-11-18-pruned-historical-blocks.md) |
+| 2026-11-18 | Capture payload stored once (#65) | local | 8 workers, uncapped local PostgreSQL: WAL −18–29%; ~1,700 → ~2,150 tx/s when every transaction transfers the mint, ~10,000 → ~11,900 tx/s when 1 in 20 does | [report](2026-11-18-capture-payload-once.md) |
+| 2026-11-18 | Parallel historical block workers | local | 8 workers on uncapped local PostgreSQL: ~800 → ~1,600 tx/s when every transaction transfers the mint, ~3,300 → ~8,500 tx/s when 1 in 20 does | [report](2026-11-18-parallel-historical-workers.md) |
 | 2026-11-18 | Historical block write throughput | local | Batched block writes: 97 → 723–995 tx/s when every transaction transfers the mint, 1,223 → 2,721–3,650 tx/s when 1 in 20 does | [report](2026-11-18-historical-block-throughput.md) |
 | 2026-11-18 | Archive/replay overlap under v7 (#31) | provider | 50 of 50 slots `consistent`, 0 conflicts, verified through 470015999 | [report](2026-11-17-provider-overlap.md#final-run-under-decoder-v7-2026-11-18-0245-utc) |
 | 2026-11-17 | Archive/replay overlap (#31) | provider | 47 of 50 slots reconciled after #105, 0 conflicts; 3 slots unknown (unsupported instruction); omissions are failed transactions (checked on one slot) | [report](2026-11-17-provider-overlap.md) |

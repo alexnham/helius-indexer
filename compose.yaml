@@ -52,6 +52,8 @@ services:
       # Replace the session's copied binary with a rebuilt image's only when set to 1.
       INDEXER_UPGRADE_BINARY: ${INDEXER_UPGRADE_BINARY:-0}
       INDEXER_SAMPLE_PERCENT: ${INDEXER_SAMPLE_PERCENT:-}
+      # Parallel historical block workers (1-16); the Compose PostgreSQL has one CPU.
+      INDEXER_HISTORICAL_WORKERS: ${INDEXER_HISTORICAL_WORKERS:-1}
       # Unix socket on a shared volume: private to these containers, so plaintext is allowed.
       DATABASE_URL: host=/var/run/postgresql user=indexer dbname=indexer
       # Live input goes through Kafka; the consumer service writes it to PostgreSQL.

@@ -51,8 +51,12 @@ This is compatibility of observed data, not independent signature/finality proof
 Cross-provider completeness reconciliation remains a separate validation task.
 
 Raw observations are retained once per distinct source/result in the additive
-`capture_inputs` table. Existing captures are lazily copied into this audit table
-before an update, preserving their original raw payload. `captures.result_json`
+`capture_inputs` table. A first observation's row holds no payload of its own: NULL
+payload columns mean "byte-identical to the current `captures` row" (migration 0013),
+so its bytes are stored once. Every write that changes a `captures` payload first
+copies the current bytes into those NULL rows, preserving the original raw payload;
+`captures` must not be changed any other way. Rows written before migration 0013 keep
+their own bytes. Rollback fills NULL rows from `captures` and restores NOT NULL. `captures.result_json`
 becomes a compatible reference that retains known optional identity evidence;
 it need not be byte-identical to the first raw payload. Raw inputs remain unchanged.
 A conflicting observation is durably quarantined without changing transfer rows.
