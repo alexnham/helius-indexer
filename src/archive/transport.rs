@@ -18,6 +18,17 @@ const PREFETCH_SLOTS: u64 = 64;
 const EPOCH_SLOTS: u64 = 432000;
 /// Largest range one prefetch request covers; pieces of a window download concurrently.
 const PIECE_BYTES: usize = 8 * 1024 * 1024;
+/// A read that waits this long for bytes fails, so a stalled stream is retried instead of
+/// holding its window until the 20-second deadline.
+const STALL: Duration = Duration::from_secs(3);
+/// Slowest per-stream rate a piece may take before it is retried, so a trickling stream
+/// costs seconds rather than the full deadline.
+// shortcut: assumes each archive stream gets at least 2 MiB/s; a slower link fails pieces twice, make it configurable then.
+const MIN_PIECE_RATE: u64 = 2 * 1024 * 1024;
+/// Deadline for one piece of `span` bytes: 2 seconds plus its size at `MIN_PIECE_RATE`.
+fn piece_deadline(span: usize) -> Duration {
+    Duration::from_secs(2) + Duration::from_secs_f64(span as f64 / MIN_PIECE_RATE as f64)
+}
 /// (slot, CAR offset, length, 12-byte index record).
 type IndexEntry = (u64, u64, u32, Vec<u8>);
 static FILE_ID: AtomicU64 = AtomicU64::new(0);
@@ -42,6 +53,8 @@ pub struct Stats {
     pub response_body_bytes: u64,
     pub requests: u32,
     pub cached_chunks: u32,
+    /// Failed pieces requested again.
+    pub retries: u32,
 }
 #[derive(Deserialize, Serialize)]
 struct Receipt {
@@ -62,6 +75,8 @@ pub struct ArchiveSource {
     began: Instant,
     /// One agent per source, so requests reuse its connection to the archive.
     agent: ureq::Agent,
+    origin: String,
+    stall: Duration,
     /// The run's slot range; a cache miss inside it prefetches the adjacent slots.
     planned: Option<(u64, u64)>,
     /// Blocks decoded at once inside the planned range (`INDEXER_HISTORICAL_WORKERS`).
@@ -97,6 +112,8 @@ impl ArchiveSource {
                 .http_status_as_error(false)
                 .build()
                 .into(),
+            origin: ORIGIN.into(),
+            stall: STALL,
             planned: None,
             threads: 1,
             ready: BTreeMap::new(),
@@ -134,7 +151,8 @@ impl ArchiveSource {
     }
     fn fetch(&mut self, path: &str, offset: u64, length: usize) -> Result<Vec<u8>> {
         let timeout = self.admit(offset, length, 0)?;
-        let (bytes, read) = get(&self.agent, path, offset, length, timeout);
+        let url = format!("{}/{path}", self.origin);
+        let (bytes, read) = get(&self.agent, &url, offset, length, timeout, self.stall);
         self.stats.response_body_bytes += read;
         bytes
     }
@@ -149,7 +167,7 @@ impl ArchiveSource {
         self.stats.requests += 1;
         let response = self
             .agent
-            .head(format!("{ORIGIN}/{epoch}/epoch-{epoch}.car"))
+            .head(format!("{}/{epoch}/epoch-{epoch}.car", self.origin))
             .config()
             .timeout_global(Some(timeout))
             .build()
@@ -287,56 +305,77 @@ impl ArchiveSource {
                 wanted.push((s, offset, length, record.to_vec()));
             }
         }
-        // Pieces are admitted in order against the budget, then downloaded concurrently.
-        let path = format!("{epoch}/epoch-{epoch}.car");
-        let (mut admitted, mut refused, mut reserved) = (Vec::new(), None, 0);
-        for run in contiguous_runs(wanted, PIECE_BYTES) {
-            let base = run[0].1;
-            let span = run.last().map(|e| e.1 + u64::from(e.2) - base).unwrap() as usize;
-            match self.admit(base, span, reserved) {
-                Ok(timeout) => {
-                    reserved += span as u64;
-                    admitted.push((base, span, timeout, run));
-                }
-                Err(error) => {
-                    refused = Some(error);
-                    break;
+        // Pieces are admitted in order against the budget, then downloaded concurrently. A
+        // piece that stalls or drops is requested once more, also within the budget.
+        let url = format!("{}/{epoch}/epoch-{epoch}.car", self.origin);
+        let (mut pending, mut refused, mut first_error) =
+            (contiguous_runs(wanted, PIECE_BYTES), None, None);
+        for round in 0..2 {
+            let (mut admitted, mut reserved) = (Vec::new(), 0);
+            for run in pending {
+                let base = run[0].1;
+                let span = run.last().map(|e| e.1 + u64::from(e.2) - base).unwrap() as usize;
+                match self.admit(base, span, reserved) {
+                    Ok(timeout) => {
+                        reserved += span as u64;
+                        admitted.push((base, span, timeout.min(piece_deadline(span)), run));
+                    }
+                    Err(error) => {
+                        refused.get_or_insert(error);
+                        break;
+                    }
                 }
             }
-        }
-        // Each piece's thread also caches its slots, so their file syncs overlap.
-        let this = &*self;
-        let path = &path;
-        let pieces: Vec<(Result<()>, u64)> = std::thread::scope(|scope| {
-            let handles: Vec<_> = admitted
-                .into_iter()
-                .map(|(base, span, timeout, run)| {
-                    scope.spawn(move || {
-                        let (bytes, read) = get(&this.agent, path, base, span, timeout);
-                        let stored = bytes.and_then(|bytes| {
-                            run.into_iter().try_for_each(|(s, offset, length, record)| {
-                                let at = (offset - base) as usize;
-                                let raw = &bytes[at..at + length as usize];
-                                this.store(s, offset, length, record, raw).map(drop)
-                            })
-                        });
-                        (stored, read)
+            // Each piece's thread also caches its slots, so their file syncs overlap.
+            let this = &*self;
+            let url = &url;
+            let pieces: Vec<(Result<()>, u64, Vec<IndexEntry>)> = std::thread::scope(|scope| {
+                let handles: Vec<_> = admitted
+                    .into_iter()
+                    .map(|(base, span, timeout, run)| {
+                        scope.spawn(move || {
+                            let (bytes, read) =
+                                get(&this.agent, url, base, span, timeout, this.stall);
+                            let stored = bytes.and_then(|bytes| {
+                                run.iter().try_for_each(|(s, offset, length, record)| {
+                                    let at = (offset - base) as usize;
+                                    let raw = &bytes[at..at + *length as usize];
+                                    this.store(*s, *offset, *length, record.clone(), raw)
+                                        .map(drop)
+                                })
+                            });
+                            (stored, read, run)
+                        })
                     })
-                })
-                .collect();
-            handles
-                .into_iter()
-                .map(|h| {
-                    h.join()
-                        .unwrap_or((Err(Error("archive_request_failed")), 0))
-                })
-                .collect()
-        });
-        let mut first_error = None;
-        for (stored, read) in pieces {
-            self.stats.response_body_bytes += read;
-            if let Err(error) = stored {
-                first_error.get_or_insert(error);
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| {
+                        h.join()
+                            .unwrap_or((Err(Error("archive_request_failed")), 0, Vec::new()))
+                    })
+                    .collect()
+            });
+            pending = Vec::new();
+            for (stored, read, run) in pieces {
+                self.stats.response_body_bytes += read;
+                match stored {
+                    Ok(()) => {}
+                    Err(Error(
+                        "archive_request_failed"
+                        | "archive_read_failed"
+                        | "archive_truncated_range",
+                    )) if round == 0 && !run.is_empty() => {
+                        self.stats.retries += 1;
+                        pending.push(run);
+                    }
+                    Err(error) => {
+                        first_error.get_or_insert(error);
+                    }
+                }
+            }
+            if pending.is_empty() {
+                break;
             }
         }
         match first_error.or(refused) {
@@ -352,7 +391,7 @@ impl BlockSource for ArchiveSource {
         self.ready.clear();
     }
     fn diagnostics(&self) -> serde_json::Value {
-        serde_json::json!({"jetstreamer_revision":JETSTREAMER_REVISION,"response_body_bytes":self.stats.response_body_bytes,"requests":self.stats.requests,"cached_chunks":self.stats.cached_chunks,"limits":{"response_body_bytes":self.limits.bytes,"requests":self.limits.requests,"seconds":self.limits.seconds}})
+        serde_json::json!({"jetstreamer_revision":JETSTREAMER_REVISION,"response_body_bytes":self.stats.response_body_bytes,"requests":self.stats.requests,"cached_chunks":self.stats.cached_chunks,"retries":self.stats.retries,"limits":{"response_body_bytes":self.limits.bytes,"requests":self.limits.requests,"seconds":self.limits.seconds}})
     }
     fn provenance(&self) -> &'static str {
         super::SOURCE
@@ -456,18 +495,20 @@ fn normalized(
 /// One admitted range request; also returns the response body bytes read, for the stats.
 fn get(
     agent: &ureq::Agent,
-    path: &str,
+    url: &str,
     offset: u64,
     length: usize,
     timeout: Duration,
+    stall: Duration,
 ) -> (Result<Vec<u8>>, u64) {
     let end = offset + length as u64 - 1;
     let response = agent
-        .get(format!("{ORIGIN}/{path}"))
+        .get(url)
         .header("Range", format!("bytes={offset}-{end}"))
         .header("Accept-Encoding", "identity")
         .config()
         .timeout_global(Some(timeout))
+        .timeout_per_read(Some(stall))
         .build()
         .call();
     let mut response = match response {
@@ -592,6 +633,7 @@ fn validate_range(value: &str, start: u64, end: u64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{io::BufRead, io::BufReader, net::TcpListener, sync::Arc};
     #[test]
     fn range_and_index_errors_never_mean_skipped_slots() {
         assert!(validate_range("bytes 10-21/100", 10, 21).is_ok());
@@ -626,6 +668,118 @@ mod tests {
             PIECE_BYTES,
         );
         assert_eq!(starts(runs), vec![vec![1, 2], vec![3], vec![4], vec![5]]);
+    }
+    /// Serves `index` and `car` for epoch 0 Range requests. The first `stalls` block requests
+    /// send nothing and are dropped or, with `trickle`, send one byte every 150 ms. Returns
+    /// the origin and the block request count.
+    fn archive_server(
+        index: Vec<u8>,
+        car: Vec<u8>,
+        stalls: u64,
+        trickle: bool,
+    ) -> (String, Arc<AtomicU64>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let car_requests = Arc::new(AtomicU64::new(0));
+        let count = car_requests.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let (mut stream, index, car, count) =
+                    (stream.unwrap(), index.clone(), car.clone(), count.clone());
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let (mut path, mut range) = (String::new(), (0, 0));
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).unwrap() == 0 || line.trim().is_empty() {
+                            break;
+                        }
+                        let line = line.trim().to_ascii_lowercase();
+                        if let Some(rest) = line.strip_prefix("get ") {
+                            path = rest.split(' ').next().unwrap().to_string();
+                        }
+                        if let Some((a, b)) = line
+                            .strip_prefix("range: bytes=")
+                            .and_then(|r| r.split_once('-'))
+                        {
+                            range = (a.parse::<usize>().unwrap(), b.parse::<usize>().unwrap());
+                        }
+                    }
+                    let body = if path.ends_with(".car") { &car } else { &index };
+                    let stalled =
+                        path.ends_with(".car") && count.fetch_add(1, Ordering::SeqCst) < stalls;
+                    if stalled && !trickle {
+                        std::thread::sleep(Duration::from_secs(2));
+                        return;
+                    }
+                    let part = &body[range.0..=range.1];
+                    let head = format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {}-{}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        range.0,
+                        range.1,
+                        body.len(),
+                        part.len()
+                    );
+                    stream.write_all(head.as_bytes()).unwrap();
+                    if stalled {
+                        for byte in part {
+                            if stream.write_all(&[*byte]).is_err() {
+                                return;
+                            }
+                            std::thread::sleep(Duration::from_millis(150));
+                        }
+                        return;
+                    }
+                    stream.write_all(part).unwrap();
+                });
+            }
+        });
+        (origin, car_requests)
+    }
+    #[test]
+    fn a_stalled_piece_is_requested_once_more_within_the_request_budget() {
+        // Slots 10-12 of epoch 0 are three adjacent 10-byte blocks: one piece.
+        let car: Vec<u8> = (0..130u8).collect();
+        let mut index = vec![0; 13 * 12];
+        for (i, slot) in (10..13).enumerate() {
+            let at = slot * 12;
+            index[at..at + 8].copy_from_slice(&(100 + 10 * i as u64).to_le_bytes());
+            index[at + 8..at + 12].copy_from_slice(&10u32.to_le_bytes());
+        }
+        let source = |origin: String| {
+            let dir = tempfile::tempdir().unwrap();
+            let mut source = ArchiveSource::new(dir.path(), false, Limits::default()).unwrap();
+            (source.network, source.origin) = (true, origin);
+            source.stall = Duration::from_millis(100);
+            source.plan(10, 12);
+            (source, dir)
+        };
+        // One stall: the retry caches every slot of the piece.
+        let (origin, car_requests) = archive_server(index.clone(), car.clone(), 1, false);
+        let (mut one, _dir) = source(origin);
+        assert_eq!(one.chunk(10).unwrap().0, car[100..110]);
+        assert_eq!((one.stats.requests, one.stats.retries), (3, 1));
+        for slot in [11, 12] {
+            let at = 100 + 10 * (slot as usize - 10);
+            assert_eq!(one.chunk(slot).unwrap().0, car[at..at + 10]);
+        }
+        assert_eq!((one.stats.requests, one.stats.cached_chunks), (3, 3));
+        assert_eq!(car_requests.load(Ordering::SeqCst), 2);
+        // Two stalls: the slot fails after one retry instead of retrying again.
+        let (origin, car_requests) = archive_server(index.clone(), car.clone(), 2, false);
+        let (mut two, _dir) = source(origin);
+        assert_eq!(two.chunk(10).err(), Some(Error("archive_request_failed")));
+        assert_eq!((two.stats.requests, two.stats.retries), (3, 1));
+        assert_eq!(car_requests.load(Ordering::SeqCst), 2);
+        // A trickle that never stalls a read still misses the piece's own 2-second deadline.
+        let (origin, _) = archive_server(index, car.clone(), 1, true);
+        let (mut slow, _dir) = source(origin);
+        slow.stall = Duration::from_millis(500);
+        let began = Instant::now();
+        assert_eq!(slow.chunk(10).unwrap().0, car[100..110]);
+        assert_eq!(slow.stats.retries, 1);
+        assert!(began.elapsed() < Duration::from_secs(4));
+        assert_eq!(piece_deadline(PIECE_BYTES), Duration::from_secs(6));
     }
     #[test]
     fn offline_cache_miss_never_attempts_a_network() {

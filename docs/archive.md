@@ -31,13 +31,17 @@ or private endpoints. The ordinary build and tests require no archive access.
 
 Each command allows at most eight requested slots, 32 archive HTTP requests,
 128 MiB of archive response bodies, 16 MiB per raw slot range, and 120 seconds.
-There are no retries or redirects, and each request has a maximum 20-second
-deadline, shortened by the remaining command budget.
+There are no redirects. Each request has a maximum 20-second deadline, shortened
+by the remaining command budget, and fails when a read waits 3 seconds for bytes.
+A block piece also fails after 2 seconds plus its size at 2 MiB/s (6 seconds
+for 8 MiB), so a trickling stream is retried rather than holding the window.
 Requests share one agent. Inside a run's slot range, a cache miss reads the
 index records of up to 64 nearby slots in one request, then fetches the adjacent
 blocks in pieces of up to 8 MiB (a larger block is its own piece, up to 16 MiB).
 Pieces are admitted in order against the request and byte limits, then downloaded
-and cached concurrently. Each slot is still cached with its own receipt, so a
+and cached concurrently. A piece that stalls, drops or arrives truncated is
+requested once more, within the same limits; the source diagnostics count these
+as `retries`. Each slot is still cached with its own receipt, so a
 128-slot batch takes about 15 requests instead of about 260. The planned window's
 blocks are then decoded on `INDEXER_HISTORICAL_WORKERS` threads.
 The bridge additionally allows at most eight 64 MiB RPC block responses.
