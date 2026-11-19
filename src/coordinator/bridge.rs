@@ -336,7 +336,7 @@ fn batch<A: BlockSource, R: BlockSource>(
     output["cancelled"] = json!(cancelled());
     output["source_diagnostics"] = json!({"archive":archive.diagnostics(),"rpc":rpc.diagnostics()});
     output["summary"] = crate::storage::Store::summary(database, &plan.mint)?;
-    output["batch_limits"] = json!({"unique_slots":slots,"archive_response_bytes":128*1024*1024,"archive_requests":32,"rpc_block_responses":slots+1,"rpc_block_response_bytes_each":crate::backfill::MAX_BLOCK_BYTES,"request_seconds":20});
+    output["batch_limits"] = json!({"unique_slots":slots,"archive_response_bytes":128*1024*1024,"archive_requests":128,"rpc_block_responses":slots+1,"rpc_block_response_bytes_each":crate::backfill::MAX_BLOCK_BYTES,"request_seconds":20});
     telemetry.set_context("coordinator", "archive_rpc", "historical");
     let mut event = telemetry.event(
         "bridge_batch_finished",
@@ -403,8 +403,10 @@ pub fn run(
         let mut archive = archive::ArchiveSource::new(
             cache,
             true,
+            // A batch spans hundreds of slots and downloads each window in up to 16 pieces.
             archive::Limits {
                 seconds: duration.as_secs(),
+                requests: 128,
                 ..archive::Limits::default()
             },
         )?;

@@ -60,3 +60,34 @@ local trickle test only, because no trickle happened during the second set.
   second), so their rate is not measured here.
 - The 2 MiB/s floor is a shortcut: a link slower than 2 MiB/s per stream would fail
   pieces twice.
+
+## Concurrent pieces (`codex/archive-overlap-download`)
+
+A planned window now covers a whole 128-slot bridge subrange, is split into up to 16
+pieces of 1–8 MiB (using at most half the requests left), and downloads on 8
+concurrent streams. A bridge batch allows 128 archive requests instead of 32; the
+128 MiB byte limit is unchanged. The piece rate floor drops to 1 MiB/s per stream.
+
+Old Faithful from this laptop, 8 MiB ranges at random offsets, 3 repeats:
+
+| Streams | 1 | 2 | 4 | 8 | 16 |
+| --- | --- | --- | --- | --- | --- |
+| MiB/s | 3.9–11.1 | 12.2–17.8 | 16.3–25.2 | 29.4–32.1 | 33.4–36.9 |
+
+One of the 93 requests (4 streams, first repeat) hung for its full 60 s.
+
+Alternating cold runs, the stall-retry branch (A) against this branch (B):
+
+| Variant of B | A median | B median | B requests | B failed slots |
+| --- | --- | --- | --- | --- |
+| 16 pieces at once, 32-request limit | 14.6 s | 11.2 s | 32 (cap) | 141 (`archive_download_limit`) |
+| Pieces from the request budget, 32-request limit | 15.2 s | 13.0 s | 27–32 | 82 in one run |
+| 16 streams, 128 requests, 2 MiB/s floor | 15.1 s | 12.5 s | 40–67 | 18 in one run: retries spent the 128 MiB byte limit |
+| **8 streams, 16 pieces, 128 requests, 1 MiB/s floor** | **14.8 s** | **12.9 s** | 40–41 | **0** |
+
+The final variant: 6 + 6 runs, 13.9–15.2 s (A) and 12.5–15.6 s (B); time in `block`
+calls 13.3 → 11.4 s median; 4,459 transactions decoded in every run. About 11 → 15.5
+slots/s on a clean cold batch.
+
+What is left: each subrange is downloaded completely before its blocks are decoded, so
+download and decode still take turns. Overlapping them is the next download change.
