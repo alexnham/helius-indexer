@@ -118,3 +118,26 @@ Alternating runs against the concurrent-pieces branch (A):
 (18.1 s cold when clean, 6.1 s warm), the three changes together take a clean cold
 200-slot batch from 11 to ~20.6 slots/s and the warm ceiling from ~32 to ~71 slots/s.
 A cold batch is now mostly download (~7 of ~8.4 s in `block` calls).
+
+## Blocks decoded as their pieces arrive (`codex/archive-pipeline`)
+
+`block` decoded a window 8 slots at a time, waiting for the slowest block of each group,
+and only after the whole 128-slot window had downloaded. Each download stream now
+decodes its piece's blocks as soon as the piece is cached, and cached blocks of a window
+are decoded on a pool of `INDEXER_HISTORICAL_WORKERS` threads that stays busy.
+
+Alternating runs on 2026-11-19 against main at 9f7f039 (A); same range and settings as
+above, load average 26–49 from other work:
+
+| | A | B (this branch) |
+| --- | --- | --- |
+| Cold, 5 + 5, median | 9.2 s (8.8–11.5) | **8.5 s** (7.9–9.6) |
+| Time in `block` calls, cold, median | 7.9 s | 6.4 s |
+| Warm, 3 + 3, median | 3.1 s | 3.1 s |
+| Time in `block` calls, warm | 1.6–1.8 s | 1.2–1.3 s |
+
+4,459 transactions decoded, 40 requests and 0 failed slots in every run. Cold batches
+are ~8% faster (21.7 → 23.5 slots/s). The warm total does not change: once decoding is
+faster, writing the blocks (~1.7 s per batch) is what the feeder waits on, and that
+still does not overlap the next window's download. Downloading the next window while
+the current one is written is the remaining half of the pipeline.

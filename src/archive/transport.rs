@@ -44,6 +44,10 @@ fn piece_deadline(span: usize) -> Duration {
 }
 /// (slot, CAR offset, length, 12-byte index record).
 type IndexEntry = (u64, u64, u32, Vec<u8>);
+/// A decoded block (value, parent slot, own hash) with its cache receipt.
+type Decoded = Result<((serde_json::Value, u64, String), Receipt)>;
+/// A downloaded piece: its decoded blocks (or why it failed), bytes read, and its run.
+type Piece = (Result<Vec<(u64, Decoded)>>, u64, Vec<IndexEntry>);
 static FILE_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy)]
@@ -94,10 +98,12 @@ pub struct ArchiveSource {
     planned: Option<(u64, u64)>,
     /// The run's mint: planned blocks are decoded with other transactions pruned.
     mint: Option<String>,
-    /// Blocks decoded at once inside the planned range (`INDEXER_HISTORICAL_WORKERS`).
+    /// Decode threads for cached blocks inside the planned range (`INDEXER_HISTORICAL_WORKERS`).
     pub(super) threads: u64,
     /// Normalized blocks decoded ahead of their `block` call.
     ready: BTreeMap<u64, Result<Vec<u8>>>,
+    /// Blocks a prefetch decoded as their pieces arrived, not yet linked to their parents.
+    early: BTreeMap<u64, Decoded>,
     /// Recently decoded slots' own block hashes, so a child needs no second parse of its parent.
     hashes: BTreeMap<u64, String>,
     pub stats: Stats,
@@ -133,6 +139,7 @@ impl ArchiveSource {
             mint: None,
             threads: 1,
             ready: BTreeMap::new(),
+            early: BTreeMap::new(),
             hashes: BTreeMap::new(),
             stats: Stats::default(),
         })
@@ -302,7 +309,8 @@ impl ArchiveSource {
     /// Caches the uncached slots of the planned range near `slot` (from its predecessor,
     /// usually its parent) with one index request and one request per contiguous run of
     /// blocks, about `PIECES` runs per window, at most `STREAMS` at once. Each slot keeps
-    /// its own receipt; slots without an index entry, or whose piece is lost, are left for
+    /// its own receipt, and each stream decodes its pieces' blocks into `early` while other
+    /// pieces download; slots without an index entry, or whose piece is lost, are left for
     /// `chunk` to fetch or report.
     fn prefetch(&mut self, slot: u64, start: u64, end: u64) -> Result<()> {
         let epoch = slot / EPOCH_SLOTS;
@@ -354,7 +362,7 @@ impl ArchiveSource {
             // Each stream also caches its pieces' slots, so their file syncs overlap.
             admitted.reverse();
             let (queue, done) = (Mutex::new(admitted), Mutex::new(Vec::new()));
-            let (this, url) = (&*self, &url);
+            let (this, url, mint) = (&*self, &url, self.mint.as_deref());
             std::thread::scope(|scope| {
                 let streams: Vec<_> = (0..STREAMS)
                     .map(|_| {
@@ -365,12 +373,22 @@ impl ArchiveSource {
                                 let (bytes, read) =
                                     get(&this.agent, url, base, span, timeout, this.stall);
                                 let stored = bytes.and_then(|bytes| {
-                                    run.iter().try_for_each(|(s, offset, length, record)| {
+                                    let mut blocks = Vec::new();
+                                    for (s, offset, length, record) in &run {
                                         let at = (offset - base) as usize;
                                         let raw = &bytes[at..at + *length as usize];
-                                        this.store(*s, *offset, *length, record.clone(), raw)
-                                            .map(drop)
-                                    })
+                                        blocks.push((
+                                            *s,
+                                            raw,
+                                            this.store(*s, *offset, *length, record.clone(), raw)?,
+                                        ));
+                                    }
+                                    Ok(blocks
+                                        .into_iter()
+                                        .map(|(s, raw, receipt)| {
+                                            (s, decode(raw, s, mint).map(|d| (d, receipt)))
+                                        })
+                                        .collect::<Vec<_>>())
                                 });
                                 if let Ok(mut done) = done.lock() {
                                     done.push((stored, read, run));
@@ -384,13 +402,12 @@ impl ArchiveSource {
                     let _ = stream.join();
                 }
             });
-            let pieces: Vec<(Result<()>, u64, Vec<IndexEntry>)> =
-                done.into_inner().unwrap_or_default();
+            let pieces: Vec<Piece> = done.into_inner().unwrap_or_default();
             pending = Vec::new();
             for (stored, read, run) in pieces {
                 self.stats.response_body_bytes += read;
                 match stored {
-                    Ok(()) => {}
+                    Ok(blocks) => self.early.extend(blocks),
                     Err(Error(
                         "archive_request_failed"
                         | "archive_read_failed"
@@ -430,28 +447,41 @@ impl BlockSource for ArchiveSource {
     fn capture_source(&self) -> &'static str {
         super::SOURCE
     }
-    /// Inside the planned range, decodes the next `threads` slots at once and serves them
-    /// in order. Cache reads and downloads stay sequential, so limits and stats are exact.
+    /// Inside the planned range, serves the next prefetch window (`PREFETCH_SLOTS`) in
+    /// order: blocks a prefetch decoded as they arrived, and the rest read from the cache
+    /// and decoded on `threads` threads. Cache reads stay sequential, so stats are exact.
     fn block(&mut self, slot: u64) -> Result<Vec<u8>> {
         if let Some(done) = self.ready.remove(&slot) {
             return done;
         }
-        // shortcut: a window may read (or download) slots the run then skips as complete; fine while windows stay at most 16 slots.
+        // shortcut: a window may read (or download) slots the run then skips as complete; the prefetch window downloads them anyway, revisit if resumed runs skip many.
         // Only planned slots are pruned: boundary evidence outside the range stays whole.
         let (last, mint) = match self.planned {
             Some((start, end)) if (start..=end).contains(&slot) => {
-                (end.min(slot + self.threads.max(1) - 1), self.mint.clone())
+                (end.min(slot + PREFETCH_SLOTS - 1), self.mint.clone())
             }
             _ => (slot, None),
         };
         self.ready.clear();
+        self.early.retain(|s, _| *s >= slot);
         self.hashes
             .retain(|s, _| *s + PREFETCH_SLOTS >= slot && *s < slot);
-        let chunks: Vec<_> = (slot..=last).map(|s| (s, self.chunk(s))).collect();
-        let decoded = parallel(chunks, |s, chunk| {
+        let mut chunks = Vec::new();
+        for s in slot..=last {
+            if !self.early.contains_key(&s) {
+                let chunk = self.chunk(s);
+                // Reading `s` may have prefetched (and decoded) it.
+                if !self.early.contains_key(&s) {
+                    chunks.push((s, chunk));
+                }
+            }
+        }
+        let mut decoded = parallel(chunks, self.threads, |s, chunk| {
             let (raw, receipt) = chunk?;
             decode(&raw, s, mint.as_deref()).map(|d| (d, receipt))
         });
+        let early = self.early.split_off(&(last + 1));
+        decoded.extend(std::mem::replace(&mut self.early, early));
         for (s, result) in &decoded {
             if let Ok(((_, _, hash), _)) = result {
                 self.hashes.insert(*s, hash.clone());
@@ -473,7 +503,7 @@ impl BlockSource for ArchiveSource {
                 }),
             ));
         }
-        self.ready = parallel(linked, |s, linked| {
+        self.ready = parallel(linked, self.threads, |s, linked| {
             let (block, hash, receipt) = linked?;
             normalized(block, hash, s, &receipt)
         })
@@ -490,25 +520,33 @@ fn runtime() -> Result<tokio::runtime::Runtime> {
         .build()
         .map_err(|_| Error("archive_runtime_failed"))
 }
+/// A panic becomes the slot's error, so a bad block never takes down its thread's others.
 fn decode(raw: &[u8], slot: u64, mint: Option<&str>) -> Result<(serde_json::Value, u64, String)> {
-    runtime()?.block_on(super::decode::decode_pruned(raw, slot, mint))
+    std::panic::catch_unwind(|| runtime()?.block_on(super::decode::decode_pruned(raw, slot, mint)))
+        .unwrap_or(Err(Error("archive_decode_failed")))
 }
-/// Runs `work` on each item on its own thread; a panic becomes that slot's error.
+/// Runs `work` on each item on at most `threads` threads; a panic becomes that slot's error.
 fn parallel<T: Send, U: Send>(
     items: Vec<(u64, T)>,
+    threads: u64,
     work: impl Fn(u64, T) -> Result<U> + Sync,
 ) -> Vec<(u64, Result<U>)> {
-    let work = &work;
+    let (queue, done) = (Mutex::new(items), Mutex::new(Vec::new()));
     std::thread::scope(|scope| {
-        let handles: Vec<_> = items
-            .into_iter()
-            .map(|(s, item)| (s, scope.spawn(move || work(s, item))))
-            .collect();
-        handles
-            .into_iter()
-            .map(|(s, h)| (s, h.join().unwrap_or(Err(Error("archive_decode_failed")))))
-            .collect()
-    })
+        for _ in 0..threads.max(1) {
+            scope.spawn(|| {
+                while let Some((s, item)) = queue.lock().ok().and_then(|mut q| q.pop()) {
+                    let result =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(s, item)))
+                            .unwrap_or(Err(Error("archive_decode_failed")));
+                    if let Ok(mut done) = done.lock() {
+                        done.push((s, result));
+                    }
+                }
+            });
+        }
+    });
+    done.into_inner().unwrap_or_default()
 }
 fn normalized(
     mut block: serde_json::Value,
@@ -819,6 +857,39 @@ mod tests {
         assert_eq!(slow.stats.retries, 1);
         assert!(began.elapsed() < Duration::from_secs(4));
         assert_eq!(piece_deadline(4 * 1024 * 1024), Duration::from_secs(6));
+    }
+    #[test]
+    fn blocks_decoded_as_their_pieces_arrive_equal_blocks_decoded_from_the_cache() {
+        use crate::archive::tests::{fixture, slot_range};
+        let value = fixture();
+        let s = value["result"]["slot"].as_u64().unwrap();
+        // s-2 <- s-1 <- s <- s+1 <- s+2, adjacent in the CAR from offset 100.
+        let (mut car, mut index) = (vec![0; 100], vec![0; ((s % EPOCH_SLOTS + 3) * 12) as usize]);
+        for (hash, slot) in (s - 2..=s + 2).enumerate() {
+            let raw = slot_range(&value, slot, slot - 1, hash as u8 + 1, true);
+            let at = ((slot % EPOCH_SLOTS) * 12) as usize;
+            index[at..at + 8].copy_from_slice(&(car.len() as u64).to_le_bytes());
+            index[at + 8..at + 12].copy_from_slice(&(raw.len() as u32).to_le_bytes());
+            car.extend(raw);
+        }
+        let (origin, _) = archive_server(index, car, 0, false);
+        let dir = tempfile::tempdir().unwrap();
+        let source = |network| {
+            let mut source = ArchiveSource::new(dir.path(), false, Limits::default()).unwrap();
+            (source.network, source.origin) = (network, origin.clone());
+            source.plan(crate::live::USDC, s - 1, s + 2);
+            source.threads = 4;
+            source
+        };
+        let mut online = source(true);
+        let fetched: Vec<_> = (s - 1..=s + 2).map(|x| online.block(x)).collect();
+        // Every planned block was decoded during the prefetch; only the slot whose read
+        // started it is read back.
+        assert_eq!(online.stats.cached_chunks, 1);
+        let mut offline = source(false);
+        let cached: Vec<_> = (s - 1..=s + 2).map(|x| offline.block(x)).collect();
+        assert!(fetched.iter().all(Result::is_ok));
+        assert_eq!(fetched, cached);
     }
     #[test]
     fn offline_cache_miss_never_attempts_a_network() {
