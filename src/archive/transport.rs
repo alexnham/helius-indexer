@@ -1,4 +1,4 @@
-use super::{JETSTREAMER_REVISION, decode_slot};
+use super::JETSTREAMER_REVISION;
 use crate::{Error, Result, backfill::BlockSource};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -92,6 +92,8 @@ pub struct ArchiveSource {
     stall: Duration,
     /// The run's slot range; a cache miss inside it prefetches the adjacent slots.
     planned: Option<(u64, u64)>,
+    /// The run's mint: planned blocks are decoded with other transactions pruned.
+    mint: Option<String>,
     /// Blocks decoded at once inside the planned range (`INDEXER_HISTORICAL_WORKERS`).
     pub(super) threads: u64,
     /// Normalized blocks decoded ahead of their `block` call.
@@ -128,6 +130,7 @@ impl ArchiveSource {
             origin: ORIGIN.into(),
             stall: STALL,
             planned: None,
+            mint: None,
             threads: 1,
             ready: BTreeMap::new(),
             hashes: BTreeMap::new(),
@@ -412,8 +415,9 @@ impl ArchiveSource {
     }
 }
 impl BlockSource for ArchiveSource {
-    fn plan(&mut self, start: u64, end: u64) {
+    fn plan(&mut self, mint: &str, start: u64, end: u64) {
         self.planned = Some((start, end));
+        self.mint = Some(mint.into());
         self.threads = crate::backfill::historical_workers().unwrap_or(1) as u64;
         self.ready.clear();
     }
@@ -433,11 +437,12 @@ impl BlockSource for ArchiveSource {
             return done;
         }
         // shortcut: a window may read (or download) slots the run then skips as complete; fine while windows stay at most 16 slots.
-        let last = match self.planned {
+        // Only planned slots are pruned: boundary evidence outside the range stays whole.
+        let (last, mint) = match self.planned {
             Some((start, end)) if (start..=end).contains(&slot) => {
-                end.min(slot + self.threads.max(1) - 1)
+                (end.min(slot + self.threads.max(1) - 1), self.mint.clone())
             }
-            _ => slot,
+            _ => (slot, None),
         };
         self.ready.clear();
         self.hashes
@@ -445,7 +450,7 @@ impl BlockSource for ArchiveSource {
         let chunks: Vec<_> = (slot..=last).map(|s| (s, self.chunk(s))).collect();
         let decoded = parallel(chunks, |s, chunk| {
             let (raw, receipt) = chunk?;
-            decode(&raw, s).map(|d| (d, receipt))
+            decode(&raw, s, mint.as_deref()).map(|d| (d, receipt))
         });
         for (s, result) in &decoded {
             if let Ok(((_, _, hash), _)) = result {
@@ -485,8 +490,8 @@ fn runtime() -> Result<tokio::runtime::Runtime> {
         .build()
         .map_err(|_| Error("archive_runtime_failed"))
 }
-fn decode(raw: &[u8], slot: u64) -> Result<(serde_json::Value, u64, String)> {
-    runtime()?.block_on(decode_slot(raw, slot))
+fn decode(raw: &[u8], slot: u64, mint: Option<&str>) -> Result<(serde_json::Value, u64, String)> {
+    runtime()?.block_on(super::decode::decode_pruned(raw, slot, mint))
 }
 /// Runs `work` on each item on its own thread; a panic becomes that slot's error.
 fn parallel<T: Send, U: Send>(
@@ -785,7 +790,7 @@ mod tests {
             let mut source = ArchiveSource::new(dir.path(), false, Limits::default()).unwrap();
             (source.network, source.origin) = (true, origin);
             source.stall = Duration::from_millis(100);
-            source.plan(10, 12);
+            source.plan(crate::live::USDC, 10, 12);
             (source, dir)
         };
         // One stall: the retry caches every slot of the piece.

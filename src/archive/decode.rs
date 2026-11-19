@@ -18,6 +18,16 @@ use std::{
 
 /// A slot's range contains CAR sections without the file's header.
 pub async fn decode_slot(raw: &[u8], expected_slot: u64) -> Result<(Value, u64, String)> {
+    decode_pruned(raw, expected_slot, None).await
+}
+/// `decode_slot`, with every transaction that does not touch `mint` reduced to its
+/// signatures, as `backfill::prune` would store it. Those are still parsed and validated;
+/// only their normalization is skipped.
+pub(super) async fn decode_pruned(
+    raw: &[u8],
+    expected_slot: u64,
+    mint: Option<&str>,
+) -> Result<(Value, u64, String)> {
     if raw.is_empty() || raw.len() > 16 * 1024 * 1024 {
         return Err(Error("archive_slot_size_limit"));
     }
@@ -61,13 +71,14 @@ pub async fn decode_slot(raw: &[u8], expected_slot: u64) -> Result<(Value, u64, 
             if tx.slot != block.slot || tx.index.is_some_and(|i| i != transactions.len() as u64) {
                 return Err(Error("archive_transaction_order"));
             }
-            let capture = normalize_transaction(
+            let capture = normalize(
                 tx,
                 &nodes,
                 Some(
                     i64::try_from(block.meta.blocktime)
                         .map_err(|_| Error("archive_invalid_block_time"))?,
                 ),
+                mint,
             )?;
             let result = capture["result"].clone();
             bytes += serde_json::to_vec(&result)
@@ -109,6 +120,16 @@ pub fn normalize_transaction(
     tx: &Transaction,
     nodes: &NodesWithCids,
     block_time: Option<i64>,
+) -> Result<Value> {
+    normalize(tx, nodes, block_time, None)
+}
+/// With `mint`, a validated transaction that does not touch it (the fields
+/// `replay::overlap::touches_mint` reads) becomes `{"result":{"transaction":{"signatures"}}}`.
+fn normalize(
+    tx: &Transaction,
+    nodes: &NodesWithCids,
+    block_time: Option<i64>,
+    mint: Option<&str>,
 ) -> Result<Value> {
     let mut complete = tx.clone();
     let data = nodes
@@ -152,6 +173,24 @@ pub fn normalize_transaction(
         + meta.loaded_readonly_addresses.len();
     if meta.pre_balances.len() != account_count || meta.post_balances.len() != account_count {
         return Err(Error("archive_incomplete_metadata"));
+    }
+    if let Some(mint) = mint {
+        let key = bs58::decode(mint).into_vec().unwrap_or_default();
+        let touches = msg.static_account_keys().iter().any(|k| k.as_ref() == key)
+            || meta
+                .loaded_writable_addresses
+                .iter()
+                .chain(&meta.loaded_readonly_addresses)
+                .any(|a| *a == key)
+            || meta
+                .pre_token_balances
+                .iter()
+                .chain(&meta.post_token_balances)
+                .any(|b| b.mint == mint);
+        if !touches {
+            let signatures: Vec<String> = native.signatures.iter().map(|s| s.to_string()).collect();
+            return Ok(json!({"result":{"transaction":{"signatures":signatures}}}));
+        }
     }
     let mut message = wire::Message {
         account_keys: msg
