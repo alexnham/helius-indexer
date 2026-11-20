@@ -95,6 +95,8 @@ services:
       DATABASE_URL: host=/var/run/postgresql user=indexer dbname=indexer
       INDEXER_KAFKA_BROKERS: kafka:9092
       INDEXER_KAFKA_PRIVATE_NETWORK: "1"
+      # Kafka keeps only input not yet written to PostgreSQL; one consumer group per topic.
+      INDEXER_KAFKA_DELETE_CONSUMED: "1"
     depends_on:
       postgres:
         condition: service_healthy
