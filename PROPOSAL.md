@@ -279,7 +279,8 @@ storage and live-priority admission gate. Defaults are 60 seconds and 50 finaliz
 slots; each invocation remains limited to 300 seconds/128 historical slots. It
 exposes source failures and scoped coverage alongside newest-first inspection.
 This does not establish a rolling 30-day API or authorize a full-window backfill.
-The runtime now continues live intake in resumable cycles and keeps only the newest
+The runtime now keeps one continuous live subscription (bounded cycles remain
+opt-in), repeats historical work beside it, and keeps only the newest
 1,000 transfers (configurable), pruning older inputs and coverage to `unknown`.
 This count-based cap is a local-testing retention choice only; the 30-day query
 window and 37-day raw retention above remain the production requirement.

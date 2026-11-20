@@ -23,6 +23,7 @@ struct State {
     /// Writes holding a permit; at most `WriteGate::limit`.
     active: usize,
     live_started: bool,
+    live_finished: bool,
     live_waiting: usize,
     history_waiting: usize,
     live_since: Option<Instant>,
@@ -84,6 +85,24 @@ impl WriteGate {
             .map_err(|_| Error("scheduling_failed"))?
             .0
             .live_started)
+    }
+    pub(crate) fn live_finished(&self) -> Result<()> {
+        self.state
+            .lock()
+            .map_err(|_| Error("scheduling_failed"))?
+            .live_finished = true;
+        self.changed.notify_all();
+        Ok(())
+    }
+    /// Whether the live worker has finished, waiting up to `timeout` for it to.
+    pub(crate) fn wait_live_finish(&self, timeout: Duration) -> Result<bool> {
+        let state = self.state.lock().map_err(|_| Error("scheduling_failed"))?;
+        Ok(self
+            .changed
+            .wait_timeout_while(state, timeout, |s| !s.live_finished)
+            .map_err(|_| Error("scheduling_failed"))?
+            .0
+            .live_finished)
     }
     fn enter(&self, live: bool, deadline: Option<Instant>) -> Result<Permit<'_>> {
         let began = Instant::now();
@@ -176,6 +195,10 @@ pub fn run(
 ) -> Result<Value> {
     telemetry.set_context("coordinator", "combined", "validation");
     crate::backfill::scope(live::USDC, start, end)?;
+    // History here is bounded by the same seconds, so a continuous run is not allowed.
+    if seconds == live::CONTINUOUS {
+        return Err(Error("invalid_live_bounds"));
+    }
     live::validate_options(start, seconds)?;
     let endpoint = std::env::var("SOLANA_RPC_URL")
         .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".into());
@@ -198,6 +221,9 @@ pub(crate) fn run_with_source<S: BlockSource + Send>(
     mut source: S,
 ) -> Result<Value> {
     crate::backfill::scope(live::USDC, start, end)?;
+    if seconds == live::CONTINUOUS {
+        return Err(Error("invalid_live_bounds"));
+    }
     live::validate_options(start, seconds)?;
     run_with_job(database, start, seconds, telemetry, |gate| {
         let mut history = History::open(database)?;
@@ -228,6 +254,9 @@ pub fn monitor(
 ) -> Result<Value> {
     crate::backfill::scope(config.mint, config.start, config.end)?;
     crate::backfill::scope(config.mint, config.live_from, config.live_from)?;
+    if config.seconds == live::CONTINUOUS {
+        return Err(Error("invalid_live_bounds"));
+    }
     live::validate_options(config.live_from, config.seconds)?;
     let endpoint = std::env::var("SOLANA_RPC_URL")
         .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".into());
@@ -323,6 +352,7 @@ fn paired_workers(
             let result = live(Arc::clone(&live_gate));
             // A failed live startup must not prevent independent historical repair.
             let _ = live_gate.live_started();
+            let _ = live_gate.live_finished();
             result
         });
         let historical_gate = Arc::clone(gate);

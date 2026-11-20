@@ -59,8 +59,11 @@ cargo run --locked -- query SESSION EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
 
 Compatible sources can now share a validation database; use the combined overlap
 command when coordinated write priority is needed.
-Replace START_SLOT with an explicitly chosen replayable slot. Time must be 1–300
-seconds; intake stops at 10,000 received transactions even if time remains.
+Replace START_SLOT with an explicitly chosen replayable slot. Time is 1–300
+seconds, or 0 to keep the subscription open until it fails or the process is
+stopped. Live intake has no message cap; a continuous run emits a cumulative
+`live_metrics` event every 60 seconds and at shutdown. A reconnect resumes from
+the delivered cursor minus the 150-slot reorder margin, never before START_SLOT.
 Subscription attempts stop at three; connection timeout is five seconds,
 unary request timeout ten seconds, and stream inactivity timeout ten seconds.
 The overall asynchronous deadline also covers connect/replay/reference work.

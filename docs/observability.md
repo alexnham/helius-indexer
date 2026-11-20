@@ -474,7 +474,9 @@ bounds and their backpressure are listed in [recovery](recovery.md).
 For the #36 metrics, the consumer report and events give:
 
 - **Consume rate:** `consumed_per_second` over `elapsed_seconds`. The produce rate is
-  `input_transactions_per_second` in the producer's `live_metrics` event.
+  `input_transactions_per_second` in the producer's `live_metrics` event. A continuous
+  live run (`SECONDS` 0) emits that event every 60 seconds with counters cumulative since
+  the run started, plus once at shutdown; a bounded run emits it only at shutdown.
 - **Consumer lag:** `lag_messages` at exit and `lag_peak_messages`, measured as the broker
   high watermark minus the position stored with the output, summed over assigned
   partitions. Fetched but unwritten input therefore counts. It is measured at most once a

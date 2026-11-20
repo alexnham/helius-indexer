@@ -470,3 +470,23 @@ fn version_three_prototype_upgrades_without_losing_replay_or_kafka_state() {
         30
     );
 }
+
+#[test]
+fn historical_cycles_repeat_past_failures_until_continuous_live_finishes() {
+    let gate = WriteGate::default();
+    let mut calls = 0;
+    let report = until_live_finishes(&gate, Duration::from_millis(1), || {
+        calls += 1;
+        match calls {
+            1 => Err(Error("storage_read_failed")),
+            3 => {
+                gate.live_finished()?;
+                Ok(json!({"outcome":"reported"}))
+            }
+            _ => Ok(json!({"outcome":"reported"})),
+        }
+    })
+    .unwrap();
+    assert_eq!(calls, 3);
+    assert_eq!(report, json!({"outcome":"reported","cycles":3}));
+}

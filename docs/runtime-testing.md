@@ -23,12 +23,16 @@ published to Kafka (`kafka:9092` on the private Compose network, plaintext under
 session; historical replay keeps writing directly. Outside this Compose network, brokers
 must still be loopback. Check consumer progress with `docker compose logs consumer`.
 
-Defaults are USDC, 60-second live cycles, an initial frozen 50-slot finalized
+Defaults are USDC, one continuous live subscription, an initial frozen 50-slot finalized
 range and job ID `recent`. Set `INDEXER_MINT`, `INDEXER_BACKFILL_SLOTS` or explicit
 `INDEXER_BACKFILL_START` / `INDEXER_BACKFILL_END` before first startup. Each scope
 is limited to 128 slots. `INDEXER_REPLAY_JOB` identifies the durable replay job.
-`INDEXER_LIVE_SECONDS` accepts 1–300; historical network intake is capped at 60
-seconds per attempt. Actual replay availability is checked before each subscription.
+`INDEXER_LIVE_SECONDS` defaults to 0: live intake keeps one subscription open,
+historical replay, archive, gap and overlap steps repeat beside it every 30 seconds,
+and pruning runs every 60 seconds. If the subscription fails, the worker waits 30
+seconds and resumes from the producer cursor minus the reorder margin. Values 1–300
+restore bounded live cycles. Historical network intake is capped at 60 seconds per
+attempt. Actual replay availability is checked before each subscription.
 The small RPC genesis/reference probe chooses the initial scope; RPC is not the
 normal historical transaction source.
 
