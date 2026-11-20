@@ -6,3 +6,6 @@
 !.env.example
 
 __pycache__/
+infra/*/.terraform/
+infra/*/*.tfstate*
+infra/*/*.tfvars

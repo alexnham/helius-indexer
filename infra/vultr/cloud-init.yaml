@@ -1,0 +1,26 @@
+#cloud-config
+# Builds the archive binary and starts PostgreSQL; the backfill itself is started by hand (README).
+package_update: true
+packages: [docker.io, docker-compose-v2, build-essential, cmake, pkg-config, git, python3]
+
+write_files:
+  # The checked-in compose limits PostgreSQL to 1 CPU and 512 MB, which suits a laptop, not this run.
+  - path: /opt/indexer.compose.override.yaml
+    content: |
+      services:
+        postgres:
+          cpus: 4.0
+          mem_limit: 16g
+          shm_size: 2g
+          command: [postgres, -c, shared_buffers=8GB, -c, effective_cache_size=20GB, -c, max_wal_size=16GB]
+
+runcmd:
+  - git clone https://github.com/alexnham/helius-indexer.git /opt/indexer
+  - git -C /opt/indexer checkout ${git_ref}
+  - mv /opt/indexer.compose.override.yaml /opt/indexer/compose.override.yaml
+  # compose requires the secret file to exist; the archive backfill needs no credentials.
+  - touch /opt/indexer/.env
+  - cd /opt/indexer && docker compose up -d postgres
+  - curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.99.0
+  - cd /opt/indexer && /root/.cargo/bin/cargo build --release --locked --features archive
+  - touch /opt/indexer/.build-done
