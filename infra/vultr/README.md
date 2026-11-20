@@ -29,13 +29,14 @@ Cloud-init takes ~10 minutes; `/opt/indexer/.build-done` appears when the build 
 ssh root@IP
 cd /opt/indexer
 export DATABASE_URL=postgres://indexer:indexer@127.0.0.1:55432/indexer
-B=target/release/helius-indexer; A="--binary $B --directory /opt/runs --session vm-test"
-python3 scripts/archive-backfill.py plan $A --allow-provider --days 30
+B=target/release/helius-indexer; A="--binary $B --directory /opt/runs --session vm_test"
+# --days 30 probes public RPC, which failed from a VM; start from a known slot instead.
+python3 scripts/archive-backfill.py plan $A --allow-provider --start-slot 470447000
 python3 scripts/archive-backfill.py run $A --allow-provider --config config/backfill.example.json \
   --slots-per-batch 200 --max-batches 400 --max-reserved-bytes 600000000000
 ```
 
-Run it in `tmux` so a dropped SSH session does not stop it; `touch /opt/runs/vm-test/CANCEL`
+Run it in `tmux` so a dropped SSH session does not stop it; `touch /opt/runs/CANCEL`
 stops it after the current batch. `python3 scripts/archive-backfill.py serve $A` shows progress on
 http://127.0.0.1:8768 through the tunnel in `terraform output ssh`. Record the results in `docs/validation/`.
 
