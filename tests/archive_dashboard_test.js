@@ -26,6 +26,7 @@ render({worker: {state: 'budget_exhausted'}, configuration: {mint: 'USDC', slot_
 assert.match(get('stages').textContent, /80/);
 assert.match(get('stages').textContent, /Charged bytes: 738197504/);
 assert.match(get('stages').textContent, /Batches with unknown actual bytes: 1/);
+assert.match(get('stages').textContent, /Archive rate limit: none/);
 assert.match(get('meta').textContent, /sample/i);
 assert.match(get('notice').textContent, /incomplete/i);
 assert.match(get('flowNote').textContent, /unknown|unverified/i);

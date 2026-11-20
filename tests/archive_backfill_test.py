@@ -29,10 +29,13 @@ elif cmd=="bridge":
  if os.environ.get("FAKE_FAIL"): print(os.environ.get("SOLANA_RPC_URL","secret"),file=sys.stderr); print('{"event":"command_failed","error_class":"rpc_rate_limited"}',file=sys.stderr); sys.exit(3)
  if os.environ.get("FAKE_CANCEL"): Path(os.environ["BACKFILL_CANCEL_FILE"]).touch()
  s["slots_per_batch"]=os.environ.get("INDEXER_BRIDGE_BATCH_SLOTS")
- s["pending"]=max(0,s["pending"]-1); s["batches"]+=1; p.write_text(json.dumps(s)); r=report()
+ limited=os.environ.get("FAKE_LIMITED")
+ if not limited: s["pending"]=max(0,s["pending"]-1)
+ s["batches"]+=1; p.write_text(json.dumps(s)); r=report()
  r["batch_limits"]={"unique_slots":int(os.environ.get("INDEXER_BRIDGE_BATCH_SLOTS","8"))}
  if os.environ.get("FAKE_OLD_BINARY"): r.pop("batch_limits")
  r["source_diagnostics"]={"archive":{"response_body_bytes":5},"rpc":{"response_body_bytes_read":7}}
+ if limited: r["source_diagnostics"]["archive"].update(rate_limited=True,retry_after_seconds=int(limited))
  print(json.dumps(r))
 elif cmd=="summary": print(json.dumps({"transfer_count":3}))
 else: print(json.dumps({"ok":True}))
@@ -110,6 +113,40 @@ class ArchiveBackfillTests(unittest.TestCase):
         self.assertEqual(json.loads(self.state.read_text())["batches"], 2)
         self.assertEqual(app.main(["status", *self.common]), 0)
         self.assertEqual(self.manifest()["budget"]["reserved_bytes"], 24)
+
+    def test_rate_limited_batches_wait_with_backoff_instead_of_stopping(self):
+        self.assertEqual(app.rate_limit_wait({}, 1), None)
+        limited = lambda after: {"source_diagnostics": {"archive": {"rate_limited": True,
+                                                                    "retry_after_seconds": after}}}
+        self.assertEqual([app.rate_limit_wait(limited(None), k) for k in (1, 2, 3, 9)],
+                         [30, 60, 120, 900])
+        self.assertEqual(app.rate_limit_wait(limited(2000), 1), 2000)
+        waits = []
+        original = (app.wait_unless_cancelled, app.RATE_LIMIT_MAX_BATCHES)
+        app.wait_unless_cancelled = lambda _cancel, seconds: waits.append(seconds) or True
+        try:
+            run = ["run", *self.common, "--max-batches", "3", "--max-reserved-bytes",
+                   str(4 * app.BATCH_RESERVE), "--min-free-bytes", "0"]
+            # A batch that verified nothing because of a 429 waits, rather than ending the run.
+            os.environ["FAKE_LIMITED"] = "45"
+            self.assertEqual(app.main(run), 0)
+            m = self.manifest()
+            self.assertEqual((m["total_batches"], m["stop_reason"]), (3, "max_batches"))
+            self.assertEqual(waits, [45, 60, 120])
+            self.assertEqual(m["rate_limit"]["consecutive_batches"], 3)
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(app.main(["status", *self.common]), 0)
+            self.assertEqual(json.loads(output.getvalue())["manifest"]["rate_limit"]["wait_seconds"], 120)
+            # Too many in a row stop the run; a clean batch clears the record.
+            app.RATE_LIMIT_MAX_BATCHES = 4
+            self.assertEqual(app.main(run), 0)
+            self.assertEqual(self.manifest()["stop_reason"], "archive_rate_limited")
+            del os.environ["FAKE_LIMITED"]
+            self.assertEqual(app.main(run), 0)
+            self.assertNotIn("rate_limit", self.manifest())
+        finally:
+            app.wait_unless_cancelled, app.RATE_LIMIT_MAX_BATCHES = original
 
     def test_reservation_still_caps_batches(self):
         self.assertEqual(app.main(["run", *self.common, "--max-batches", "4",

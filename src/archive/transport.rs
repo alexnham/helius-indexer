@@ -9,7 +9,7 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     sync::{
-        Mutex,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -129,6 +129,9 @@ pub struct ArchiveSource {
     index: BTreeMap<u64, Vec<u8>>,
     /// The next window's download in flight, and the bytes admitted for it.
     next: Option<(std::thread::JoinHandle<Vec<Piece>>, u64)>,
+    /// Set by an HTTP 429: 1 + the `Retry-After` seconds (0 when absent). Once set, no
+    /// more requests are admitted for this source, so a rate-limited batch stops asking.
+    limited: Arc<AtomicU64>,
     pub stats: Stats,
 }
 impl ArchiveSource {
@@ -167,6 +170,7 @@ impl ArchiveSource {
             batch: None,
             index: BTreeMap::new(),
             next: None,
+            limited: Arc::new(AtomicU64::new(0)),
             stats: Stats::default(),
         })
     }
@@ -183,6 +187,9 @@ impl ArchiveSource {
     fn admit(&mut self, offset: u64, length: usize, reserved: u64) -> Result<Duration> {
         if !self.network {
             return Err(Error("archive_cache_miss"));
+        }
+        if self.limited.load(Ordering::Relaxed) > 0 {
+            return Err(Error("archive_rate_limited"));
         }
         if length == 0
             || length > MAX_CHUNK
@@ -206,13 +213,24 @@ impl ArchiveSource {
     fn fetch(&mut self, path: &str, offset: u64, length: usize) -> Result<Vec<u8>> {
         let timeout = self.admit(offset, length, 0)?;
         let url = format!("{}/{path}", self.origin);
-        let (bytes, read) = get(&self.agent, &url, offset, length, timeout, self.stall);
+        let (bytes, read) = get(
+            &self.agent,
+            &url,
+            offset,
+            length,
+            timeout,
+            self.stall,
+            &self.limited,
+        );
         self.stats.response_body_bytes += read;
         bytes
     }
     pub(super) fn probe_epoch(&mut self, epoch: u64) -> Result<bool> {
         if !self.network {
             return Err(Error("archive_cache_miss"));
+        }
+        if self.limited.load(Ordering::Relaxed) > 0 {
+            return Err(Error("archive_rate_limited"));
         }
         if self.stats.requests >= self.limits.requests {
             return Err(Error("archive_download_limit"));
@@ -231,6 +249,7 @@ impl ArchiveSource {
             200 => Ok(true),
             404 => Ok(false),
             403 => Err(Error("archive_access_denied")),
+            429 => Err(rate_limited(&response, &self.limited)),
             _ => Err(Error("archive_availability_unknown")),
         }
     }
@@ -434,6 +453,7 @@ impl ArchiveSource {
                 &url,
                 self.mint.as_deref(),
                 self.stall,
+                &self.limited,
                 admitted,
             );
             pending = self.absorb(pieces, round == 0, &mut first_error);
@@ -471,15 +491,24 @@ impl ArchiveSource {
             return;
         }
         let bytes = admitted.iter().map(|a| a.1 as u64).sum();
-        let (agent, cache, mint, stall) = (
+        let (agent, cache, mint, stall, limited) = (
             self.agent.clone(),
             self.cache.clone(),
             self.mint.clone(),
             self.stall,
+            self.limited.clone(),
         );
         let url = format!("{}/{epoch}/epoch-{epoch}.car", self.origin);
         let handle = std::thread::spawn(move || {
-            download(&agent, &cache, &url, mint.as_deref(), stall, admitted)
+            download(
+                &agent,
+                &cache,
+                &url,
+                mint.as_deref(),
+                stall,
+                &limited,
+                admitted,
+            )
         });
         self.next = Some((handle, bytes));
     }
@@ -502,7 +531,7 @@ impl BlockSource for ArchiveSource {
         self.ready.clear();
     }
     fn diagnostics(&self) -> serde_json::Value {
-        serde_json::json!({"jetstreamer_revision":JETSTREAMER_REVISION,"response_body_bytes":self.stats.response_body_bytes,"requests":self.stats.requests,"cached_chunks":self.stats.cached_chunks,"retries":self.stats.retries,"limits":{"response_body_bytes":self.limits.bytes,"requests":self.limits.requests,"seconds":self.limits.seconds}})
+        serde_json::json!({"jetstreamer_revision":JETSTREAMER_REVISION,"response_body_bytes":self.stats.response_body_bytes,"requests":self.stats.requests,"cached_chunks":self.stats.cached_chunks,"retries":self.stats.retries,"rate_limited":self.limited.load(Ordering::Relaxed)>0,"retry_after_seconds":self.limited.load(Ordering::Relaxed).checked_sub(1).filter(|s|*s>0),"limits":{"response_body_bytes":self.limits.bytes,"requests":self.limits.requests,"seconds":self.limits.seconds}})
     }
     fn provenance(&self) -> &'static str {
         super::SOURCE
@@ -638,6 +667,7 @@ fn download(
     url: &str,
     mint: Option<&str>,
     stall: Duration,
+    limited: &AtomicU64,
     mut admitted: Vec<Admitted>,
 ) -> Vec<Piece> {
     admitted.reverse();
@@ -649,7 +679,14 @@ fn download(
                     while let Some((base, span, timeout, run)) =
                         queue.lock().ok().and_then(|mut q| q.pop())
                     {
-                        let (bytes, read) = get(agent, url, base, span, timeout, stall);
+                        // After a 429 the pieces still queued are not requested.
+                        if limited.load(Ordering::Relaxed) > 0 {
+                            if let Ok(mut done) = done.lock() {
+                                done.push((Err(Error("archive_rate_limited")), 0, run));
+                            }
+                            continue;
+                        }
+                        let (bytes, read) = get(agent, url, base, span, timeout, stall, limited);
                         let stored = bytes.and_then(|bytes| {
                             let mut blocks = Vec::new();
                             for (s, offset, length, record) in &run {
@@ -715,6 +752,19 @@ fn store(
     )?;
     Ok(receipt)
 }
+/// Records an HTTP 429 and its `Retry-After` seconds (the delta form; a date counts as
+/// absent) so the source stops requesting, and the run driver can wait before the next batch.
+fn rate_limited<B>(response: &ureq::http::Response<B>, limited: &AtomicU64) -> Error {
+    let seconds = response
+        .headers()
+        .get("retry-after")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(0)
+        .min(86_400);
+    limited.fetch_max(1 + seconds, Ordering::Relaxed);
+    Error("archive_rate_limited")
+}
 /// One admitted range request; also returns the response body bytes read, for the stats.
 fn get(
     agent: &ureq::Agent,
@@ -723,6 +773,7 @@ fn get(
     length: usize,
     timeout: Duration,
     stall: Duration,
+    limited: &AtomicU64,
 ) -> (Result<Vec<u8>>, u64) {
     let end = offset + length as u64 - 1;
     let response = agent
@@ -741,6 +792,7 @@ fn get(
     let checked = match response.status().as_u16() {
         403 => Err(Error("archive_access_denied")),
         404 => Err(Error("archive_object_unavailable")),
+        429 => Err(rate_limited(&response, limited)),
         206 => response
             .headers()
             .get("content-range")
@@ -898,13 +950,14 @@ mod tests {
         assert_eq!(piece_span(2 * mib, 0), 2 * mib as usize);
     }
     /// Serves `index` and `car` for epoch 0 Range requests. The first `stalls` block requests
-    /// send nothing and are dropped or, with `trickle`, send one byte every 150 ms. Returns
-    /// the origin and the block request count.
+    /// send nothing and are dropped or, with `trickle`, send one byte every 150 ms; with
+    /// `limited`, every block request gets a 429. Returns the origin and the block request count.
     fn archive_server(
         index: Vec<u8>,
         car: Vec<u8>,
         stalls: u64,
         trickle: bool,
+        limited: bool,
     ) -> (String, Arc<AtomicU64>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
@@ -938,6 +991,15 @@ mod tests {
                         path.ends_with(".car") && count.fetch_add(1, Ordering::SeqCst) < stalls;
                     if stalled && !trickle {
                         std::thread::sleep(Duration::from_secs(2));
+                        return;
+                    }
+                    if limited && path.ends_with(".car") {
+                        let body = r#"{"code":"too_many_requests"}"#;
+                        let head = format!(
+                            "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 7\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = stream.write_all(head.as_bytes());
                         return;
                     }
                     let part = &body[range.0..=range.1];
@@ -983,7 +1045,7 @@ mod tests {
             (source, dir)
         };
         // One stall: the retry caches every slot of the piece.
-        let (origin, car_requests) = archive_server(index.clone(), car.clone(), 1, false);
+        let (origin, car_requests) = archive_server(index.clone(), car.clone(), 1, false, false);
         let (mut one, _dir) = source(origin);
         assert_eq!(one.chunk(10).unwrap().0, car[100..110]);
         assert_eq!((one.stats.requests, one.stats.retries), (3, 1));
@@ -1000,13 +1062,13 @@ mod tests {
         assert_eq!(one.chunk(11).unwrap().0, car[110..120]);
         assert_eq!(one.stats.cached_chunks, 4);
         // Two stalls: the slot fails after one retry instead of retrying again.
-        let (origin, car_requests) = archive_server(index.clone(), car.clone(), 2, false);
+        let (origin, car_requests) = archive_server(index.clone(), car.clone(), 2, false, false);
         let (mut two, _dir) = source(origin);
         assert_eq!(two.chunk(10).err(), Some(Error("archive_request_failed")));
         assert_eq!((two.stats.requests, two.stats.retries), (3, 1));
         assert_eq!(car_requests.load(Ordering::SeqCst), 2);
         // A trickle that never stalls a read still misses the piece's own 2-second deadline.
-        let (origin, _) = archive_server(index, car.clone(), 1, true);
+        let (origin, _) = archive_server(index.clone(), car.clone(), 1, true, false);
         let (mut slow, _dir) = source(origin);
         slow.stall = Duration::from_millis(500);
         let began = Instant::now();
@@ -1014,6 +1076,18 @@ mod tests {
         assert_eq!(slow.stats.retries, 1);
         assert!(began.elapsed() < Duration::from_secs(4));
         assert_eq!(piece_deadline(4 * 1024 * 1024), Duration::from_secs(6));
+        // A 429 fails the slot as rate-limited, records Retry-After, and nothing more is
+        // requested: not a retry, not the next slot.
+        let (origin, car_requests) = archive_server(index, car, 0, false, true);
+        let (mut limited, _dir) = source(origin);
+        assert_eq!(limited.chunk(10).err(), Some(Error("archive_rate_limited")));
+        assert_eq!((limited.stats.requests, limited.stats.retries), (2, 0));
+        assert_eq!(limited.chunk(11).err(), Some(Error("archive_rate_limited")));
+        assert_eq!(limited.stats.requests, 2);
+        assert_eq!(car_requests.load(Ordering::SeqCst), 1);
+        let diagnostics = limited.diagnostics();
+        assert_eq!(diagnostics["rate_limited"], true);
+        assert_eq!(diagnostics["retry_after_seconds"], 7);
     }
     #[test]
     fn blocks_decoded_as_their_pieces_arrive_equal_blocks_decoded_from_the_cache() {
@@ -1029,7 +1103,7 @@ mod tests {
             index[at + 8..at + 12].copy_from_slice(&(raw.len() as u32).to_le_bytes());
             car.extend(raw);
         }
-        let (origin, _) = archive_server(index, car, 0, false);
+        let (origin, _) = archive_server(index, car, 0, false, false);
         let dir = tempfile::tempdir().unwrap();
         let source = |network| {
             let mut source = ArchiveSource::new(dir.path(), false, Limits::default()).unwrap();

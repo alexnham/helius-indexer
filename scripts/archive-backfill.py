@@ -18,6 +18,11 @@ DEFAULT_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 SAMPLE_PERCENT = 10
 BATCH_RESERVE = 704 * 1024 * 1024  # archive 128 MiB + nine RPC blocks at 64 MiB (eight-slot batches)
 DEFAULT_RESERVE_LIMIT = 2 * 1024**3
+# Old Faithful answers HTTP 429 when rate-limited: wait 30 s after a rate-limited batch,
+# doubling to at most 15 minutes (or longer if Retry-After says so), and stop the run after
+# 12 rate-limited batches in a row.
+RATE_LIMIT_WAIT_SECONDS = (30, 900)
+RATE_LIMIT_MAX_BATCHES = 12
 DEFAULT_MIN_FREE = 10 * 1024**3
 # Above the native per-batch bounds: 120 s archive plus nine 20 s RPC block requests.
 CHILD_TIMEOUT_SECONDS = 360
@@ -353,11 +358,30 @@ def status(args):
     output = {
         "manifest": {key: manifest.get(key) for key in (
             "session", "mint", "start_slot", "state", "stop_reason", "window", "sampling",
-            "budget", "batches", "run_config",
+            "budget", "batches", "run_config", "rate_limit",
         )},
         "bridge": bridge, "sampling": sampling,
     }
     print(json.dumps(output, sort_keys=True))
+
+
+def rate_limit_wait(report, consecutive):
+    archive = report.get("source_diagnostics", {}).get("archive", {})
+    if archive.get("rate_limited") is not True:
+        return None
+    first, longest = RATE_LIMIT_WAIT_SECONDS
+    retry_after = archive.get("retry_after_seconds")
+    return max(min(first * 2 ** (consecutive - 1), longest),
+               retry_after if isinstance(retry_after, int) else 0)
+
+
+def wait_unless_cancelled(cancel_file, seconds):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if cancel_file.exists():
+            return False
+        time.sleep(min(1.0, deadline - time.monotonic()))
+    return True
 
 
 def source_bytes(report):
@@ -483,6 +507,22 @@ def run_batches(args, env, path, manifest, cancel_file):
         if report.get("cancelled") is True:
             manifest["stop_reason"] = "cancelled_by_indexer"
             return
+        # A rate-limited batch is expected to verify less; wait instead of stopping.
+        consecutive = manifest.get("rate_limit", {}).get("consecutive_batches", 0) + 1
+        wait = rate_limit_wait(report, consecutive)
+        if wait is None:
+            manifest.pop("rate_limit", None)
+        elif consecutive >= RATE_LIMIT_MAX_BATCHES:
+            manifest["stop_reason"] = "archive_rate_limited"
+            return
+        else:
+            manifest["rate_limit"] = {"consecutive_batches": consecutive, "wait_seconds": wait,
+                                      "until_unix_seconds": int(time.time()) + wait}
+            write_manifest(path, manifest)
+            if not wait_unless_cancelled(cancel_file, wait):
+                manifest["stop_reason"] = "cancel_file"
+                return
+            continue
         if report.get("historical", {}).get("pending_slots", 0) >= progress.get("pending_slots", 0):
             manifest["stop_reason"] = "batch_did_not_reduce_pending_slots"
             return
@@ -521,7 +561,8 @@ def serve(args):
             "backfill": {"state": current.get("state", "stopped"),
                          "window": current.get("window"), "budget": current.get("budget"),
                          "batches": current.get("batches", []),
-                         "stop_reason": current.get("stop_reason")},
+                         "stop_reason": current.get("stop_reason"),
+                         "rate_limit": current.get("rate_limit")},
             "live": {"coverage": "unknown"}, "summary": summary,
         }
 

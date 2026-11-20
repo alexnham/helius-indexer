@@ -54,7 +54,10 @@ Each bridge batch processes at most the configured positions. The wrapper reserv
 archive limit above + (`slots_per_batch` + 1) × 64 MiB before
 each batch so a crash cannot reset its charge. When the batch finishes and reports
 its source response bytes, the charge drops to those bytes; failed, timed-out and
-interrupted batches keep the full reservation. `run` stops at `--max-reserved-bytes`
+interrupted batches keep the full reservation. After a rate-limited batch (an Old Faithful
+429), `run` waits 30 s, doubling to 15 minutes, or longer if `Retry-After` asks, and then
+continues. It stops with `archive_rate_limited` after 12 rate-limited batches in a row.
+The wait shows as `rate_limit` in `status` and on the dashboard. `run` stops at `--max-reserved-bytes`
 (default 2 GiB), low free disk, a `CANCEL` file in the session directory, or a batch
 that verified nothing new. Charged bytes are a scheduling allowance, not billing.
 Each native command may take up to 360 s. The native worker shares a cooperative
