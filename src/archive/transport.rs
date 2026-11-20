@@ -22,9 +22,11 @@ const PREFETCH_SLOTS: u64 = 128;
 const EPOCH_SLOTS: u64 = 432000;
 /// Largest range one prefetch request covers; pieces of a window download concurrently.
 const PIECE_BYTES: usize = 8 * 1024 * 1024;
-/// Concurrent piece downloads. From a home link the total levels off at 8-16 streams; a
-/// datacenter VM doubles it from 8 to 16 (docs/validation/2026-11-20-archive-vm-test.md).
-const STREAMS: usize = 16;
+/// Concurrent piece downloads. One archive stream gets ~4-11 MiB/s and the total levels
+/// off at 8-16 streams (docs/validation/2026-11-18-archive-throughput-baseline.md). 16
+/// streams (and 32 pieces per window) drew rate limiting from a VM
+/// (docs/validation/2026-11-20-archive-vm-test.md), so this stays at 8 until 429s back off.
+const STREAMS: usize = 8;
 /// Pieces per window: small pieces keep a stalled piece's deadline short.
 const PIECES: u32 = 2 * STREAMS as u32;
 /// A window is split into about `pieces` pieces of 1 MiB to `PIECE_BYTES` each.

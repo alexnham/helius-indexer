@@ -76,8 +76,8 @@ Two findings:
    archive source its batch range (`BlockSource::ahead`). One index request covers the
    batch. Pieces the background download loses are fetched when their slot is read.
 3. **The per-batch archive budget scales with the batch:** 1 MiB and half a request per
-   slot, at least 128 MiB/128 requests, at most 2 GiB/2048 requests. Streams go from 8
-   to 16.
+   slot, at least 128 MiB/128 requests, at most 2 GiB/2048 requests. Streams stay at 8
+   (see the second VM run).
 
 ## Results (laptop, alternating cold runs)
 
@@ -99,10 +99,36 @@ Ranges from 470447000, with all versions in each round:
 at 1000 wrote the same 32,437 transfers (identical row hash). The slot statuses were also
 identical: 599 complete, 1 `missing_token_metadata`.
 
+## Second VM run, and rate limiting
+
+Same VM type and start slot. The branch at 758d208 (with 16 streams and 32 pieces per
+window), 1000-slot batches, cancelled after 15 minutes. It cost $0.27; an attempt an hour
+earlier was abandoned when every Old Faithful request, from the laptop too, returned HTTP
+429 "too_many_requests".
+
+| Batch | Seconds | Slots failed with `archive_range_not_honored` (429) |
+| --- | --- | --- |
+| 1 | 26 (**38 slots/s**) | 0 |
+| 7 | 37 (27 slots/s) | 0 |
+| the other 13 | 49–87 | 80–312 of 1,000 |
+
+Over the run: 12,645 slots in 923 s (13.7 slots/s), and 2,354 slots left as
+`archive_range_not_honored`.
+
+- **Clean batches** matched the laptop's 1000-slot rate.
+- **Rate-limited batches** took twice as long and lost 8–31% of their slots.
+- **The limit is intermittent:** minutes after the run, the VM got 206 while the laptop got
+  429.
+- **The code misfiles the error:** a 429 is reported as `archive_range_not_honored`, and
+  nothing backs off.
+
+16 streams doubled the pieces, and so the requests, per window. The stream count is back
+at 8 here.
+
 **Limits:**
 
-- The laptop is network-bound at about 20 MB/s, so the 16 streams and the higher ceiling
-  are not shown here.
-- The VM rate with these changes has not been measured yet.
+- The laptop is network-bound at about 20 MB/s, so the higher ceiling is not shown here.
+- The VM rate is bounded by Old Faithful's rate limiting until 429s are classified and
+  backed off.
 - A batch that stops early does not count the window still downloading in its reported
   bytes (at most one window, ~66 MB).
