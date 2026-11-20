@@ -42,8 +42,9 @@ from the delivered producer cursor (the lowest undelivered slot) minus the reord
 margin, never from a received-but-undelivered position. `convert`/cuckoo features are
 excluded; no Solana runtime or database service is introduced. Prost re-encodes
 known wire fields with an explicitly stored schema revision, Tokio supplies deadlines, and a capacity-one request channel
-handles subscription/ping messages. H2 receive windows are 64 KiB, adaptive growth
-disabled, and decoded messages are capped at 16 MiB. Intake processes one message
+handles subscription/ping messages. H2 receive windows are 8 MiB, adaptive growth
+disabled (a fixed bound on unacknowledged input; 64 KiB limited intake to about
+window/RTT, ~140 transactions/s), and decoded messages are capped at 16 MiB. Intake processes one message
 at a time; there is no unbounded transaction/telemetry queue.
 
 ## Opt-in command

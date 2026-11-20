@@ -27,6 +27,9 @@ const CONTINUOUS_DEADLINE: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 pub(crate) const BATCH_INPUTS: usize = 100;
 pub(crate) const BATCH_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const BATCH_WINDOW: Duration = Duration::from_millis(200);
+/// HTTP/2 receive window per stream and per connection. It bounds unacknowledged input
+/// in flight; 64 KiB capped throughput near window/RTT (~140 tx/s at a 30–60 ms RTT).
+const RECEIVE_WINDOW: u32 = 8 * 1024 * 1024;
 pub(crate) const PROTO_SCHEMA: &str = "laserstream-core-proto/14.0.0";
 const RECENT_SECONDS: i64 = 60;
 
@@ -841,8 +844,8 @@ pub(crate) fn connect(
         Endpoint::from_static("https://laserstream-mainnet-ewr.helius-rpc.com")
             .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(10))
-            .initial_stream_window_size(65536)
-            .initial_connection_window_size(65536)
+            .initial_stream_window_size(RECEIVE_WINDOW)
+            .initial_connection_window_size(RECEIVE_WINDOW)
             .http2_adaptive_window(false)
             .buffer_size(1)
             .tls_config(ClientTlsConfig::new().with_native_roots())
