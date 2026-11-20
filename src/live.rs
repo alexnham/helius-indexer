@@ -322,9 +322,12 @@ pub(crate) fn run_replay(
     replay: &mut crate::replay::ReplayRun,
 ) -> Result<Value> {
     let mint = replay.scope.mint.clone();
+    // Re-reading from the job start would spend each grant on already-received slots.
+    let start = crate::storage::replay::JobLog::open(database)?
+        .resume_start(&replay.reservation.job, &replay.scope)?;
     run_intake(
         database,
-        replay.scope.start,
+        start,
         seconds,
         &mint,
         telemetry,
