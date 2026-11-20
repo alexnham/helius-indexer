@@ -6,6 +6,12 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 pub const SECONDS_PER_GRANT: i64 = 60;
+fn resume_within(slot: Option<i64>, start: u64, end: u64) -> u64 {
+    slot.map_or(start, |s| {
+        crate::kafka::resume_slot(s as u64).clamp(start, end)
+    })
+}
+const RESUME_SLOT: &str = "SELECT COALESCE((SELECT MIN(r.slot) FROM replay_receipts r WHERE r.job=$1 AND r.status<>'decoded' AND NOT EXISTS (SELECT 1 FROM live_raw l WHERE l.id=r.raw_id)),(SELECT MAX(slot) FROM replay_receipts WHERE job=$1))";
 pub const MESSAGES_PER_GRANT: i64 = 10_000;
 pub const BYTES_PER_GRANT: i64 = 64 * 1024 * 1024;
 pub const CONNECTIONS_PER_GRANT: i64 = 3;
@@ -214,6 +220,19 @@ impl JobLog {
         tx.commit().map_err(write_failed)
     }
 
+    /// Where the next replay attempt subscribes: the reorder margin before the highest
+    /// durably received slot, or before the lowest unresolved receipt whose raw input was
+    /// pruned (it must be fetched again), never before the job start. Receipts are input
+    /// progress only; this never marks a slot verified.
+    pub fn resume_start(&mut self, id: &str, scope: &Scope) -> Result<u64> {
+        let slot = self
+            .0
+            .query_one(RESUME_SLOT, &[&id])
+            .map_err(read_failed)?
+            .get(0);
+        Ok(resume_within(slot, scope.start, scope.end))
+    }
+
     pub fn status(&mut self, id: &str) -> Result<Value> {
         valid_id(id)?;
         let mut tx = self
@@ -224,6 +243,13 @@ impl JobLog {
             .start()
             .map_err(read_failed)?;
         let r = tx.query_opt("SELECT mint,start_slot,end_slot,decoder,created_at,grants,seconds_charged,connections_used,messages_used,bytes_used FROM replay_jobs WHERE id=$1", &[&id]).map_err(read_failed)?.ok_or(Error("replay_job_missing"))?;
+        let next_replay_start = resume_within(
+            tx.query_one(RESUME_SLOT, &[&id])
+                .map_err(read_failed)?
+                .get(0),
+            r.get::<_, i64>(1) as u64,
+            r.get::<_, i64>(2) as u64,
+        );
         let receipts=tx.query_one("SELECT COUNT(*),COUNT(*) FILTER (WHERE r.status='decoded'),COUNT(*) FILTER (WHERE r.status<>'decoded'),COUNT(l.id) FROM replay_receipts r LEFT JOIN live_raw l ON l.id=r.raw_id WHERE r.job=$1", &[&id]).map_err(read_failed)?;
         let attempts:Vec<Value>=tx.query("SELECT id,started_at,reserved_seconds,status,first_available,reference_slot,observed_at,end_observed FROM replay_attempts WHERE job=$1 ORDER BY id DESC LIMIT 20", &[&id]).map_err(read_failed)?.into_iter().map(|a|{
             let first:Option<i64>=a.get(4);let observed:Option<i64>=a.get(6);
@@ -279,7 +305,7 @@ impl JobLog {
         };
         Ok(
             json!({"job":id,"state":state,"pending_age_seconds":now().checked_sub(r.get::<_,i64>(4)).filter(|n|*n>=0),"oldest_unresolved_age_seconds":if receipts.get::<_,i64>(2)==0 {Some(0)}else{oldest.and_then(|t|now().checked_sub(t)).filter(|n|*n>=0)},"failures":failures,"retained":{"transfer_count":retained,"coverage":"unknown"},"mint":r.get::<_,String>(0),"start":r.get::<_,i64>(1),"end":r.get::<_,i64>(2),"decoder_version":r.get::<_,String>(3),"created_at":r.get::<_,i64>(4),
-            "coverage":"unknown","verified_boundary":null,"resume_from":r.get::<_,i64>(1),"pending_interval":{"start":r.get::<_,i64>(1),"end":r.get::<_,i64>(2),"kind":"unverified"},"attempts":attempts,"routing":routing,"archive":lanes["archive"],"gap":lanes["gap"],"reason":"filtered_replay_has_no_validated_slot_completion_evidence",
+            "coverage":"unknown","verified_boundary":null,"resume_from":r.get::<_,i64>(1),"next_replay_start":next_replay_start,"pending_interval":{"start":r.get::<_,i64>(1),"end":r.get::<_,i64>(2),"kind":"unverified"},"attempts":attempts,"routing":routing,"archive":lanes["archive"],"gap":lanes["gap"],"reason":"filtered_replay_has_no_validated_slot_completion_evidence",
             "receipts":{"unique_inputs":receipts.get::<_,i64>(0),"decoded":receipts.get::<_,i64>(1),"unresolved":receipts.get::<_,i64>(2),"raw_still_retained":receipts.get::<_,i64>(3)},
             "budget":{"grants":grants,"seconds_charged":seconds,"seconds_remaining":grants*SECONDS_PER_GRANT-seconds,"connections_used":connections,"connections_remaining":grants*CONNECTIONS_PER_GRANT-connections,"messages_used":messages,"messages_remaining":grants*MESSAGES_PER_GRANT-messages,"bytes_used":bytes,"bytes_remaining":grants*BYTES_PER_GRANT-bytes}}),
         )
@@ -565,7 +591,7 @@ impl JobLog {
 
 pub struct Reservation {
     client: Client,
-    job: String,
+    pub(crate) job: String,
     pub attempt: i64,
 }
 
@@ -730,6 +756,49 @@ impl Reservation {
 mod tests {
     use super::*;
     use crate::{live::USDC, storage::pg::TestDatabase};
+
+    #[test]
+    fn replay_resumes_past_received_slots_but_refetches_pruned_unresolved_input() {
+        let db = TestDatabase::new();
+        let mut log = JobLog::open(&db.0).unwrap();
+        log.create("wide", USDC, 100, 227).unwrap();
+        // Gap jobs will exceed 128 slots; widen this one directly.
+        db.0.test_client()
+            .execute("UPDATE replay_jobs SET end_slot=1000 WHERE id='wide'", &[])
+            .unwrap();
+        let scope = log.scope("wide").unwrap();
+        assert_eq!(log.resume_start("wide", &scope).unwrap(), 100);
+        let mut attempt = JobLog::reserve(&db.0, "wide", 60).unwrap();
+        let Retained::Pending(decoded) = attempt.retain(400, &[1; 64], b"a").unwrap() else {
+            panic!("receipt missing")
+        };
+        attempt.acknowledge(decoded, &Ok(1)).unwrap();
+        // An undecodable input keeps its raw bytes; the retry step owns it, so replay moves on.
+        let Retained::Pending(failed) = attempt.retain(250, &[2; 64], b"b").unwrap() else {
+            panic!("receipt missing")
+        };
+        attempt
+            .acknowledge(failed, &Err(Error("unsupported_instruction")))
+            .unwrap();
+        // A crash before acknowledgment leaves a pending receipt with raw input: received.
+        attempt.retain(600, &[3; 64], b"c").unwrap();
+        assert_eq!(log.resume_start("wide", &scope).unwrap(), 450);
+        let Retained::Pending(pruned) = attempt.retain(300, &[4; 64], b"d").unwrap() else {
+            panic!("receipt missing")
+        };
+        db.0.test_client()
+            .execute("DELETE FROM live_raw WHERE id=$1", &[&pruned])
+            .unwrap();
+        assert_eq!(log.resume_start("wide", &scope).unwrap(), 150);
+        let status = log.status("wide").unwrap();
+        assert_eq!(status["next_replay_start"], 150);
+        // Input progress never becomes coverage.
+        assert_eq!(status["coverage"], "unknown");
+        assert_eq!(
+            status["pending_interval"],
+            json!({"start":100,"end":1000,"kind":"unverified"})
+        );
+    }
 
     #[test]
     fn persisted_message_byte_and_connection_limits_fail_closed() {
