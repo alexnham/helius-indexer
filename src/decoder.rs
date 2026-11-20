@@ -4,7 +4,7 @@ use std::collections::HashSet;
 
 pub const SPL_TOKEN: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 pub const TOKEN_2022: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
-pub const DECODER_VERSION: &str = "token-transfers-v7";
+pub const DECODER_VERSION: &str = "token-transfers-v8";
 pub const MAX_CAPTURE_BYTES: usize = 16 * 1024 * 1024;
 
 pub fn parse_capture(bytes: &[u8]) -> Result<Capture> {
@@ -234,10 +234,78 @@ fn decode_instruction(
     let data = bs58::decode(&ix.data)
         .into_vec()
         .map_err(|_| Error("invalid_token_instruction"))?;
+    // p-token Batch (255): records of [account count, data length, data], each taking the
+    // next accounts. Batches do not nest and need at least one record.
+    if program == SPL_TOKEN && data.first() == Some(&255) {
+        let (mut rest, mut accounts, mut nested) = (&data[1..], ix.accounts.as_slice(), 0);
+        while !rest.is_empty() || nested == 0 {
+            let [count, length, ..] = *rest else {
+                return Err(Error("invalid_token_instruction"));
+            };
+            let (count, end) = (usize::from(count), 2 + usize::from(length));
+            if length == 0 || rest.len() < end || accounts.len() < count || rest[2] == 255 {
+                return Err(Error("invalid_token_instruction"));
+            }
+            let at = (outer, inner, Some(nested));
+            let record = rest[2..end].to_vec();
+            decode_token(
+                tx,
+                keys,
+                program,
+                &accounts[..count],
+                record,
+                at,
+                output,
+                changed_owners,
+            )?;
+            (rest, accounts, nested) = (&rest[end..], &accounts[count..], nested + 1);
+        }
+        return Ok(());
+    }
+    decode_token(
+        tx,
+        keys,
+        program,
+        &ix.accounts,
+        data,
+        (outer, inner, None),
+        output,
+        changed_owners,
+    )
+}
+
+/// Token-2022 token-metadata interface instructions (sha256 of the namespaced name, first 8
+/// bytes): Initialize, UpdateField, RemoveKey, UpdateAuthority, Emit. None moves tokens.
+const METADATA_INSTRUCTIONS: [[u8; 8]; 5] = [
+    [0xd2, 0xe1, 0x1e, 0xa2, 0x58, 0xb8, 0x4d, 0x8d],
+    [0xdd, 0xe9, 0x31, 0x2d, 0xb5, 0xca, 0xdc, 0xc8],
+    [0xea, 0x12, 0x20, 0x38, 0x59, 0x8d, 0x25, 0xb5],
+    [0xd7, 0xe4, 0xa6, 0xe4, 0x54, 0x64, 0x56, 0x7b],
+    [0xfa, 0xa6, 0xb4, 0xfa, 0x0d, 0x0c, 0xb8, 0x46],
+];
+
+/// Decodes one token instruction; `at` is (outer, inner, nested batch) position.
+#[allow(clippy::too_many_arguments)]
+fn decode_token(
+    tx: &RpcTransaction,
+    keys: &[String],
+    program: &String,
+    ix_accounts: &[usize],
+    data: Vec<u8>,
+    (outer, inner, nested): (usize, Option<usize>, Option<usize>),
+    output: &mut Vec<Transfer>,
+    changed_owners: &mut HashSet<String>,
+) -> Result<()> {
     let mut data = data;
+    if program == TOKEN_2022
+        && data.len() >= 8
+        && METADATA_INSTRUCTIONS.iter().any(|d| data[..8] == *d)
+    {
+        return Ok(());
+    }
     let mut fee_raw = if program == SPL_TOKEN { Some(0) } else { None };
     if data.first() == Some(&6) {
-        if data.len() < 3 || ix.accounts.len() < 2 {
+        if data.len() < 3 || ix_accounts.len() < 2 {
             return Err(Error("invalid_authority_instruction"));
         }
         if data[1] > 3 {
@@ -248,7 +316,7 @@ fn decode_instruction(
         }
         // Agreement at transaction boundaries cannot resolve change-and-restore.
         if data[1] == 2 {
-            changed_owners.insert(keys[ix.accounts[0]].clone());
+            changed_owners.insert(keys[ix_accounts[0]].clone());
         }
         return Ok(());
     }
@@ -262,7 +330,7 @@ fn decode_instruction(
             _ => None,
         };
         if let Some((length, accounts)) = minimum {
-            if data.len() != length || ix.accounts.len() < accounts {
+            if data.len() != length || ix_accounts.len() < accounts {
                 return Err(Error("invalid_fee_maintenance_instruction"));
             }
             return Ok(());
@@ -270,7 +338,7 @@ fn decode_instruction(
     }
     // Unwrapping moves native lamports, which are outside the token-transfer index.
     if data.first() == Some(&45)
-        && ix.accounts.len() >= 3
+        && ix_accounts.len() >= 3
         && (data.as_slice() == [45, 0] || (data.len() == 10 && data[1] == 1))
     {
         return Ok(());
@@ -307,7 +375,7 @@ fn decode_instruction(
             14 => (2, 3),
             _ => return Err(Error("unsupported_confidential_instruction")),
         };
-        if data.len() != length || ix.accounts.len() < accounts {
+        if data.len() != length || ix_accounts.len() < accounts {
             return Err(Error("invalid_confidential_instruction"));
         }
         if !matches!(variant, 7 | 13) {
@@ -320,7 +388,7 @@ fn decode_instruction(
         let offsets = [data[166], data[167], data[length - 1]];
         let proof_accounts = offsets.iter().filter(|&&offset| offset == 0).count()
             + usize::from(offsets.iter().any(|&offset| offset != 0));
-        if ix.accounts.len() < 4 + proof_accounts {
+        if ix_accounts.len() < 4 + proof_accounts {
             return Err(Error("invalid_confidential_instruction"));
         }
         // Token-2022 rejects plain confidential Transfer on transfer-fee mints.
@@ -328,24 +396,32 @@ fn decode_instruction(
             fee_raw = Some(0);
         }
         (
-            ix.accounts[0],
-            ix.accounts[2],
-            Some((&keys[ix.accounts[1]], None)),
+            ix_accounts[0],
+            ix_accounts[2],
+            Some((&keys[ix_accounts[1]], None)),
         )
     } else {
         match tag {
-            3 if data.len() == 9 && ix.accounts.len() >= 3 => {
-                (ix.accounts[0], ix.accounts[1], None)
+            3 if data.len() == 9 && ix_accounts.len() >= 3 => {
+                (ix_accounts[0], ix_accounts[1], None)
             }
-            12 if data.len() == 10 && ix.accounts.len() >= 4 => (
-                ix.accounts[0],
-                ix.accounts[2],
-                Some((&keys[ix.accounts[1]], Some(data[9]))),
+            12 if data.len() == 10 && ix_accounts.len() >= 4 => (
+                ix_accounts[0],
+                ix_accounts[2],
+                Some((&keys[ix_accounts[1]], Some(data[9]))),
             ),
             3 | 12 => return Err(Error("invalid_transfer_instruction")),
             0..=24 => return Ok(()),
             // InitializeMintCloseAuthority and InitializePermanentDelegate configure a mint.
             25 | 35 if program == TOKEN_2022 => return Ok(()),
+            // WithdrawExcessLamports moves lamports above rent, never tokens.
+            38 if data.len() == 1 && ix_accounts.len() >= 3 => return Ok(()),
+            // MetadataPointer Initialize/Update configures a mint.
+            39 if program == TOKEN_2022
+                && matches!((data.get(1), data.len()), (Some(0), 66) | (Some(1), 34)) =>
+            {
+                return Ok(());
+            }
             _ => return Err(Error("unsupported_token_instruction")),
         }
     };
@@ -386,7 +462,10 @@ fn decode_instruction(
         .signatures
         .first()
         .ok_or(Error("missing_signature"))?;
-    let position = inner.map_or_else(|| "outer".to_owned(), |n| n.to_string());
+    let mut position = inner.map_or_else(|| "outer".to_owned(), |n| n.to_string());
+    if let Some(n) = nested {
+        position = format!("{position}:{n}");
+    }
     output.push(Transfer {
         transfer_id: format!("solana:mainnet-beta:{signature}:{outer}:{position}"),
         signature: signature.clone(),
@@ -394,6 +473,7 @@ fn decode_instruction(
         block_time: tx.block_time,
         instruction_index: outer,
         inner_instruction_index: inner,
+        batch_index: nested,
         mint,
         token_program: program.clone(),
         source_token_account: keys[source].clone(),

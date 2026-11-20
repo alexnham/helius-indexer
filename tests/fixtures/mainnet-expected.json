@@ -16,7 +16,7 @@
     "decimals": 6,
     "fee_raw": "0",
     "confidential": false,
-    "decoder_version": "token-transfers-v7"
+    "decoder_version": "token-transfers-v8"
   },
   {
     "transfer_id": "solana:mainnet-beta:5HaYHWnniYgjv3Yv4Qv712sUnhNwhNVb9x3TLkgeF7g1yCZ3zwMLEYwvkRQiymmTwFMt4QGjusS8PdZX7kDxbX91:3:0",
@@ -35,6 +35,6 @@
     "decimals": 6,
     "fee_raw": "0",
     "confidential": false,
-    "decoder_version": "token-transfers-v7"
+    "decoder_version": "token-transfers-v8"
   }
 ]

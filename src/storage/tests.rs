@@ -501,6 +501,7 @@ fn windowed_transfer(
         block_time,
         instruction_index: outer,
         inner_instruction_index: inner,
+        batch_index: None,
         mint: WINDOW_MINT.into(),
         token_program: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".into(),
         source_token_account: "source".into(),
@@ -559,6 +560,14 @@ fn insert_history(db: &Database, slots: &[(i64, &str)]) {
 
 fn rolling() -> window::Window {
     window::Window::resolve(NOW, None, None).unwrap()
+}
+
+/// Transfer `n` of a p-token batch at instruction 3, inner 0 of the `tie` transaction.
+fn batched(n: usize) -> Transfer {
+    let mut transfer = windowed_transfer("tie", 30, 3, Some(0), Some(NOW - 10), Some(1), None);
+    transfer.transfer_id = format!("tie:3:Some(0):{n}");
+    transfer.batch_index = Some(n);
+    transfer
 }
 
 fn listed_ids(page: &serde_json::Value) -> Vec<String> {
@@ -709,6 +718,8 @@ fn pages_are_keyset_ordered_across_ties_and_stable_across_inserts() {
             windowed_transfer("tie", 30, 1, Some(1), block_time, Some(1), None),
             windowed_transfer("tie", 30, 1, Some(2), block_time, Some(1), None),
             windowed_transfer("tie", 30, 2, None, block_time, Some(1), None),
+            batched(0),
+            batched(1),
             windowed_transfer("other", 31, 0, None, block_time, Some(1), None),
         ],
     );
@@ -725,12 +736,26 @@ fn pages_are_keyset_ordered_across_ties_and_stable_across_inserts() {
             "tie:1:Some(1)",
             "tie:1:Some(2)",
             "tie:2:None",
+            "tie:3:Some(0):0",
+            "tie:3:Some(0):1",
             "other:0:None"
         ]
     );
     let mut descending = all(true);
     descending.reverse();
     assert_eq!(descending, ascending);
+    // One row per page: batch transfers sharing an instruction position each appear once.
+    let (mut walked, mut next) = (Vec::new(), None::<String>);
+    loop {
+        let page =
+            window::listing(&db.0, Some(WINDOW_MINT), window, false, 1, next.as_deref()).unwrap();
+        walked.extend(listed_ids(&page));
+        next = page["next_cursor"].as_str().map(str::to_owned);
+        if next.is_none() {
+            break;
+        }
+    }
+    assert_eq!(walked, ascending);
 
     // Walk two rows at a time; a page cursor must survive inserts before and after it.
     let first = window::listing(&db.0, Some(WINDOW_MINT), window, false, 2, None).unwrap();
@@ -759,6 +784,8 @@ fn pages_are_keyset_ordered_across_ties_and_stable_across_inserts() {
             "tie:1:Some(2)",
             "tie:1:Some(3)",
             "tie:2:None",
+            "tie:3:Some(0):0",
+            "tie:3:Some(0):1",
             "other:0:None",
             "late:0:None"
         ]

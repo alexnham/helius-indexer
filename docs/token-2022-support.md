@@ -16,6 +16,9 @@ JSON strings. No floating point or balance-delta reconstruction is used.
 | WithdrawWithheldTokensFromMint (26, 2), WithdrawWithheldTokensFromAccounts (26, 3), HarvestWithheldTokensToMint (26, 4) | Recognized fee maintenance with validated length/account counts; emit no ordinary transfer edge |
 | UnwrapLamports (45), either token program | Recognized native SOL movement; excluded from token transfer edges |
 | InitializeMintCloseAuthority (25), InitializePermanentDelegate (35) | Recognized mint configuration; no transfer edge (v7) |
+| p-token Batch (255), SPL Token | Nested instructions decoded under the same rules; each nested transfer's identity adds its batch index (v8) |
+| WithdrawExcessLamports (38), either token program | Recognized lamport movement; no transfer edge (v8) |
+| MetadataPointer Initialize/Update (39, 0 / 1), token-metadata interface instructions | Recognized mint configuration; no transfer edge (v8) |
 | Fee configuration (26, 0 / 5), other extension instructions | Explicitly unsupported pending further coverage; not silently treated as transfers |
 | Confidential Transfer (27, 7), TransferWithFee (27, 13), current proof layout | Supported; explicit mint operand, hidden amount/fee null; see v6 boundary below |
 | Confidential configuration, deposit/withdraw within one account (27, 0–6 / 8–12 / 14) | Recognized current layouts; no transfer edge |
@@ -154,3 +157,31 @@ Found in the #31 overlap run, where three USDC transactions in slot 470015982 cr
 a Token-2022 mint and a USDC account in one call; see `tests/fixtures/README.md`.
 Other standalone setup tags (29, 31, 32) and every extension family stay unsupported
 until captured. Repair follows the v6 procedure; identities are unchanged.
+
+## Revision v8: p-token Batch and mint metadata
+
+Found investigating #60: in a 20-minute USDC archive run (slots 470462000–470486199),
+693 of 24,200 slots stayed pending on `unsupported_token_instruction`. All of them came
+from five instructions (#125). Verified 2026-11-19 against
+[p-token](https://github.com/solana-program/token/tree/3d53b934b90d/pinocchio/program/src)
+(`processor/batch.rs`, `entrypoint.rs`) and
+[Token-2022](https://github.com/solana-program/token-2022/tree/875693f53c77/interface/src/extension/metadata_pointer)
+at the linked commits:
+
+- **Batch (255, SPL Token).** Records of `[account count u8, data length u8, data]`, each
+  taking the next accounts of the outer instruction; a zero data length is invalid, and a
+  batch cannot contain a batch. v8 decodes every record with the ordinary rules. A nested
+  transfer's identity is the enclosing position plus `:<batch index>`
+  (`…:{outer}:{inner or outer}:{n}`), and records carry `batch_index`. A malformed batch
+  fails closed with `invalid_token_instruction`. Listings break ties between transfers at
+  one instruction by `transfer_id`; page cursors now include it, so a cursor issued before
+  v8 is rejected as `invalid_cursor` (start the listing again).
+- **WithdrawExcessLamports (38).** Moves lamports above rent from a token account or mint;
+  no edge.
+- **MetadataPointer (39) Initialize/Update, and the token-metadata interface**
+  (`Initialize`, `UpdateField`, `RemoveKey`, `UpdateAuthority`, `Emit`, identified by the
+  first 8 bytes of the sha256 of their namespaced names). Mint configuration; no edge.
+
+`GroupPointer` (40) and the other extension families stay unsupported until captured.
+Fixtures: `tests/fixtures/mainnet-p-token.json`. Transfers outside batches keep their
+identities; repair follows the v6 procedure and adds the previously rejected rows.

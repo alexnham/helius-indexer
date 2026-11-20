@@ -80,23 +80,32 @@ def compare(exported):
                     if keys[instruction["programIdIndex"]] != PROGRAM:
                         continue
                     data, accounts = base58(instruction["data"]), instruction["accounts"]
-                    if len(data) == 9 and data[0] == 3:
-                        src, dst = accounts[:2]
-                        mint = mints.get(src) or mints.get(dst)
-                    elif len(data) == 10 and data[0] == 12:
-                        src, mint_index, dst = accounts[:3]
-                        mint = keys[mint_index]
-                    else:
-                        continue
-                    if mint != MINT:
-                        continue
-                    signature = tx["transaction"]["signatures"][0]
-                    position = "outer" if inner is None else inner
-                    identity = f"solana:mainnet-beta:{signature}:{outer}:{position}"
-                    assert identity not in expected, "duplicate instruction identity"
-                    expected[identity] = (
-                        str(int.from_bytes(data[1:9], "little")), keys[src], keys[dst]
-                    )
+                    position = "outer" if inner is None else str(inner)
+                    parts = [(position, data, accounts)]
+                    # p-token Batch: [account count, data length, data] records after 255.
+                    if data[:1] == b"\xff":
+                        parts, rest, n = [], data[1:], 0
+                        while rest:
+                            count, length = rest[0], rest[1]
+                            parts.append((f"{position}:{n}", rest[2:2 + length], accounts[:count]))
+                            rest, accounts, n = rest[2 + length:], accounts[count:], n + 1
+                    for position, data, accounts in parts:
+                        if len(data) == 9 and data[0] == 3:
+                            src, dst = accounts[:2]
+                            mint = mints.get(src) or mints.get(dst)
+                        elif len(data) == 10 and data[0] == 12:
+                            src, mint_index, dst = accounts[:3]
+                            mint = keys[mint_index]
+                        else:
+                            continue
+                        if mint != MINT:
+                            continue
+                        signature = tx["transaction"]["signatures"][0]
+                        identity = f"solana:mainnet-beta:{signature}:{outer}:{position}"
+                        assert identity not in expected, "duplicate instruction identity"
+                        expected[identity] = (
+                            str(int.from_bytes(data[1:9], "little")), keys[src], keys[dst]
+                        )
     actual = {}
     for row in exported["transfers"]:
         assert row["mint"] == MINT, "export returned another mint"
