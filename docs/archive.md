@@ -45,8 +45,10 @@ on 8 concurrent streams; one stream gets ~4–11 MiB/s and the total levels off 
 8–16. A piece that stalls, drops or arrives truncated is
 requested once more, within the same limits; the source diagnostics count these
 as `retries`. Each slot is still cached with its own receipt, so a
-128-slot window takes about 17 requests instead of about 260. The planned window's
-blocks are then decoded on `INDEXER_HISTORICAL_WORKERS` threads. A planned
+128-slot window takes about 17 requests instead of about 260. Each stream decodes
+its piece's blocks as soon as the piece is cached, while other pieces still
+download; blocks of the window already cached are decoded on a pool of
+`INDEXER_HISTORICAL_WORKERS` threads. A planned
 window knows the run's mint, so a transaction that does not touch it is parsed and
 validated but not normalized: it is decoded straight to the signature-only form
 `backfill::prune` stores (about 9 in 10 USDC block transactions, 5× less decode

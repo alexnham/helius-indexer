@@ -9,7 +9,7 @@ use serde_cbor::Value as C;
 use sha2::{Digest, Sha256};
 use std::fs;
 
-fn fixture() -> Value {
+pub(super) fn fixture() -> Value {
     serde_json::from_slice(include_bytes!("../../tests/fixtures/mainnet-transfer.json")).unwrap()
 }
 fn b58(value: &Value) -> Vec<u8> {
@@ -166,7 +166,7 @@ fn node(value: C, raw: &mut Vec<u8>) -> Vec<u8> {
     link
 }
 // The CAR containers/entry hashes are synthetic; the legacy transaction and runtime metadata are captured.
-fn slot_range(
+pub(super) fn slot_range(
     value: &Value,
     slot: u64,
     parent: u64,
