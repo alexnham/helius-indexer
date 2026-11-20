@@ -143,7 +143,7 @@ pub fn monitor(
     telemetry: &mut Telemetry,
 ) -> Result<Value> {
     valid_id(id)?;
-    if !(1..=300).contains(&seconds) {
+    if !(seconds == live::CONTINUOUS || (1..=300).contains(&seconds)) {
         return Err(Error("invalid_replay_bounds"));
     }
     let scope = JobLog::open(database)?.scope(id)?;
@@ -155,11 +155,41 @@ pub fn monitor(
         seconds,
         &scope.mint,
         telemetry,
-        |gate| historical_cycle(database, id, seconds.min(60), cache, gate),
+        |gate| {
+            if seconds != live::CONTINUOUS {
+                return historical_cycle(database, id, seconds.min(60), cache, gate);
+            }
+            // Continuous live keeps one subscription; historical work repeats beside it.
+            let cycle_gate = std::sync::Arc::clone(&gate);
+            until_live_finishes(&gate, HISTORICAL_PAUSE, || {
+                historical_cycle(database, id, 60, cache, std::sync::Arc::clone(&cycle_gate))
+            })
+        },
     )?;
     result["job"] = status(database, id)?;
     result["coverage"] = json!("unknown");
     Ok(result)
+}
+
+/// Pause between historical cycles beside a continuous live run.
+const HISTORICAL_PAUSE: Duration = Duration::from_secs(30);
+
+/// Repeat historical cycles until the live worker finishes, reporting the last cycle.
+fn until_live_finishes(
+    gate: &WriteGate,
+    pause: Duration,
+    mut cycle: impl FnMut() -> Result<Value>,
+) -> Result<Value> {
+    let mut cycles = 0u64;
+    loop {
+        // A failed cycle is reported and retried; it never stops the next one.
+        let mut report = cycle().unwrap_or_else(|e| json!({"outcome":"failed","error_class":e.0}));
+        cycles += 1;
+        if gate.wait_live_finish(pause)? {
+            report["cycles"] = json!(cycles);
+            return Ok(report);
+        }
+    }
 }
 
 /// A named step of a historical cycle.

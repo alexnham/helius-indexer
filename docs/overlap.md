@@ -16,7 +16,7 @@ cargo run --locked -- coverage data/overlap.sqlite EPjFWdd5AufqSSqeM2qN1xzybapC8
 
 Choose an inclusive range of at most 128 recent finalized slots, with START_SLOT
 inside current LaserStream replay availability. Duration is 1–300 seconds. The
-stream stops at 10,000 received transactions and retains its existing connection,
+stream retains its existing connection,
 inactivity, message-size, and retry limits. Historical fetching stays serial;
 its cancellation check uses the same elapsed budget and optional
 BACKFILL_CANCEL_FILE. In-flight HTTP/SQLite/JSON work is synchronous and can extend
