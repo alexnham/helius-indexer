@@ -89,6 +89,9 @@ pub struct Transfer {
     pub block_time: Option<i64>,
     pub instruction_index: usize,
     pub inner_instruction_index: Option<usize>,
+    /// Position inside a p-token `Batch` instruction; absent for ordinary instructions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_index: Option<usize>,
     pub mint: String,
     pub token_program: String,
     pub source_token_account: String,

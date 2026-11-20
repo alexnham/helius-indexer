@@ -186,3 +186,71 @@ fn token_2022_mint_setup_is_recognized_and_other_extension_tags_stay_unsupported
         "unsupported_token_instruction"
     );
 }
+
+#[test]
+fn p_token_batches_decode_nested_transfers_and_new_setup_instructions_emit_none() {
+    let cases: Vec<Value> =
+        serde_json::from_slice(include_bytes!("fixtures/mainnet-p-token.json")).unwrap();
+    let decode = |capture: &Value| {
+        let raw = serde_json::to_vec(capture).unwrap();
+        decoder::decode(&decoder::parse_capture(&raw).unwrap())
+    };
+    for case in &cases {
+        let rows = serde_json::to_value(decode(&case["capture"]).unwrap()).unwrap();
+        for (row, expected) in rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .zip(case["expected"].as_array().unwrap())
+        {
+            for (field, value) in expected.as_object().unwrap() {
+                assert_eq!(
+                    row.get(field).unwrap_or(&Value::Null),
+                    value,
+                    "{field} in {}",
+                    case["kinds"]
+                );
+            }
+        }
+        assert_eq!(
+            rows.as_array().unwrap().len(),
+            case["expected"].as_array().unwrap().len()
+        );
+    }
+    // A batch's records are [account count, data length, data]; a record that overruns the
+    // data, or a nested batch, fails closed instead of being skipped.
+    fn batch(capture: &mut Value) -> &mut Value {
+        capture["result"]["meta"]["innerInstructions"][0]["instructions"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .map(|ix| &mut ix["data"])
+            .find(|d| bs58::decode(d.as_str().unwrap()).into_vec().unwrap()[0] == 255)
+            .unwrap()
+    }
+    for corrupt in [|d: &mut Vec<u8>| d[2] = 200, |d: &mut Vec<u8>| d[3] = 255] {
+        let mut capture = cases[0]["capture"].clone();
+        let data = batch(&mut capture);
+        let mut bytes = bs58::decode(data.as_str().unwrap()).into_vec().unwrap();
+        corrupt(&mut bytes);
+        *data = bs58::encode(bytes).into_string().into();
+        assert_eq!(decode(&capture).unwrap_err().0, "invalid_token_instruction");
+    }
+    // GroupPointer (40) is not in the captured evidence and stays unsupported.
+    let mut capture = cases[3]["capture"].clone();
+    let data = capture["result"]["meta"]["innerInstructions"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .flat_map(|g| g["instructions"].as_array_mut().unwrap())
+        .map(|ix| &mut ix["data"])
+        .find(|d| bs58::decode(d.as_str().unwrap()).into_vec().unwrap()[0] == 39)
+        .unwrap();
+    let mut bytes = bs58::decode(data.as_str().unwrap()).into_vec().unwrap();
+    bytes[0] = 40;
+    *data = bs58::encode(bytes).into_string().into();
+    assert_eq!(
+        decode(&capture).unwrap_err().0,
+        "unsupported_token_instruction"
+    );
+}

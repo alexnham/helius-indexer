@@ -65,25 +65,26 @@ pub fn listing(
         return Err(Error("invalid_query_limit"));
     }
     let after = cursor.map(decode_cursor).transpose()?;
-    let (slot, signature, outer, inner) = match &after {
-        Some((slot, signature, outer, inner)) => (
+    let (slot, signature, outer, inner, id) = match &after {
+        Some((slot, signature, outer, inner, id)) => (
             Some(*slot),
             Some(signature.as_str()),
             Some(*outer),
             Some(*inner),
+            Some(id.as_str()),
         ),
-        None => (None, None, None, None),
+        None => (None, None, None, None, None),
     };
     let (order, after_op) = if recent { ("DESC", "<") } else { ("ASC", ">") };
     let mut client = db.connect()?;
     let rows = client
         .query(
             &format!(
-                "SELECT slot,signature,outer_index,inner_index,record_json FROM transfers t
+                "SELECT slot,signature,outer_index,inner_index,record_json,transfer_id FROM transfers t
                 WHERE ($1::text IS NULL OR mint=$1) AND block_time>=$2 AND block_time<$3
-                AND ($4::bigint IS NULL OR (slot,signature,outer_index,inner_index) {after_op} ($4::bigint,$5::text,$6::integer,$7::integer))
+                AND ($4::bigint IS NULL OR (slot,signature,outer_index,inner_index,transfer_id) {after_op} ($4::bigint,$5::text,$6::integer,$7::integer,$9::text))
                 AND {LIVE_ROWS}
-                ORDER BY slot {order}, signature {order}, outer_index {order}, inner_index {order} LIMIT $8"
+                ORDER BY slot {order}, signature {order}, outer_index {order}, inner_index {order}, transfer_id {order} LIMIT $8"
             ),
             &[
                 &mint,
@@ -94,6 +95,7 @@ pub fn listing(
                 &outer,
                 &inner,
                 &((limit + 1) as i64),
+                &id,
             ],
         )
         .map_err(read_failed)?;
@@ -102,7 +104,7 @@ pub fn listing(
     let next_cursor = shown
         .last()
         .filter(|_| has_more)
-        .map(|r| encode_cursor(r.get(0), r.get(1), r.get(2), r.get(3)));
+        .map(|r| encode_cursor(r.get(0), r.get(1), r.get(2), r.get(3), r.get(5)));
     let transfers = shown
         .iter()
         .map(|r| {
@@ -270,15 +272,16 @@ pub(crate) fn coverage(client: &mut Client, mint: Option<&str>, window: Window) 
 
 const SLOT_MAPPING: &str = "min..max slot of known-block-time transfers in the window; covers that span only, not the window edges";
 
-/// Opaque cursor: hex of "slot:signature:outer:inner". Clients must not parse it.
-fn encode_cursor(slot: i64, signature: &str, outer: i32, inner: i32) -> String {
-    format!("{slot}:{signature}:{outer}:{inner}")
+/// Opaque cursor: hex of "slot:signature:outer:inner:transfer_id". The transfer ID breaks
+/// ties between p-token batch transfers at one instruction. Clients must not parse it.
+fn encode_cursor(slot: i64, signature: &str, outer: i32, inner: i32, id: &str) -> String {
+    format!("{slot}:{signature}:{outer}:{inner}:{id}")
         .bytes()
         .map(|b| format!("{b:02x}"))
         .collect()
 }
 
-fn decode_cursor(cursor: &str) -> Result<(i64, String, i32, i32)> {
+fn decode_cursor(cursor: &str) -> Result<(i64, String, i32, i32, String)> {
     let bytes = (0..cursor.len())
         .step_by(2)
         .map(|i| {
@@ -289,8 +292,9 @@ fn decode_cursor(cursor: &str) -> Result<(i64, String, i32, i32)> {
         .collect::<Option<Vec<u8>>>()
         .ok_or(Error("invalid_cursor"))?;
     let text = String::from_utf8(bytes).map_err(|_| Error("invalid_cursor"))?;
-    let parts: Vec<&str> = text.split(':').collect();
-    let &[slot, signature, outer, inner] = parts.as_slice() else {
+    // The transfer ID itself contains ':', so it is the unsplit remainder.
+    let parts: Vec<&str> = text.splitn(5, ':').collect();
+    let &[slot, signature, outer, inner, id] = parts.as_slice() else {
         return Err(Error("invalid_cursor"));
     };
     Ok((
@@ -298,5 +302,6 @@ fn decode_cursor(cursor: &str) -> Result<(i64, String, i32, i32)> {
         signature.to_owned(),
         outer.parse().map_err(|_| Error("invalid_cursor"))?,
         inner.parse().map_err(|_| Error("invalid_cursor"))?,
+        id.to_owned(),
     ))
 }

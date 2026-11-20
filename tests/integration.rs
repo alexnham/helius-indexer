@@ -212,7 +212,7 @@ fn token_2022_unknown_opcodes_and_malformed_authority_changes_are_rejected() {
     assert_eq!(decode(&value).unwrap_err().0, "conflicting_token_program");
     value = capture();
     value["result"]["transaction"]["message"]["instructions"][0] =
-        instruction(255, 1, vec![1, 2, 4]);
+        instruction(254, 1, vec![1, 2, 4]);
     assert_eq!(
         decode(&value).unwrap_err().0,
         "unsupported_token_instruction"
@@ -287,7 +287,7 @@ fn failed_decode_is_retained_without_partial_transfers() {
     value["result"]["transaction"]["message"]["instructions"]
         .as_array_mut()
         .unwrap()
-        .push(instruction(255, 1, vec![1, 2, 4]));
+        .push(instruction(254, 1, vec![1, 2, 4]));
     assert!(persist(db, &value).is_err());
     assert!(Store::query(db, None, 1000).unwrap().is_empty());
     let mut conn = db.test_client();
@@ -427,7 +427,7 @@ fn malformed_input_and_decode_errors_export_sanitized_failure_metrics() {
     assert!(!text.contains("stage=\"decode\""));
     let mut value = capture();
     value["result"]["transaction"]["message"]["instructions"][0] =
-        instruction(255, 1, vec![1, 2, 4]);
+        instruction(254, 1, vec![1, 2, 4]);
     std::fs::write(&input, serde_json::to_vec(&value).unwrap()).unwrap();
     let metrics = dir.path().join("decode.prom");
     let failed = cli(&[
@@ -504,7 +504,7 @@ fn every_failure_event_keeps_context_even_when_decode_and_storage_fail() {
     let input = dir.path().join("capture.json");
     let mut value = capture();
     value["result"]["transaction"]["message"]["instructions"][0] =
-        instruction(255, 1, vec![1, 2, 4]);
+        instruction(254, 1, vec![1, 2, 4]);
     std::fs::write(&input, serde_json::to_vec(&value).unwrap()).unwrap();
     // Nothing listens on port 1, and a directory cannot be opened as a new metrics file.
     let result = Command::new(env!("CARGO_BIN_EXE_helius-indexer"))

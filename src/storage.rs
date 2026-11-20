@@ -674,7 +674,7 @@ impl Store {
         let transfers = transaction
             .execute(
                 "DELETE FROM transfers WHERE (slot,transfer_id) NOT IN (SELECT slot,transfer_id FROM transfers
-             ORDER BY slot DESC, signature DESC, outer_index DESC, inner_index DESC LIMIT $1)",
+             ORDER BY slot DESC, signature DESC, outer_index DESC, inner_index DESC, transfer_id DESC LIMIT $1)",
                 &[&(keep as i64)],
             )
             .map_err(write_failed)?;
@@ -802,7 +802,7 @@ impl Store {
                     "SELECT record_json FROM transfers t
             WHERE ($1::text IS NULL OR mint=$1)
             AND NOT EXISTS(SELECT 1 FROM decoder_repairs r WHERE r.signature=t.signature AND r.status='unresolved')
-            ORDER BY slot {order}, signature {order}, outer_index {order}, inner_index {order} LIMIT $2"
+            ORDER BY slot {order}, signature {order}, outer_index {order}, inner_index {order}, transfer_id {order} LIMIT $2"
                 ),
                 &[&mint, &(limit as i64)],
             )
