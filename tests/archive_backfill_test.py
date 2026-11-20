@@ -66,7 +66,7 @@ class ArchiveBackfillTests(unittest.TestCase):
 
     def test_config_drives_native_batch_size_reservation_and_cli_precedence(self):
         config = self.root / "backfill.json"
-        reserve = 128 * 1024**2 + 1001 * 64 * 1024**2
+        reserve = 1000 * 1024**2 + 1001 * 64 * 1024**2  # archive 1 MiB per slot
         config.write_text(json.dumps({"slots_per_batch": 1000, "max_batches": 5,
                                       "max_reserved_bytes": reserve, "min_free_bytes": 0}))
         self.assertEqual(app.main(["run", *self.common, "--config", str(config),

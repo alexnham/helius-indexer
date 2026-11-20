@@ -31,7 +31,8 @@ or private endpoints. The ordinary build and tests require no archive access.
 
 Each command allows at most eight requested slots, 32 archive HTTP requests,
 128 MiB of archive response bodies, 16 MiB per raw slot range, and 120 seconds.
-A `bridge` batch allows 128 archive requests within the same byte and time limits.
+A `bridge` batch of N slots allows N MiB and N/2 archive requests (at least 128 MiB
+and 128 requests, at most 2 GiB and 2048) within the same time limit.
 There are no redirects. Each request has a maximum 20-second deadline, shortened
 by the remaining command budget, and fails when a read waits 3 seconds for bytes.
 A block piece also fails after 2 seconds plus its size at 1 MiB/s (6 seconds

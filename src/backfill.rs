@@ -29,6 +29,9 @@ pub trait BlockSource {
     /// The run's mint and slot range, before its first `block`, so a source can fetch
     /// ahead and, unless it keeps full blocks, return planned blocks already pruned.
     fn plan(&mut self, _mint: &str, _start: u64, _end: u64) {}
+    /// The whole range a batch reads through successive runs, so a source can fetch the
+    /// next run's blocks while this one is written.
+    fn ahead(&mut self, _start: u64, _end: u64) {}
     /// Bridge evidence compares whole blocks; other sources retain pruned blocks.
     fn keeps_full_blocks(&self) -> bool {
         false

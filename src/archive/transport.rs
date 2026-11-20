@@ -23,7 +23,9 @@ const EPOCH_SLOTS: u64 = 432000;
 /// Largest range one prefetch request covers; pieces of a window download concurrently.
 const PIECE_BYTES: usize = 8 * 1024 * 1024;
 /// Concurrent piece downloads. One archive stream gets ~4-11 MiB/s and the total levels
-/// off at 8-16 streams (docs/validation/2026-11-18-archive-throughput-baseline.md).
+/// off at 8-16 streams (docs/validation/2026-11-18-archive-throughput-baseline.md). 16
+/// streams (and 32 pieces per window) drew rate limiting from a VM
+/// (docs/validation/2026-11-20-archive-vm-test.md), so this stays at 8 until 429s back off.
 const STREAMS: usize = 8;
 /// Pieces per window: small pieces keep a stalled piece's deadline short.
 const PIECES: u32 = 2 * STREAMS as u32;
@@ -55,6 +57,20 @@ pub struct Limits {
     pub bytes: u64,
     pub requests: u32,
     pub seconds: u64,
+}
+const MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const MAX_REQUESTS: u32 = 2048;
+impl Limits {
+    /// A bridge batch of `slots`: 1 MiB and half a request per slot (blocks average about
+    /// 0.5 MB), at least the single-command limits and at most 2 GiB and 2048 requests.
+    pub fn bridge(slots: u64, seconds: u64) -> Self {
+        let mib = 1024 * 1024;
+        Self {
+            bytes: (slots * mib).clamp(128 * mib, MAX_BYTES),
+            requests: (slots / 2).clamp(128, u64::from(MAX_REQUESTS)) as u32,
+            seconds,
+        }
+    }
 }
 impl Default for Limits {
     fn default() -> Self {
@@ -106,14 +122,21 @@ pub struct ArchiveSource {
     early: BTreeMap<u64, Decoded>,
     /// Recently decoded slots' own block hashes, so a child needs no second parse of its parent.
     hashes: BTreeMap<u64, String>,
+    /// The batch's whole range (`BlockSource::ahead`): the next window downloads while the
+    /// current one is written.
+    batch: Option<(u64, u64)>,
+    /// Index records already read, by slot: one request covers the rest of the batch.
+    index: BTreeMap<u64, Vec<u8>>,
+    /// The next window's download in flight, and the bytes admitted for it.
+    next: Option<(std::thread::JoinHandle<Vec<Piece>>, u64)>,
     pub stats: Stats,
 }
 impl ArchiveSource {
     pub fn new(cache: &Path, network: bool, limits: Limits) -> Result<Self> {
         if limits.bytes == 0
-            || limits.bytes > 128 * 1024 * 1024
+            || limits.bytes > MAX_BYTES
             || limits.requests == 0
-            || limits.requests > 128
+            || limits.requests > MAX_REQUESTS
             || limits.seconds == 0
             || limits.seconds > 120
         {
@@ -141,6 +164,9 @@ impl ArchiveSource {
             ready: BTreeMap::new(),
             early: BTreeMap::new(),
             hashes: BTreeMap::new(),
+            batch: None,
+            index: BTreeMap::new(),
+            next: None,
             stats: Stats::default(),
         })
     }
@@ -161,7 +187,12 @@ impl ArchiveSource {
         if length == 0
             || length > MAX_CHUNK
             || self.stats.requests >= self.limits.requests
-            || self.stats.response_body_bytes + reserved + length as u64 + 1 > self.limits.bytes
+            || self.stats.response_body_bytes
+                + reserved
+                + self.next.as_ref().map_or(0, |n| n.1)
+                + length as u64
+                + 1
+                > self.limits.bytes
         {
             return Err(Error("archive_download_limit"));
         }
@@ -225,13 +256,41 @@ impl ArchiveSource {
         runtime()?.block_on(super::decode::block_time(&raw, slot))
     }
     fn paths(&self, slot: u64) -> (PathBuf, PathBuf) {
-        let stem = format!("epoch-{}-slot-{slot}", slot / EPOCH_SLOTS);
-        (
-            self.cache.join(format!("{stem}.json")),
-            self.cache.join(format!("{stem}.car-range")),
-        )
+        paths(&self.cache, slot)
+    }
+    /// Reads a cached block and checks it against its receipt.
+    fn cached(
+        &self,
+        slot: u64,
+        epoch: u64,
+        manifest: &Path,
+        file: &Path,
+    ) -> Result<(Vec<u8>, Receipt)> {
+        let bytes = read_bounded(manifest, 4096)?;
+        let receipt: Receipt =
+            serde_json::from_slice(&bytes).map_err(|_| Error("archive_invalid_receipt"))?;
+        if receipt.schema_version != 1
+            || receipt.jetstreamer_revision != JETSTREAMER_REVISION
+            || receipt.slot != slot
+            || receipt.epoch != epoch
+            || receipt.length == 0
+            || receipt.length as usize > MAX_CHUNK
+            || receipt.index_record.len() != 12
+        {
+            return Err(Error("archive_invalid_receipt"));
+        }
+        let (offset, length) = decode_index(&receipt.index_record)?;
+        if offset != receipt.offset || length != receipt.length {
+            return Err(Error("archive_invalid_receipt"));
+        }
+        let raw = read_bounded(file, MAX_CHUNK)?;
+        if raw.len() != receipt.length as usize || hex(&Sha256::digest(&raw)) != receipt.sha256 {
+            return Err(Error("archive_cache_integrity_failed"));
+        }
+        Ok((raw, receipt))
     }
     fn chunk(&mut self, slot: u64) -> Result<(Vec<u8>, Receipt)> {
+        self.finish_next();
         if let Some((start, end)) = self.planned
             && (start..=end).contains(&slot)
             && !self.paths(slot).0.exists()
@@ -241,30 +300,19 @@ impl ArchiveSource {
         let epoch = slot / EPOCH_SLOTS;
         let (manifest, file) = self.paths(slot);
         if manifest.exists() {
-            let bytes = read_bounded(&manifest, 4096)?;
-            let receipt: Receipt =
-                serde_json::from_slice(&bytes).map_err(|_| Error("archive_invalid_receipt"))?;
-            if receipt.schema_version != 1
-                || receipt.jetstreamer_revision != JETSTREAMER_REVISION
-                || receipt.slot != slot
-                || receipt.epoch != epoch
-                || receipt.length == 0
-                || receipt.length as usize > MAX_CHUNK
-                || receipt.index_record.len() != 12
-            {
-                return Err(Error("archive_invalid_receipt"));
+            match self.cached(slot, epoch, &manifest, &file) {
+                Ok(found) => {
+                    self.stats.cached_chunks += 1;
+                    return Ok(found);
+                }
+                // Cache files are written without fsync, so one cut short by a crash is
+                // downloaded again rather than failing its slot.
+                Err(_) if self.network => {
+                    let _ = fs::remove_file(&manifest);
+                    let _ = fs::remove_file(&file);
+                }
+                Err(error) => return Err(error),
             }
-            let (offset, length) = decode_index(&receipt.index_record)?;
-            if offset != receipt.offset || length != receipt.length {
-                return Err(Error("archive_invalid_receipt"));
-            }
-            let raw = read_bounded(&file, MAX_CHUNK)?;
-            if raw.len() != receipt.length as usize || hex(&Sha256::digest(&raw)) != receipt.sha256
-            {
-                return Err(Error("archive_cache_integrity_failed"));
-            }
-            self.stats.cached_chunks += 1;
-            return Ok((raw, receipt));
         }
         let record = self.fetch(
             &format!("{epoch}/epoch-{epoch}-slot-ranges.raw"),
@@ -277,150 +325,118 @@ impl ArchiveSource {
             offset,
             length as usize,
         )?;
-        let receipt = self.store(slot, offset, length, record, &raw)?;
+        let receipt = store(&self.cache, slot, offset, length, record, &raw)?;
         Ok((raw, receipt))
     }
-    fn store(
-        &self,
-        slot: u64,
-        offset: u64,
-        length: u32,
-        index_record: Vec<u8>,
-        raw: &[u8],
-    ) -> Result<Receipt> {
-        let receipt = Receipt {
-            schema_version: 1,
-            jetstreamer_revision: JETSTREAMER_REVISION.into(),
-            epoch: slot / EPOCH_SLOTS,
-            slot,
-            offset,
-            length,
-            index_record,
-            sha256: hex(&Sha256::digest(raw)),
-        };
-        let (manifest, file) = self.paths(slot);
-        atomic_write(&file, raw)?;
-        atomic_write(
-            &manifest,
-            &serde_json::to_vec(&receipt).map_err(|_| Error("serialization_failed"))?,
-        )?;
-        Ok(receipt)
+    /// Index records for `first..=last` of `epoch`, read once for the rest of the batch.
+    fn records(&mut self, epoch: u64, first: u64, last: u64) -> Result<Vec<(u64, Vec<u8>)>> {
+        if !(first..=last).all(|s| self.index.contains_key(&s)) {
+            let through = self
+                .batch
+                .filter(|(start, end)| (start..=end).contains(&&last))
+                .map_or(last, |(_, end)| {
+                    end.min(epoch * EPOCH_SLOTS + EPOCH_SLOTS - 1)
+                })
+                .max(last);
+            let records = self.fetch(
+                &format!("{epoch}/epoch-{epoch}-slot-ranges.raw"),
+                (first % EPOCH_SLOTS) * 12,
+                ((through - first + 1) * 12) as usize,
+            )?;
+            for (s, record) in (first..=through).zip(records.as_chunks::<12>().0) {
+                self.index.insert(s, record.to_vec());
+            }
+        }
+        Ok((first..=last)
+            .map(|s| (s, self.index[&s].clone()))
+            .collect())
+    }
+    /// The uncached, indexed slots of `first..=last` in pieces of about `PIECES` per window,
+    /// using at most half the requests left so retries and later windows still fit.
+    fn runs(&mut self, epoch: u64, first: u64, last: u64) -> Result<Vec<Vec<IndexEntry>>> {
+        let mut wanted = Vec::new();
+        for (s, record) in self.records(epoch, first, last)? {
+            if let (false, Ok((offset, length))) = (self.paths(s).0.exists(), decode_index(&record))
+            {
+                wanted.push((s, offset, length, record));
+            }
+        }
+        let window = wanted.iter().map(|e| u64::from(e.2)).sum();
+        let left = self.limits.requests.saturating_sub(self.stats.requests);
+        Ok(contiguous_runs(
+            wanted,
+            piece_span(window, (left / 2).min(PIECES)),
+        ))
+    }
+    /// Admits pieces in order against the budget until one is refused.
+    fn admit_runs(&mut self, runs: Vec<Vec<IndexEntry>>) -> (Vec<Admitted>, Option<Error>) {
+        let (mut admitted, mut reserved) = (Vec::new(), 0);
+        for run in runs {
+            let base = run[0].1;
+            let span = run.last().map(|e| e.1 + u64::from(e.2) - base).unwrap() as usize;
+            match self.admit(base, span, reserved) {
+                Ok(timeout) => {
+                    reserved += span as u64;
+                    admitted.push((base, span, timeout.min(piece_deadline(span)), run));
+                }
+                Err(error) => return (admitted, Some(error)),
+            }
+        }
+        (admitted, None)
+    }
+    /// Counts downloaded pieces and keeps their decoded blocks; returns the runs worth one
+    /// more request when `retry`, and records the first other error.
+    fn absorb(
+        &mut self,
+        pieces: Vec<Piece>,
+        retry: bool,
+        first_error: &mut Option<Error>,
+    ) -> Vec<Vec<IndexEntry>> {
+        let mut again = Vec::new();
+        for (stored, read, run) in pieces {
+            self.stats.response_body_bytes += read;
+            match stored {
+                Ok(blocks) => self.early.extend(blocks),
+                Err(Error(
+                    "archive_request_failed" | "archive_read_failed" | "archive_truncated_range",
+                )) if retry && !run.is_empty() => {
+                    self.stats.retries += 1;
+                    again.push(run);
+                }
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        again
     }
     /// Caches the uncached slots of the planned range near `slot` (from its predecessor,
-    /// usually its parent) with one index request and one request per contiguous run of
-    /// blocks, about `PIECES` runs per window, at most `STREAMS` at once. Each slot keeps
-    /// its own receipt, and each stream decodes its pieces' blocks into `early` while other
-    /// pieces download; slots without an index entry, or whose piece is lost, are left for
-    /// `chunk` to fetch or report.
+    /// usually its parent) with one request per contiguous run of blocks, at most `STREAMS`
+    /// at once. Each slot keeps its own receipt, and each stream decodes its pieces' blocks
+    /// into `early` while other pieces download; slots without an index entry, or whose
+    /// piece is lost, are left for `chunk` to fetch or report.
     fn prefetch(&mut self, slot: u64, start: u64, end: u64) -> Result<()> {
         let epoch = slot / EPOCH_SLOTS;
         let first = slot.saturating_sub(1).max(start).max(epoch * EPOCH_SLOTS);
         let last = end
             .min(first + PREFETCH_SLOTS - 1)
             .min(epoch * EPOCH_SLOTS + EPOCH_SLOTS - 1);
-        let records = self.fetch(
-            &format!("{epoch}/epoch-{epoch}-slot-ranges.raw"),
-            (first % EPOCH_SLOTS) * 12,
-            ((last - first + 1) * 12) as usize,
-        )?;
-        let mut wanted = Vec::new();
-        for (s, record) in (first..=last).zip(records.as_chunks::<12>().0) {
-            if let (false, Ok((offset, length))) = (self.paths(s).0.exists(), decode_index(record))
-            {
-                wanted.push((s, offset, length, record.to_vec()));
-            }
-        }
-        // Pieces are admitted in order against the budget, then downloaded concurrently. A
-        // piece that stalls or drops is requested once more, also within the budget.
         let url = format!("{}/{epoch}/epoch-{epoch}.car", self.origin);
-        // Up to `PIECES` pieces, using at most half the requests left so retries and the
-        // run's later windows still fit the command's request limit.
-        let window = wanted.iter().map(|e| u64::from(e.2)).sum();
-        let left = self.limits.requests.saturating_sub(self.stats.requests);
-        let pieces = (left / 2).min(PIECES);
-        let (mut pending, mut refused, mut first_error) = (
-            contiguous_runs(wanted, piece_span(window, pieces)),
-            None,
-            None,
-        );
+        // A piece that stalls or drops is requested once more, also within the budget.
+        let (mut pending, mut refused, mut first_error) =
+            (self.runs(epoch, first, last)?, None, None);
         for round in 0..2 {
-            let (mut admitted, mut reserved) = (Vec::new(), 0);
-            for run in pending {
-                let base = run[0].1;
-                let span = run.last().map(|e| e.1 + u64::from(e.2) - base).unwrap() as usize;
-                match self.admit(base, span, reserved) {
-                    Ok(timeout) => {
-                        reserved += span as u64;
-                        admitted.push((base, span, timeout.min(piece_deadline(span)), run));
-                    }
-                    Err(error) => {
-                        refused.get_or_insert(error);
-                        break;
-                    }
-                }
-            }
-            // Each stream also caches its pieces' slots, so their file syncs overlap.
-            admitted.reverse();
-            let (queue, done) = (Mutex::new(admitted), Mutex::new(Vec::new()));
-            let (this, url, mint) = (&*self, &url, self.mint.as_deref());
-            std::thread::scope(|scope| {
-                let streams: Vec<_> = (0..STREAMS)
-                    .map(|_| {
-                        scope.spawn(|| {
-                            while let Some((base, span, timeout, run)) =
-                                queue.lock().ok().and_then(|mut q| q.pop())
-                            {
-                                let (bytes, read) =
-                                    get(&this.agent, url, base, span, timeout, this.stall);
-                                let stored = bytes.and_then(|bytes| {
-                                    let mut blocks = Vec::new();
-                                    for (s, offset, length, record) in &run {
-                                        let at = (offset - base) as usize;
-                                        let raw = &bytes[at..at + *length as usize];
-                                        blocks.push((
-                                            *s,
-                                            raw,
-                                            this.store(*s, *offset, *length, record.clone(), raw)?,
-                                        ));
-                                    }
-                                    Ok(blocks
-                                        .into_iter()
-                                        .map(|(s, raw, receipt)| {
-                                            (s, decode(raw, s, mint).map(|d| (d, receipt)))
-                                        })
-                                        .collect::<Vec<_>>())
-                                });
-                                if let Ok(mut done) = done.lock() {
-                                    done.push((stored, read, run));
-                                }
-                            }
-                        })
-                    })
-                    .collect();
-                // A panicked stream loses its piece; those slots are fetched one by one later.
-                for stream in streams {
-                    let _ = stream.join();
-                }
-            });
-            let pieces: Vec<Piece> = done.into_inner().unwrap_or_default();
-            pending = Vec::new();
-            for (stored, read, run) in pieces {
-                self.stats.response_body_bytes += read;
-                match stored {
-                    Ok(blocks) => self.early.extend(blocks),
-                    Err(Error(
-                        "archive_request_failed"
-                        | "archive_read_failed"
-                        | "archive_truncated_range",
-                    )) if round == 0 && !run.is_empty() => {
-                        self.stats.retries += 1;
-                        pending.push(run);
-                    }
-                    Err(error) => {
-                        first_error.get_or_insert(error);
-                    }
-                }
-            }
+            let (admitted, refusal) = self.admit_runs(pending);
+            refused = refused.or(refusal);
+            let pieces = download(
+                &self.agent,
+                &self.cache,
+                &url,
+                self.mint.as_deref(),
+                self.stall,
+                admitted,
+            );
+            pending = self.absorb(pieces, round == 0, &mut first_error);
             if pending.is_empty() {
                 break;
             }
@@ -430,8 +446,55 @@ impl ArchiveSource {
             None => Ok(()),
         }
     }
+    /// Starts downloading the batch's window after `last` in the background, within the
+    /// budget. Anything it cannot start or loses is fetched when its slot is read.
+    // shortcut: a batch that stops early drops the window in flight uncounted in `stats` (at most one window's bytes), count it if the byte charge must be exact.
+    fn start_next(&mut self, last: u64) {
+        let Some((_, end)) = self
+            .batch
+            .filter(|(start, end)| (start..=end).contains(&&(last + 1)))
+        else {
+            return;
+        };
+        if self.next.is_some() || !self.network {
+            return;
+        }
+        let (first, epoch) = (last + 1, (last + 1) / EPOCH_SLOTS);
+        let through = end
+            .min(first + PREFETCH_SLOTS - 1)
+            .min(epoch * EPOCH_SLOTS + EPOCH_SLOTS - 1);
+        let Ok(runs) = self.runs(epoch, first, through) else {
+            return;
+        };
+        let (admitted, _) = self.admit_runs(runs);
+        if admitted.is_empty() {
+            return;
+        }
+        let bytes = admitted.iter().map(|a| a.1 as u64).sum();
+        let (agent, cache, mint, stall) = (
+            self.agent.clone(),
+            self.cache.clone(),
+            self.mint.clone(),
+            self.stall,
+        );
+        let url = format!("{}/{epoch}/epoch-{epoch}.car", self.origin);
+        let handle = std::thread::spawn(move || {
+            download(&agent, &cache, &url, mint.as_deref(), stall, admitted)
+        });
+        self.next = Some((handle, bytes));
+    }
+    /// Waits for the window downloading in the background and keeps what arrived.
+    fn finish_next(&mut self) {
+        if let Some((handle, _)) = self.next.take() {
+            let pieces = handle.join().unwrap_or_default();
+            self.absorb(pieces, false, &mut None);
+        }
+    }
 }
 impl BlockSource for ArchiveSource {
+    fn ahead(&mut self, start: u64, end: u64) {
+        self.batch = Some((start, end));
+    }
     fn plan(&mut self, mint: &str, start: u64, end: u64) {
         self.planned = Some((start, end));
         self.mint = Some(mint.into());
@@ -509,6 +572,9 @@ impl BlockSource for ArchiveSource {
         })
         .into_iter()
         .collect();
+        if mint.is_some() {
+            self.start_next(last);
+        }
         self.ready
             .remove(&slot)
             .unwrap_or(Err(Error("archive_decode_failed")))
@@ -561,6 +627,93 @@ fn normalized(
         return Err(Error("archive_normalized_block_limit"));
     }
     Ok(bytes)
+}
+/// A piece admitted for download: CAR offset, length, deadline, and its blocks.
+type Admitted = (u64, usize, Duration, Vec<IndexEntry>);
+/// Downloads admitted pieces on up to `STREAMS` streams; each stream caches and decodes its
+/// pieces' blocks while other pieces download.
+fn download(
+    agent: &ureq::Agent,
+    cache: &Path,
+    url: &str,
+    mint: Option<&str>,
+    stall: Duration,
+    mut admitted: Vec<Admitted>,
+) -> Vec<Piece> {
+    admitted.reverse();
+    let (queue, done) = (Mutex::new(admitted), Mutex::new(Vec::new()));
+    std::thread::scope(|scope| {
+        let streams: Vec<_> = (0..STREAMS)
+            .map(|_| {
+                scope.spawn(|| {
+                    while let Some((base, span, timeout, run)) =
+                        queue.lock().ok().and_then(|mut q| q.pop())
+                    {
+                        let (bytes, read) = get(agent, url, base, span, timeout, stall);
+                        let stored = bytes.and_then(|bytes| {
+                            let mut blocks = Vec::new();
+                            for (s, offset, length, record) in &run {
+                                let at = (offset - base) as usize;
+                                let raw = &bytes[at..at + *length as usize];
+                                blocks.push((
+                                    *s,
+                                    raw,
+                                    store(cache, *s, *offset, *length, record.clone(), raw)?,
+                                ));
+                            }
+                            Ok(blocks
+                                .into_iter()
+                                .map(|(s, raw, receipt)| {
+                                    (s, decode(raw, s, mint).map(|d| (d, receipt)))
+                                })
+                                .collect::<Vec<_>>())
+                        });
+                        if let Ok(mut done) = done.lock() {
+                            done.push((stored, read, run));
+                        }
+                    }
+                })
+            })
+            .collect();
+        // A panicked stream loses its piece; those slots are fetched one by one later.
+        for stream in streams {
+            let _ = stream.join();
+        }
+    });
+    done.into_inner().unwrap_or_default()
+}
+fn paths(cache: &Path, slot: u64) -> (PathBuf, PathBuf) {
+    let stem = format!("epoch-{}-slot-{slot}", slot / EPOCH_SLOTS);
+    (
+        cache.join(format!("{stem}.json")),
+        cache.join(format!("{stem}.car-range")),
+    )
+}
+fn store(
+    cache: &Path,
+    slot: u64,
+    offset: u64,
+    length: u32,
+    index_record: Vec<u8>,
+    raw: &[u8],
+) -> Result<Receipt> {
+    let receipt = Receipt {
+        schema_version: 1,
+        jetstreamer_revision: JETSTREAMER_REVISION.into(),
+        epoch: slot / EPOCH_SLOTS,
+        slot,
+        offset,
+        length,
+        index_record,
+        sha256: hex(&Sha256::digest(raw)),
+    };
+    let (manifest, file) = paths(cache, slot);
+    atomic_write(&file, raw)?;
+    atomic_write(
+        &manifest,
+        &serde_json::to_vec(&receipt).map_err(|_| Error("serialization_failed"))?,
+    )?;
+    Ok(receipt)
 }
 /// One admitted range request; also returns the response body bytes read, for the stats.
 fn get(
@@ -647,13 +800,11 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         .create_new(true)
         .open(&temp)
         .map_err(|_| Error("archive_cache_write_failed"))?;
+    // No fsync: a cache file is checked against its sha256 on every read and downloaded again
+    // if a crash cut it short, and syncing cost as much as downloading it.
     file.write_all(bytes)
-        .and_then(|_| file.sync_all())
         .map_err(|_| Error("archive_cache_write_failed"))?;
-    fs::rename(temp, path).map_err(|_| Error("archive_cache_write_failed"))?;
-    fs::File::open(path.parent().ok_or(Error("archive_cache_write_failed"))?)
-        .and_then(|f| f.sync_all())
-        .map_err(|_| Error("archive_cache_write_failed"))
+    fs::rename(temp, path).map_err(|_| Error("archive_cache_write_failed"))
 }
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -842,6 +993,12 @@ mod tests {
         }
         assert_eq!((one.stats.requests, one.stats.cached_chunks), (3, 3));
         assert_eq!(car_requests.load(Ordering::SeqCst), 2);
+        // A cached block cut short (written without fsync) is downloaded again.
+        fs::write(one.paths(11).1, b"cut").unwrap();
+        assert_eq!(one.chunk(11).unwrap().0, car[110..120]);
+        assert_eq!((one.stats.requests, one.stats.cached_chunks), (5, 3));
+        assert_eq!(one.chunk(11).unwrap().0, car[110..120]);
+        assert_eq!(one.stats.cached_chunks, 4);
         // Two stalls: the slot fails after one retry instead of retrying again.
         let (origin, car_requests) = archive_server(index.clone(), car.clone(), 2, false);
         let (mut two, _dir) = source(origin);
@@ -890,6 +1047,21 @@ mod tests {
         let cached: Vec<_> = (s - 1..=s + 2).map(|x| offline.block(x)).collect();
         assert!(fetched.iter().all(Result::is_ok));
         assert_eq!(fetched, cached);
+        // One batch read as two runs: the second run's window downloads while the first is
+        // served, and one index request covers the batch.
+        let dir = tempfile::tempdir().unwrap();
+        let mut batch = ArchiveSource::new(dir.path(), false, Limits::default()).unwrap();
+        (batch.network, batch.origin, batch.threads) = (true, origin.clone(), 4);
+        batch.ahead(s - 1, s + 2);
+        batch.plan(crate::live::USDC, s - 1, s);
+        let mut ahead: Vec<_> = (s - 1..=s).map(|x| batch.block(x)).collect();
+        assert!(batch.next.is_some());
+        batch.plan(crate::live::USDC, s + 1, s + 2);
+        ahead.extend((s + 1..=s + 2).map(|x| batch.block(x)));
+        assert_eq!(ahead, cached);
+        // One index request and one piece per window, plus s-2 (the parent outside the
+        // batch) read alone: its index record and its block.
+        assert_eq!((batch.stats.requests, batch.stats.retries), (5, 0));
     }
     #[test]
     fn offline_cache_miss_never_attempts_a_network() {
