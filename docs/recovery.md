@@ -28,9 +28,19 @@ than dropping input:
   partitions. The next owner resumes from the positions stored with the output, so
   inputs may be redelivered but are stored once.
 
+- **Written input (opt-in):** with `INDEXER_KAFKA_DELETE_CONSUMED=1` the consumer
+  deletes records below the positions it stored with its output, every 60 s and at
+  exit, only for partitions it owns. Unwritten input is never deleted, and topic
+  retention stays 37 days for it. Restoring PostgreSQL from a backup taken before a
+  deletion cannot replay the deleted input: those positions start at Kafka's earliest
+  remaining record, so re-fetch that interval from LaserStream replay or the archive.
+  Use it only when one consumer group reads the topic. A failed deletion emits
+  `written_records_delete_failed` and consuming continues.
+
 The consumer report gives `storage_write_seconds` (time in PostgreSQL writes) and
 `prefetch_peak_bytes` (largest prefetched byte count librdkafka reported for the
-consumer's one shared queue). Tests cover a full producer queue against an
+consumer's one shared queue), and `deleted_written_records` (successful deletions of
+written input in this run). Tests cover a full producer queue against an
 unreachable broker and a six-partition consumer whose position writes are locked for
 ten seconds.
 

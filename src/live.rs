@@ -19,10 +19,17 @@ use tonic::{
 
 pub const USDC: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 const MAX_MESSAGES: usize = 10_000;
+/// `SECONDS` value for a live run that keeps its subscription until it fails or is stopped.
+pub const CONTINUOUS: u64 = 0;
+// shortcut: a continuous run is a deadline this far away; switch to an explicit stop signal if runs ever need to outlive it.
+const CONTINUOUS_DEADLINE: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 /// A live batch flushes at this many inputs, bytes or age, whichever comes first.
 pub(crate) const BATCH_INPUTS: usize = 100;
 pub(crate) const BATCH_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const BATCH_WINDOW: Duration = Duration::from_millis(200);
+/// HTTP/2 receive window per stream and per connection. It bounds unacknowledged input
+/// in flight; 64 KiB capped throughput near window/RTT (~140 tx/s at a 30–60 ms RTT).
+const RECEIVE_WINDOW: u32 = 8 * 1024 * 1024;
 pub(crate) const PROTO_SCHEMA: &str = "laserstream-core-proto/14.0.0";
 const RECENT_SECONDS: i64 = 60;
 
@@ -256,7 +263,7 @@ fn age(observed: i64) -> Option<i64> {
 
 /// Only this explicitly opted-in command opens a provider connection.
 pub fn validate_options(from: u64, seconds: u64) -> Result<()> {
-    if !(1..=300).contains(&seconds) || from > i64::MAX as u64 {
+    if !(seconds == CONTINUOUS || (1..=300).contains(&seconds)) || from > i64::MAX as u64 {
         return Err(Error("invalid_live_bounds"));
     }
     if std::env::var("INDEXER_LIVE_OPT_IN").as_deref() != Ok("1") {
@@ -322,9 +329,12 @@ pub(crate) fn run_replay(
     replay: &mut crate::replay::ReplayRun,
 ) -> Result<Value> {
     let mint = replay.scope.mint.clone();
+    // Re-reading from the job start would spend each grant on already-received slots.
+    let start = crate::storage::replay::JobLog::open(database)?
+        .resume_start(&replay.reservation.job, &replay.scope)?;
     run_intake(
         database,
-        replay.scope.start,
+        start,
         seconds,
         &mint,
         telemetry,
@@ -343,7 +353,15 @@ fn run_intake(
     mut replay: Option<&mut crate::replay::ReplayRun>,
 ) -> Result<Value> {
     let historical = replay.is_some();
-    let deadline = Instant::now() + Duration::from_secs(seconds);
+    if historical && seconds == CONTINUOUS {
+        return Err(Error("invalid_live_bounds"));
+    }
+    let deadline = Instant::now()
+        + if seconds == CONTINUOUS {
+            CONTINUOUS_DEADLINE
+        } else {
+            Duration::from_secs(seconds)
+        };
     let admit = || {
         if historical {
             gate.historical_until(deadline)
@@ -388,7 +406,8 @@ fn run_intake(
     let mut buffer = Vec::new();
     let mut buffered_bytes = 0usize;
     let mut buffered_since: Option<Instant> = None;
-    let mut accepted = 0usize;
+    let mut last_slot: Option<u64> = None;
+    let mut metrics_at = Instant::now();
     // Historical input keeps its own durable receipts; only live intake publishes to Kafka.
     let mut producer = if historical { None } else { live_producer()? };
     let result = (|| {
@@ -406,6 +425,12 @@ fn run_intake(
                 let _permit = admit()?;
                 job.reservation.connection()?;
             }
+            // A reconnect resumes from delivered input, not from the run's first slot.
+            let start = if historical {
+                from
+            } else {
+                resume_start(from, producer.as_ref().map_or(last_slot, |p| p.cursor()))
+            };
             let mut client = connect(&runtime, deadline, &token)?;
             let (first_available, reference) = availability(&runtime, deadline, &mut client)?;
             {
@@ -415,7 +440,7 @@ fn run_intake(
                         .availability(&job.scope, first_available, reference)?;
                 } else {
                     let first = first_available.ok_or(Error("replay_info_unavailable"))?;
-                    check_replay(from, first)?;
+                    check_replay(start, first)?;
                     if reference > i64::MAX as u64 || first > i64::MAX as u64 {
                         return Err(Error("unsupported_slot"));
                     }
@@ -429,7 +454,7 @@ fn run_intake(
             let (sender, receiver) = tokio::sync::mpsc::channel(1);
             network(&runtime, deadline, async {
                 sender
-                    .send(request_mint(from, mint))
+                    .send(request_mint(start, mint))
                     .await
                     .map_err(|_| Error("subscription_failed"))
             })?;
@@ -452,8 +477,17 @@ fn run_intake(
                     )?;
                     return Ok("time_limit");
                 }
-                if stats.count >= MAX_MESSAGES {
+                // Live intake has no message cap; only historical replay is message-bounded.
+                if historical && stats.count >= MAX_MESSAGES {
                     return Ok("message_limit");
+                }
+                if !historical && metrics_at.elapsed().as_secs() >= RECENT_SECONDS as u64 {
+                    metrics_at = Instant::now();
+                    let elapsed = started.elapsed().as_secs_f64();
+                    diagnostic(
+                        telemetry,
+                        &metrics(&stats, bytes, reconnects, elapsed, historical, &intake),
+                    );
                 }
                 if std::env::var_os("BACKFILL_CANCEL_FILE")
                     .is_some_and(|p| std::path::Path::new(&p).exists())
@@ -546,7 +580,7 @@ fn run_intake(
                     })?;
                 }
                 if let Some(subscribe_update::UpdateOneof::Transaction(tx)) = update.update_oneof {
-                    if tx.slot < from && !historical {
+                    if tx.slot < start && !historical {
                         return Err(Error("unexpected_slot"));
                     }
                     telemetry.slot = Some(tx.slot);
@@ -554,12 +588,9 @@ fn run_intake(
                     if !historical {
                         buffered_bytes = buffered_bytes.saturating_add(tx.encoded_len());
                         buffered_since.get_or_insert_with(Instant::now);
+                        last_slot = last_slot.max(Some(tx.slot));
                         buffer.push(tx);
-                        accepted += 1;
-                        if buffer.len() >= BATCH_INPUTS
-                            || buffered_bytes >= BATCH_BYTES
-                            || accepted >= MAX_MESSAGES
-                        {
+                        if buffer.len() >= BATCH_INPUTS || buffered_bytes >= BATCH_BYTES {
                             stats.flush_live(
                                 &mut intake,
                                 &mut buffer,
@@ -569,9 +600,6 @@ fn run_intake(
                                 telemetry,
                             )?;
                             (buffered_bytes, buffered_since) = (0, None);
-                        }
-                        if accepted >= MAX_MESSAGES {
-                            return Ok("message_limit");
                         }
                         continue;
                     }
@@ -663,14 +691,32 @@ fn run_intake(
     let report = json!({"status":status,"raw_write_successes":stats.raw_writes,"duplicate_receipts":duplicate_receipts,"mode":if historical {"historical"}else{"live"},"received":stats.count,"unresolved_attempts":stats.failures,"input_protobuf_bytes":bytes,"elapsed_seconds":elapsed,"reconnect_attempts":reconnects,"inserted_transfers":stats.inserted,"input_transactions_per_second":stats.count as f64/elapsed,"decoded_write_successes":stats.output_successes,"coverage_valid":false,"verified_boundary":null,"freshness_seconds":null,"storage":intake.store.stats(),"kafka":producer.as_ref().map(|p| json!({"topic":crate::kafka::TOPIC,"producer_cursor":p.cursor(),"late_beyond_reorder_margin":p.late_beyond_margin,"reorder_margin_slots":crate::kafka::REORDER_MARGIN_SLOTS})),"coverage":coverage});
     diagnostic(
         telemetry,
-        &json!({"event":"live_metrics","mode":if historical {"historical"}else{"live"},"source_kind":"laserstream","indexer_transactions_total":stats.count,"indexer_decode_failures_total":stats.failures,"indexer_input_bytes_total":bytes,"indexer_reconnects_total":reconnects,"indexer_coverage_valid":0,"indexer_live_freshness_seconds":null,"indexer_live_slot_gap":null,
-            "stage_metrics":[{"stage":"raw_write","success":stats.raw_writes,"duration_seconds_sum":stats.raw_seconds},
-                {"stage":"decode_write","success":stats.output_successes,"unsupported":stats.failures,"duration_seconds_sum":stats.output_seconds},
-                {"stage":"transfer_write","storage":intake.store.stats()}],
-            "elapsed_seconds":elapsed,"input_transactions_per_second":stats.count as f64/elapsed}),
+        &metrics(&stats, bytes, reconnects, elapsed, historical, &intake),
     );
     result?;
     Ok(report)
+}
+
+/// The live subscription start: the run's first slot, or the reorder-margin resume point
+/// of input already delivered, whichever is later.
+fn resume_start(from: u64, delivered: Option<u64>) -> u64 {
+    delivered.map_or(from, |slot| crate::kafka::resume_slot(slot).max(from))
+}
+
+/// Cumulative counters since the run started; a continuous run emits them every minute.
+fn metrics(
+    stats: &IntakeStats,
+    bytes: usize,
+    reconnects: usize,
+    elapsed: f64,
+    historical: bool,
+    intake: &Intake,
+) -> Value {
+    json!({"event":"live_metrics","mode":if historical {"historical"}else{"live"},"source_kind":"laserstream","indexer_transactions_total":stats.count,"indexer_decode_failures_total":stats.failures,"indexer_input_bytes_total":bytes,"indexer_reconnects_total":reconnects,"indexer_coverage_valid":0,"indexer_live_freshness_seconds":null,"indexer_live_slot_gap":null,
+        "stage_metrics":[{"stage":"raw_write","success":stats.raw_writes,"duration_seconds_sum":stats.raw_seconds},
+            {"stage":"decode_write","success":stats.output_successes,"unsupported":stats.failures,"duration_seconds_sum":stats.output_seconds},
+            {"stage":"transfer_write","storage":intake.store.stats()}],
+        "elapsed_seconds":elapsed,"input_transactions_per_second":stats.count as f64/elapsed})
 }
 #[derive(Default)]
 struct IntakeStats {
@@ -798,8 +844,8 @@ pub(crate) fn connect(
         Endpoint::from_static("https://laserstream-mainnet-ewr.helius-rpc.com")
             .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(10))
-            .initial_stream_window_size(65536)
-            .initial_connection_window_size(65536)
+            .initial_stream_window_size(RECEIVE_WINDOW)
+            .initial_connection_window_size(RECEIVE_WINDOW)
             .http2_adaptive_window(false)
             .buffer_size(1)
             .tls_config(ClientTlsConfig::new().with_native_roots())
@@ -909,6 +955,14 @@ pub(crate) mod tests {
     use super::*;
     use crate::storage::pg::TestDatabase;
     use laserstream_core_proto::solana::storage::confirmed_block as wire;
+    #[test]
+    fn a_reconnect_resumes_from_delivered_input_within_the_reorder_margin() {
+        let margin = crate::kafka::REORDER_MARGIN_SLOTS;
+        assert_eq!(resume_start(1_000, None), 1_000);
+        assert_eq!(resume_start(1_000, Some(5_000)), 5_000 - margin);
+        // Never earlier than the run's own first slot.
+        assert_eq!(resume_start(1_000, Some(1_000 + margin - 1)), 1_000);
+    }
     #[test]
     fn shared_loop_flush_keeps_live_output_batched_and_atomically_acknowledged() {
         let db = TestDatabase::new();
@@ -1514,11 +1568,12 @@ pub(crate) mod tests {
 
     #[test]
     fn bounds_checked_before_environment_or_network() {
-        assert_eq!(
+        // Zero seconds is a continuous run, not a bounds error.
+        assert_ne!(
             run(
                 &Database::new("postgres://unused@127.0.0.1/x", "unused").unwrap(),
                 1,
-                0,
+                CONTINUOUS,
                 &mut crate::telemetry::Telemetry::default()
             )
             .unwrap_err()

@@ -22,6 +22,14 @@ including crashes; restarting never refills it. Received messages/bytes are char
 even when subsequent raw persistence fails. These counters describe processing
 allowances, not exact provider billing or total HTTP/2 transport bytes.
 
+Each attempt subscribes from `next_replay_start` in status, not the job start:
+the 150-slot reorder margin before the highest received slot, or before the lowest
+unresolved receipt whose raw input was pruned (so it is fetched again), clamped to the
+job scope. It is derived from stored receipts on every attempt. Received slots are input
+progress only and never verified coverage; undecodable input with retained raw bytes is
+left to `replay-retry` and does not hold replay back. Jobs of at most 128 slots always
+resume at their start, since the margin exceeds them.
+
 A PostgreSQL session advisory lock permits one active attempt per job. Connection
 death releases ownership, not consumed budgets. A subsequent attempt records the
 previous running attempt as interrupted. This is single-job ownership, not the

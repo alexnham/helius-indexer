@@ -40,7 +40,8 @@ def configuration(env, tip):
         raise ValueError("Invalid INDEXER_REPLAY_JOB")
     return {"historical_source":"laserstream_replay","replay_job":job,"mint": mint, "mints": [mint], "sample_percent": percent, "slot_start": start, "slot_end": end,
             "live_from": integer(env, "INDEXER_LIVE_FROM", max(0, tip - 4), 0, tip),
-            "seconds": integer(env, "INDEXER_LIVE_SECONDS", 60, 1, 300),
+            # 0 keeps one live subscription open; 1-300 runs bounded live cycles.
+            "seconds": integer(env, "INDEXER_LIVE_SECONDS", 0, 0, 300),
             "keep": integer(env, "INDEXER_KEEP_TRANSFERS", 1000, 1, 1_000_000),
             "mode": "live and backfill", "coverage": "unknown", "query_limit": 1000,
             # A PostgreSQL session schema on DATABASE_URL's server, never a file.
@@ -262,12 +263,22 @@ def main():
             atomic_json(session / "session.json", config)
             atomic_json(session / "worker.json", {"state": "starting", "coverage": "unknown"})
         stopped = threading.Event()
-        process = None
+        children = []  # the monitor and, beside continuous live, a prune
+        continuous = config["seconds"] == 0
         def cycle(args, timeout=None, report_name="report.json"):
             def track(child):
-                nonlocal process
-                process = child
-            return execute_cycle(session, args, env, timeout or config["seconds"] + 60, track, report_name)
+                children[:] = [c for c in children if c.poll() is None] + [child]
+            return execute_cycle(session, args, env, timeout or (None if continuous else config["seconds"] + 60), track, report_name)
+
+        def prune():
+            # Continuous live never returns between cycles, so retention runs on its own timer.
+            while not stopped.wait(60):
+                try:
+                    code, _ = cycle(["prune", config["database"], config["keep"]], timeout=300, report_name="prune.json")
+                except (OSError, ValueError, subprocess.SubprocessError):
+                    code = None
+                if code != 0 and not stopped.is_set():
+                    record_event(session, "prune_failed", "failed", exit_code=code)
 
         def worker():
             # Both workers resume independently; replay budgets never reset between cycles.
@@ -287,8 +298,8 @@ def main():
                     if stopped.is_set():
                         atomic_json(session / "worker.json", {"state": "stopped", "cycle": number, "coverage": "unknown"})
                         return
-                    if config.get("sample_percent") is not None:
-                        pruned = None  # A sampled demo keeps every raw input for decoder repair.
+                    if config.get("sample_percent") is not None or continuous:
+                        pruned = None  # A sampled demo keeps every raw input; continuous live prunes on its timer.
                     else:
                         prune_code, pruned = cycle(["prune", db, config["keep"]], timeout=300, report_name="prune.json")
                         if prune_code != 0:
@@ -310,10 +321,14 @@ def main():
         port = integer(os.environ, "INDEXER_CONSOLE_PORT", 8765, 1024, 65535)
         server = CONSOLE.HTTPServer(("0.0.0.0", port), CONSOLE.handler_for(session, port, runtime_status=status))
         thread = threading.Thread(target=worker) if not inspect_only else None
+        pruner = threading.Thread(target=prune) if thread and continuous and config.get("sample_percent") is None else None
+        def terminate():
+            for child in list(children):
+                if child.poll() is None:
+                    child.terminate()
         def stop(_signum, _frame):
             stopped.set()
-            if process is not None and process.poll() is None:
-                process.terminate()
+            terminate()
             raise KeyboardInterrupt
         signal.signal(signal.SIGTERM, stop)
         signal.signal(signal.SIGINT, stop)
@@ -321,6 +336,8 @@ def main():
         record_event(session, "runtime_started", "startup", inspect_only=inspect_only, binary=binary, archive=archive)
         if thread:
             thread.start()
+        if pruner:
+            pruner.start()
         print("Provider-backed console ready; " + ("inspection only" if inspect_only else "continuous intake starting") + "; coverage unknown", flush=True)
         try:
             server.serve_forever()
@@ -329,13 +346,16 @@ def main():
         finally:
             server.server_close()
             stopped.set()
-            if process is not None and process.poll() is None:
-                process.terminate()
-            if thread:
-                thread.join(timeout=10)
-            if thread and thread.is_alive() and process is not None:
-                process.kill()
-                thread.join()
+            terminate()
+            for worker_thread in (thread, pruner):
+                if worker_thread:
+                    worker_thread.join(timeout=10)
+            for child in list(children):
+                if child.poll() is None:
+                    child.kill()
+            for worker_thread in (thread, pruner):
+                if worker_thread:
+                    worker_thread.join()
 
 
 if __name__ == "__main__":

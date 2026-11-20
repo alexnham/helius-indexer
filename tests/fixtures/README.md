@@ -126,6 +126,21 @@ and `Program return:` lines were removed; invocation and success lines are kept.
 No credentials or provider URLs are included. A test rewrites tag 25 to 29 to check
 that unverified setup tags stay unsupported.
 
+## p-token Batch and mint metadata
+
+`mainnet-p-token.json` holds five successful finalized mainnet transactions from the
+2026-11-19 sustained archive run (Old Faithful, epoch 1089), one per instruction class in
+#125: two p-token `Batch` transactions (slots 470466240 and 470466328), with two nested
+transfers each; `WithdrawExcessLamports` (470468958); `MetadataPointer` with token-metadata
+`Initialize` (470467125); and token-metadata `UpdateAuthority` (470468825). Each case lists
+the expected transfer identities, positions (including `batch_index`), mints, accounts,
+amounts and fees. The archive's token balances carry decimals only, so the nested batch
+transfers were checked by an independent parse of the batch bytes, and the USDC edges by
+`scripts/compare-captured-usdc.py` (7 expected, 0 missing, extra or wrong).
+`Program log:`, `Program data:` and `Program return:` lines were removed; invocation and
+success lines are kept. No credentials or provider URLs are included. A test corrupts a
+batch record length, nests a batch, and rewrites tag 39 to 40 to check that each still fails.
+
 ## Confidential transfer layouts (synthetic)
 
 `confidential-transfers.json` contains two synthetic finalized-envelope examples

@@ -92,6 +92,14 @@ Block-time policy (reviewed 2026-11-14):
 
 Provisionally retain matched raw transactions for 37 days: 30 days of query history plus a seven-day repair margin. Compressed object storage is the candidate raw store. Preserve instructions, inner instructions, relevant execution metadata, source provenance, and schema/version information needed to repeat decoding. Size and validate this policy before production.
 
+Requirements change (2026-11-19): live raw input need not stay in Kafka once written.
+With `INDEXER_KAFKA_DELETE_CONSUMED=1` (set by the Docker runtime's consumer), the
+consumer deletes records below the positions it stored with their output, so Kafka
+holds only unwritten input. Kafka is then not the 37-day raw store: decoder repair of
+older live input re-fetches it from LaserStream replay (about two days) or Old Faithful.
+Deletion assumes one consumer group per topic. The 37-day raw retention above remains
+the production target for a dedicated raw store.
+
 Requirements change (2026-11-18): historical block responses are retained pruned. The block header, every transaction's signatures and each transaction that touches the job's mint (decodable or not) are kept; other transactions keep only their signatures. Block identity, skip evidence, retries and decoder repair still run offline from the pruned block. Correcting the mint filter itself requires fetching the affected blocks again from the source. Archive/RPC bridge evidence still retains whole blocks, because it compares them.
 
 The initial API provides:
@@ -279,7 +287,8 @@ storage and live-priority admission gate. Defaults are 60 seconds and 50 finaliz
 slots; each invocation remains limited to 300 seconds/128 historical slots. It
 exposes source failures and scoped coverage alongside newest-first inspection.
 This does not establish a rolling 30-day API or authorize a full-window backfill.
-The runtime now continues live intake in resumable cycles and keeps only the newest
+The runtime now keeps one continuous live subscription (bounded cycles remain
+opt-in), repeats historical work beside it, and keeps only the newest
 1,000 transfers (configurable), pruning older inputs and coverage to `unknown`.
 This count-based cap is a local-testing retention choice only; the 30-day query
 window and 37-day raw retention above remain the production requirement.

@@ -467,14 +467,18 @@ The runtime resumes Kafka from the stored `resume_from`, never its maximum raw
 slot. Deterministic tests exercise direct batch acknowledgment and Kafka publication
 alongside a replay receipt using real local PostgreSQL/Kafka, without provider calls.
 
-The Kafka consumer report adds `storage_write_seconds` and `prefetch_peak_bytes`
+The Kafka consumer report adds `storage_write_seconds`, `deleted_written_records`
+(successful deletions of written input when `INDEXER_KAFKA_DELETE_CONSUMED=1`; a failure
+emits `written_records_delete_failed`) and `prefetch_peak_bytes`
 (from librdkafka statistics, sampled every second); producer and consumer buffer
 bounds and their backpressure are listed in [recovery](recovery.md).
 
 For the #36 metrics, the consumer report and events give:
 
 - **Consume rate:** `consumed_per_second` over `elapsed_seconds`. The produce rate is
-  `input_transactions_per_second` in the producer's `live_metrics` event.
+  `input_transactions_per_second` in the producer's `live_metrics` event. A continuous
+  live run (`SECONDS` 0) emits that event every 60 seconds with counters cumulative since
+  the run started, plus once at shutdown; a bounded run emits it only at shutdown.
 - **Consumer lag:** `lag_messages` at exit and `lag_peak_messages`, measured as the broker
   high watermark minus the position stored with the output, summed over assigned
   partitions. Fetched but unwritten input therefore counts. It is measured at most once a

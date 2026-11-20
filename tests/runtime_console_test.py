@@ -31,7 +31,7 @@ def database():
 class RuntimeConsole(unittest.TestCase):
     def test_configurable_mint_and_independent_live_and_backfill_ranges(self):
         default = RUNTIME.configuration({}, 1000)
-        self.assertEqual((default["slot_start"], default["slot_end"], default["seconds"], default["keep"]), (951, 1000, 60, 1000))
+        self.assertEqual((default["slot_start"], default["slot_end"], default["seconds"], default["keep"]), (951, 1000, 0, 1000))
         custom = RUNTIME.configuration({"INDEXER_MINT": "So11111111111111111111111111111111111111112",
             "INDEXER_BACKFILL_START": "100", "INDEXER_BACKFILL_END": "149",
             "INDEXER_LIVE_FROM": "990", "INDEXER_LIVE_SECONDS": "10"}, 1000)
@@ -39,7 +39,7 @@ class RuntimeConsole(unittest.TestCase):
         self.assertIsNone(default["sample_percent"])
         self.assertEqual(RUNTIME.configuration({"INDEXER_SAMPLE_PERCENT": "100"}, 1000)["sample_percent"], 100)
         for options in [{"INDEXER_MINT": "bad"}, {"INDEXER_BACKFILL_SLOTS": "129"},
-                        {"INDEXER_LIVE_SECONDS": "301"}, {"INDEXER_BACKFILL_END": "1001"},
+                        {"INDEXER_LIVE_SECONDS": "301"}, {"INDEXER_LIVE_SECONDS": "-1"}, {"INDEXER_BACKFILL_END": "1001"},
                         {"INDEXER_BACKFILL_START": "0"}, {"INDEXER_LIVE_FROM": "-1"},
                         {"INDEXER_KEEP_TRANSFERS": "0"}, {"INDEXER_SAMPLE_PERCENT": "0"}, {"INDEXER_SAMPLE_PERCENT": "101"}]:
             with self.assertRaises(ValueError):

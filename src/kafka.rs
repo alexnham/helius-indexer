@@ -403,15 +403,32 @@ impl rdkafka::consumer::ConsumerContext for Positions {
     }
 }
 
-/// Consumes live input from `topic` as one member of the session's consumer group and
-/// writes it in batches; each batch commits its output and the group's positions together.
-/// Input that fails before storage is retained in live_raw for offline retry. A storage
-/// failure stops the consumer without advancing positions, so a restart replays the batch.
+/// How often a consumer that deletes written input does so.
+const DELETE_INTERVAL: Duration = Duration::from_secs(60);
+
+/// `consume_with`, deleting written input when `INDEXER_KAFKA_DELETE_CONSUMED=1`.
 pub fn consume(
     database: &crate::storage::Database,
     brokers: &str,
     topic: &str,
     seconds: u64,
+) -> Result<serde_json::Value> {
+    let delete = std::env::var("INDEXER_KAFKA_DELETE_CONSUMED").as_deref() == Ok("1");
+    consume_with(database, brokers, topic, seconds, delete)
+}
+
+/// Consumes live input from `topic` as one member of the session's consumer group and
+/// writes it in batches; each batch commits its output and the group's positions together.
+/// Input that fails before storage is retained in live_raw for offline retry. A storage
+/// failure stops the consumer without advancing positions, so a restart replays the batch.
+/// With `delete_consumed`, records below the positions stored in PostgreSQL are deleted
+/// from Kafka every minute and at exit; the topic must have no other consumer group.
+pub fn consume_with(
+    database: &crate::storage::Database,
+    brokers: &str,
+    topic: &str,
+    seconds: u64,
+    delete_consumed: bool,
 ) -> Result<serde_json::Value> {
     use crate::live::{BATCH_BYTES, BATCH_INPUTS, BATCH_WINDOW};
     use rdkafka::consumer::{BaseConsumer, Consumer};
@@ -464,6 +481,16 @@ pub fn consume(
     let mut measured = None;
     let mut since: Option<std::time::Instant> = None;
     let mut totals = Totals::default();
+    let admin: Option<AdminClient<DefaultClientContext>> = if delete_consumed {
+        Some(
+            config(brokers)
+                .create()
+                .map_err(|_| Error("kafka_unavailable"))?,
+        )
+    } else {
+        None
+    };
+    let mut deleted_at = std::time::Instant::now();
     loop {
         if let Some(error) = consumer
             .context()
@@ -511,6 +538,18 @@ pub fn consume(
             buffered_bytes = 0;
             since = None;
         }
+        if let Some(admin) = admin.as_ref()
+            && (done || deleted_at.elapsed() >= DELETE_INTERVAL)
+        {
+            deleted_at = std::time::Instant::now();
+            delete_written(
+                admin,
+                topic,
+                &consumer.context().stored,
+                &mut totals,
+                telemetry,
+            );
+        }
         if done {
             break;
         }
@@ -548,7 +587,7 @@ pub fn consume(
         "batches":totals.batches,"revoked_unwritten":totals.revoked_unwritten,"storage_failures_retained":totals.storage_retained,
         "storage_write_seconds":totals.storage_seconds,
         "prefetch_peak_bytes":consumer.context().prefetch_peak.load(std::sync::atomic::Ordering::Relaxed),
-        "batch_retries":totals.batch_retries,
+        "batch_retries":totals.batch_retries,"deleted_written_records":totals.deleted,
         "rebalances":{"assigned":context.assignments.load(Relaxed),"revoked":context.revocations.load(Relaxed)},
         "lag_messages":durable_lag(&consumer, topic),"lag_peak_messages":totals.lag_peak,
         "elapsed_seconds":elapsed,"consumed_per_second":totals.consumed as f64/elapsed,
@@ -556,8 +595,53 @@ pub fn consume(
     )
 }
 
+/// Deletes records below the positions this consumer stored with its written output.
+/// Housekeeping only: a failure is reported and consuming continues.
+fn delete_written(
+    admin: &AdminClient<DefaultClientContext>,
+    topic: &str,
+    stored: &std::sync::Mutex<std::collections::HashMap<i32, i64>>,
+    totals: &mut Totals,
+    telemetry: &crate::telemetry::Telemetry,
+) {
+    let mut below = rdkafka::TopicPartitionList::new();
+    if let Ok(stored) = stored.lock() {
+        for (&partition, &next) in stored.iter().filter(|(_, next)| **next > 0) {
+            if below
+                .add_partition_offset(topic, partition, rdkafka::Offset::Offset(next))
+                .is_err()
+            {
+                return;
+            }
+        }
+    }
+    if below.count() == 0 {
+        return;
+    }
+    let options = AdminOptions::new().operation_timeout(Some(Duration::from_secs(10)));
+    let deleted = block_on(admin.delete_records(&below, &options)).and_then(|r| {
+        let partitions = r.map_err(|_| Error("kafka_delete_failed"))?;
+        if partitions.elements().iter().all(|e| e.error().is_ok()) {
+            Ok(())
+        } else {
+            Err(Error("kafka_delete_failed"))
+        }
+    });
+    match deleted {
+        Ok(()) => totals.deleted += 1,
+        Err(e) => telemetry.emit(
+            "written_records_delete_failed",
+            "delete",
+            "failed",
+            Some(e.0),
+        ),
+    }
+}
+
 #[derive(Default)]
 struct Totals {
+    /// Successful deletions of written records.
+    deleted: u64,
     consumed: u64,
     inserted: u64,
     retained: u64,
@@ -1008,7 +1092,7 @@ mod cursor_tests {
 #[cfg(test)]
 mod consumer_tests {
     use super::{
-        IntakeProducer, consume,
+        IntakeProducer, consume, consume_with,
         tests::{TestTopic, test_brokers},
     };
     use crate::{
@@ -1075,6 +1159,44 @@ mod consumer_tests {
             "a restart resumes from stored positions"
         );
         assert_eq!(Store::query(&test.0, None, 100).unwrap().len(), 2);
+    }
+
+    /// Sum over partitions of the earliest offset Kafka still holds.
+    fn low_watermarks(topic: &str, partitions: i32) -> i64 {
+        use rdkafka::consumer::{BaseConsumer, Consumer};
+        let consumer: BaseConsumer = super::config(&test_brokers()).create().unwrap();
+        (0..partitions)
+            .map(|p| {
+                consumer
+                    .fetch_watermarks(topic, p, Duration::from_secs(10))
+                    .unwrap()
+                    .0
+            })
+            .sum()
+    }
+
+    #[test]
+    fn written_records_are_deleted_only_when_enabled_and_never_past_stored_positions() {
+        let kept = TestDatabase::new();
+        let topic = TestTopic::new(2);
+        produce(&topic.0, &[signed(9, 123), signed(8, 124), signed(7, 125)]);
+        consume(&kept.0, &test_brokers(), &topic.0, 4).unwrap();
+        assert_eq!(low_watermarks(&topic.0, 2), 0, "deletion is opt-in");
+
+        let test = TestDatabase::new();
+        let topic = TestTopic::new(2);
+        produce(&topic.0, &[signed(9, 123), signed(8, 124), signed(7, 125)]);
+        let report = consume_with(&test.0, &test_brokers(), &topic.0, 4, true).unwrap();
+        assert_eq!(report["inserted_transfers"], 3);
+        assert_eq!(report["deleted_written_records"], 1);
+        assert_eq!(stored_positions(&test), 3);
+        // Exactly the written records are gone: Kafka now starts at the stored positions.
+        assert_eq!(low_watermarks(&topic.0, 2), stored_positions(&test));
+        // Unwritten input stays: a new record is still delivered after the deletion.
+        produce(&topic.0, &[signed(6, 126)]);
+        let again = consume_with(&test.0, &test_brokers(), &topic.0, 4, true).unwrap();
+        assert_eq!(again["consumed"], 1);
+        assert_eq!(Store::query(&test.0, None, 100).unwrap().len(), 4);
     }
 
     #[test]
