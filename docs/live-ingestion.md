@@ -37,8 +37,9 @@ This is a local validation slice for issue #2; production readiness is pending.
 The implementation uses the generated Helius protobuf client directly with
 Tonic TLS, rather than the SDK's automatic reconnect loop: SDK 2.0.0 resets its
 retry counter after a successful connection and can reconnect silently. Owning
-three explicit subscription attempts gives bounded retry events and replays from
-the requested start, never an in-memory cursor. `convert`/cuckoo features are
+three explicit subscription attempts gives bounded retry events. A reconnect resumes
+from the delivered producer cursor (the lowest undelivered slot) minus the reorder
+margin, never from a received-but-undelivered position. `convert`/cuckoo features are
 excluded; no Solana runtime or database service is introduced. Prost re-encodes
 known wire fields with an explicitly stored schema revision, Tokio supplies deadlines, and a capacity-one request channel
 handles subscription/ping messages. H2 receive windows are 64 KiB, adaptive growth
