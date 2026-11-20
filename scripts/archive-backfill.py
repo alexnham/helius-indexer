@@ -16,7 +16,7 @@ import time
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 SAMPLE_PERCENT = 10
-BATCH_RESERVE = 704 * 1024 * 1024  # archive 128 MiB + nine RPC blocks at 64 MiB
+BATCH_RESERVE = 704 * 1024 * 1024  # archive 128 MiB + nine RPC blocks at 64 MiB (eight-slot batches)
 DEFAULT_RESERVE_LIMIT = 2 * 1024**3
 DEFAULT_MIN_FREE = 10 * 1024**3
 # Above the native per-batch bounds: 120 s archive plus nine 20 s RPC block requests.
@@ -150,8 +150,10 @@ def configure_run(args):
         raise SafeError("max_batches is required in the config or --max-batches")
     if not 1 <= args.slots_per_batch <= 10_000:
         raise SafeError("slots_per_batch must be between 1 and 10000")
-    # One extra RPC response allows the archive/RPC boundary comparison.
-    args.batch_reserve = 128 * 1024**2 + (args.slots_per_batch + 1) * 64 * 1024**2
+    # The native archive limit (`Limits::bridge`), plus one extra RPC response for the
+    # archive/RPC boundary comparison.
+    archive = min(max(args.slots_per_batch, 128), 2048) * 1024**2
+    args.batch_reserve = archive + (args.slots_per_batch + 1) * 64 * 1024**2
 
 
 def validate(args):

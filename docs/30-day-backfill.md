@@ -35,12 +35,12 @@ The checked-in example preserves the existing defaults and requests 100 batches.
 Credentials remain in environment variables, never this file.
 
 `slots_per_batch` defaults to eight and accepts 1–10,000. For example, set it to
-1,000 and `max_reserved_bytes` to at least 67,310,190,592 bytes (62.6875 GiB) to
+1,000 and `max_reserved_bytes` to at least 68,224,548,864 bytes (63.54 GiB) to
 admit one worst-case batch. This reservation is deliberately pessimistic, not an
-expected download size or measured recommendation. Larger batches still share the
-existing 128 MiB/32-request archive ceiling and 120-second cooperative deadline;
-they can stop or fail before reaching the slot maximum. They do not increase
-concurrency. Native historical operations remain in subranges of at most 128 slots,
+expected download size or measured recommendation. A batch of N slots may download N MiB in N/2
+archive requests (at least 128 MiB and 128 requests, at most 2 GiB and 2048) within the
+120-second cooperative deadline; it can stop or fail before reaching the slot maximum.
+Inside a batch, the next 128-slot window downloads while the current one is written. Native historical operations remain in subranges of at most 128 slots,
 with the same per-slot durable writes and independent coverage checks.
 
 The native `bridge` worker also accepts `INDEXER_BRIDGE_BATCH_SLOTS`; the wrapper
@@ -50,8 +50,8 @@ effective batch limits. Existing sessions can resume with changed limits without
 changing their frozen range, sampling policy, or binary. A session frozen with an
 older binary needs a new session to use the native batch-size setting.
 
-Each bridge batch processes at most the configured positions. The wrapper reserves
-128 MiB + (`slots_per_batch` + 1) × 64 MiB before
+Each bridge batch processes at most the configured positions. The wrapper reserves the
+archive limit above + (`slots_per_batch` + 1) × 64 MiB before
 each batch so a crash cannot reset its charge. When the batch finishes and reports
 its source response bytes, the charge drops to those bytes; failed, timed-out and
 interrupted batches keep the full reservation. `run` stops at `--max-reserved-bytes`
