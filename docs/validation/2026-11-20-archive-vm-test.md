@@ -132,3 +132,22 @@ at 8 here.
   backed off.
 - A batch that stops early does not count the window still downloading in its reported
   bytes (at most one window, ~66 MB).
+
+## Third VM run: `main` with rate-limit backoff
+
+Same VM type and start slot. `main` at 18985a3 (#133 and #135: 8 streams, look-ahead,
+rate-limit backoff), 1000-slot batches, cancelled after 20 minutes. It cost $0.28.
+
+| | |
+| --- | --- |
+| Batches | 38, 37,993 slots in 1,273 s: **29.8 slots/s** |
+| Per 3 minutes | 28.0–32.3 slots/s, with no decline |
+| Rate limiting | none: 0 `archive_rate_limited` slots and no waits |
+| Downloaded | 20.3 GB, 0.53 MB/slot, 16 MB/s |
+| PostgreSQL | 13 GB, ~340 KB/slot |
+| Slots | 37,986 complete; 7 `missing_token_metadata`; 7 skipped |
+
+Against the first VM run (`main` at df097b8, 200-slot batches), throughput rose from 15.7
+to 29.8 slots/s. At this rate 30 days (≈12.1M slots) takes about 4.7 days. Disk remains the
+constraint: about 4 TB of PostgreSQL, plus the download cache unless it is evicted (#124).
+Whether Old Faithful rate-limits a multi-day run is not known from 20 minutes.
