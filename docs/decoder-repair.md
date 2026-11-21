@@ -35,8 +35,10 @@ ordinary ingestion does not remove the marker until explicit repair reverifies i
 
 `repair-history` processes the selected full retained RPC blocks.
 `repair-history-archive` selects full normalized archive blocks in the same
-SQLite history, preserving archive provenance. It requires neither the optional
-archive SDK feature nor a CAR cache; missing archived blocks remain unknown.
+SQLite history, preserving archive provenance. Since 2026-11-21 an archive backfill
+retains only each block's CAR receipt: with a CACHE argument (archive feature,
+`INDEXER_ARCHIVE_OPT_IN=1`) the command reads those blocks again from Old Faithful;
+without one, receipt-only slots remain unknown with `retained_block_unavailable`.
 Source selection is explicit, so missing RPC input does not silently fall back
 to a different source. It can import
 transactions rejected by an earlier decoder that never reached the capture table.

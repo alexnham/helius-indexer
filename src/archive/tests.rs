@@ -275,6 +275,54 @@ fn maintained_wire_reader_normalizes_captured_legacy_and_synthetic_v0_v1() {
 }
 
 #[test]
+fn an_archive_backfill_retains_a_car_receipt_and_reads_the_block_again_on_retry() {
+    let value = fixture();
+    let slot = value["result"]["slot"].as_u64().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    put_cache(
+        dir.path(),
+        slot,
+        &slot_range(&value, slot, slot - 1, 7, true),
+    );
+    put_cache(
+        dir.path(),
+        slot - 1,
+        &slot_range(&value, slot - 1, slot - 2, 6, false),
+    );
+    let path = crate::storage::pg::TestDatabase::new();
+    let path = &path.0;
+    let mint = &crate::live::USDC;
+    let mut history = History::open(path).unwrap();
+    let mut source = ArchiveSource::new(dir.path(), false, Limits::default()).unwrap();
+    assert!(
+        history
+            .run(mint, slot, slot, &mut source, || false)
+            .unwrap()
+            .0
+            .complete
+    );
+    let (response, produced): (Vec<u8>, bool) = {
+        let row = path
+            .test_client()
+            .query_one("SELECT response,produced_block FROM historical_inputs", &[])
+            .unwrap();
+        (row.get(0), row.get(1))
+    };
+    // Only the CAR receipt is kept, and skip evidence still knows a block was produced.
+    let receipt: Value = serde_json::from_slice(&response).unwrap();
+    assert_eq!(receipt["archive_receipt"]["slot"], slot);
+    assert!(receipt["archive_receipt"]["car_sha256"].is_string());
+    assert!(produced && response.len() < 1024);
+    // A retry reads the block from the archive again rather than decoding the receipt.
+    history.reverify(mint, slot, slot).unwrap();
+    let (coverage, metrics) = history
+        .run(mint, slot, slot, &mut source, || false)
+        .unwrap();
+    assert!(coverage.complete);
+    assert_eq!((metrics.cached_blocks, metrics.source_attempts), (0, 1));
+}
+
+#[test]
 fn cached_car_source_replays_through_real_storage_and_both_source_orders() {
     let value = fixture();
     let slot = value["result"]["slot"].as_u64().unwrap();

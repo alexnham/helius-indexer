@@ -132,10 +132,9 @@ impl HistoryLog {
         received_at: u64,
         raw: &[u8],
         pruned: bool,
-    ) -> Result<()> {
         // Recorded once so skip evidence never parses stored bytes again.
-        let produced_block =
-            serde_json::from_slice::<serde_json::Value>(raw).is_ok_and(|v| v["result"].is_object());
+        produced_block: bool,
+    ) -> Result<()> {
         self.0
             .borrow_mut()
             .execute(

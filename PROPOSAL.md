@@ -102,6 +102,8 @@ the production target for a dedicated raw store.
 
 Requirements change (2026-11-18): historical block responses are retained pruned. The block header, every transaction's signatures and each transaction that touches the job's mint (decodable or not) are kept; other transactions keep only their signatures. Block identity, skip evidence, retries and decoder repair still run offline from the pruned block. Correcting the mint filter itself requires fetching the affected blocks again from the source. Archive/RPC bridge evidence still retains whole blocks, because it compares them.
 
+Requirements change (2026-11-21): an Old Faithful block response is retained as its CAR receipt (epoch, slot, CAR offset and length, sha256, Jetstreamer revision), not its bytes; the archive is immutable, so the block can be read again. Matched transactions stay in `captures`, so decoder repair of captured transactions stays offline. Retries and `repair-history-archive` (candidates an earlier decoder rejected) read the block again from Old Faithful, which needs network access and is subject to its rate limits. Block identity and skip evidence are recorded at ingest and do not need the bytes.
+
 The initial API provides:
 
 - Transfer listings filtered by mint and time, with deterministic ordering and pagination.
