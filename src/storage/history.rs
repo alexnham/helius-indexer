@@ -3,7 +3,10 @@
 use super::Database;
 use crate::{Error, Result, decoder::DECODER_VERSION};
 use postgres::Client;
-use std::cell::RefCell;
+use std::{
+    cell::RefCell,
+    collections::{BTreeMap, HashSet},
+};
 
 pub(crate) struct HistoryLog(RefCell<Client>);
 
@@ -26,23 +29,72 @@ impl HistoryLog {
     }
 
     /// Creates unknown records for unscheduled slots; existing progress is kept.
-    pub(crate) fn schedule(&self, mint: &str, slot: u64, now: u64) -> Result<()> {
-        self.0.borrow_mut().execute("INSERT INTO historical_slots(mint,decoder,slot,status,first_pending) VALUES ($1,$2,$3,'unknown',$4) ON CONFLICT DO NOTHING",&[&mint,&DECODER_VERSION,&(slot as i64),&(now as i64)]).map_err(write_error)?;
+    /// Schedules every slot of `start..=end` not already scheduled, in one statement.
+    pub(crate) fn schedule(&self, mint: &str, start: u64, end: u64, now: u64) -> Result<()> {
+        self.0.borrow_mut().execute("INSERT INTO historical_slots(mint,decoder,slot,status,first_pending) SELECT $1,$2,s,'unknown',$5 FROM generate_series($3::bigint,$4::bigint) s ON CONFLICT DO NOTHING",&[&mint,&DECODER_VERSION,&(start as i64),&(end as i64),&(now as i64)]).map_err(write_error)?;
         Ok(())
     }
 
     pub(crate) fn slot(&self, mint: &str, slot: u64) -> Result<Option<SlotRecord>> {
-        let row = self.0.borrow_mut().query_opt("SELECT status,error_class,attempts,block_time,first_pending FROM historical_slots WHERE mint=$1 AND decoder=$2 AND slot=$3",&[&mint,&DECODER_VERSION,&(slot as i64)]).map_err(read_error)?;
-        row.map(|r| {
-            Ok((
-                r.get(0),
-                r.get(1),
-                u64::try_from(r.get::<_, i64>(2)).map_err(|_| Error("history_read_failed"))?,
-                r.get(3),
-                u64::try_from(r.get::<_, i64>(4)).map_err(|_| Error("history_read_failed"))?,
-            ))
-        })
-        .transpose()
+        Ok(self.slots(mint, slot, slot)?.remove(&slot))
+    }
+
+    /// The scheduled slots of `start..=end`, in one query.
+    pub(crate) fn slots(
+        &self,
+        mint: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<BTreeMap<u64, SlotRecord>> {
+        let rows = self.0.borrow_mut().query("SELECT slot,status,error_class,attempts,block_time,first_pending FROM historical_slots WHERE mint=$1 AND decoder=$2 AND slot BETWEEN $3 AND $4",&[&mint,&DECODER_VERSION,&(start as i64),&(end as i64)]).map_err(read_error)?;
+        let count = |v: i64| u64::try_from(v).map_err(|_| Error("history_read_failed"));
+        rows.iter()
+            .map(|r| {
+                Ok((
+                    count(r.get(0))?,
+                    (
+                        r.get(1),
+                        r.get(2),
+                        count(r.get(3))?,
+                        r.get(4),
+                        count(r.get(5))?,
+                    ),
+                ))
+            })
+            .collect()
+    }
+
+    /// Slots of `start..=end` that `source` completed or skipped.
+    pub(crate) fn source_done_slots(
+        &self,
+        mint: &str,
+        start: u64,
+        end: u64,
+        source: &str,
+    ) -> Result<HashSet<u64>> {
+        self.slot_set("SELECT slot FROM historical_source_slots WHERE mint=$1 AND decoder=$2 AND slot BETWEEN $3 AND $4 AND source_kind=$5 AND status IN ('complete','skipped')", &[&mint,&DECODER_VERSION,&(start as i64),&(end as i64),&source])
+    }
+
+    /// Slots of `start..=end` with an input retained from `source` (any decoder).
+    pub(crate) fn input_slots(
+        &self,
+        mint: &str,
+        start: u64,
+        end: u64,
+        source: &str,
+    ) -> Result<HashSet<u64>> {
+        self.slot_set("SELECT DISTINCT slot FROM historical_inputs WHERE mint=$1 AND slot BETWEEN $2 AND $3 AND source_kind=$4", &[&mint,&(start as i64),&(end as i64),&source])
+    }
+
+    fn slot_set(
+        &self,
+        sql: &str,
+        params: &[&(dyn postgres::types::ToSql + Sync)],
+    ) -> Result<HashSet<u64>> {
+        let rows = self.0.borrow_mut().query(sql, params).map_err(read_error)?;
+        rows.iter()
+            .map(|r| u64::try_from(r.get::<_, i64>(0)).map_err(|_| Error("history_read_failed")))
+            .collect()
     }
 
     /// Slot status and the active source's completion change together.
@@ -61,10 +113,6 @@ impl HistoryLog {
         transaction.execute("INSERT INTO historical_source_slots VALUES($1,$2,$3,$4,$5) ON CONFLICT(mint,decoder,slot,source_kind) DO UPDATE SET status=excluded.status",&[&mint,&DECODER_VERSION,&(slot as i64),&source,&status]).map_err(write_error)?;
         transaction.commit().map_err(write_error)?;
         Ok(())
-    }
-
-    pub(crate) fn source_done(&self, mint: &str, slot: u64, source: &str) -> Result<bool> {
-        Ok(self.0.borrow_mut().query_one("SELECT EXISTS(SELECT 1 FROM historical_source_slots WHERE mint=$1 AND decoder=$2 AND slot=$3 AND source_kind=$4 AND status IN ('complete','skipped'))",&[&mint,&DECODER_VERSION,&(slot as i64),&source]).map_err(read_error)?.get(0))
     }
 
     pub(crate) fn add_attempt(&self, mint: &str, slot: u64) -> Result<()> {

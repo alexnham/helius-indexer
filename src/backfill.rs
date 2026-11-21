@@ -426,8 +426,9 @@ impl History {
         let mut oldest = None;
         let mut age_unknown = false;
         let mut completed = 0;
+        let mut records = self.db.slots(mint, start, end)?;
         for slot in start..=end {
-            let record = self.db.slot(mint, slot)?;
+            let record = records.remove(&slot);
             let scheduled = record.is_some();
             let (status, error_class, attempts, block_time, first) =
                 record.unwrap_or(("unknown".into(), None, 0, None, now()));
@@ -506,10 +507,19 @@ impl History {
         scope(mint, start, end)?;
         self.active_source = source.provenance();
         source.plan(mint, start, end);
-        for slot in start..=end {
+        {
             let _permit = self.gate.historical()?;
-            self.db.schedule(mint, slot, now())?;
+            self.db.schedule(mint, start, end, now())?;
         }
+        // Read once for the run: a slot's status changes only after it is fetched.
+        let snapshot = Snapshot {
+            start,
+            slots: self.coverage(mint, start, end)?.slots,
+            done: self
+                .db
+                .source_done_slots(mint, start, end, self.active_source)?,
+            inputs: self.db.input_slots(mint, start, end, source.provenance())?,
+        };
         let started = Instant::now();
         let mut metrics = Metrics {
             archive_input: source.capture_source() == "old-faithful-jetstreamer",
@@ -526,7 +536,15 @@ impl History {
             self.telemetry.set_context("backfill", "rpc", "historical");
         }
         if self.workers > 1 && !self.revision_repair {
-            self.run_workers(mint, start, end, source, &cancelled, &mut metrics)?;
+            self.run_workers(
+                mint,
+                start,
+                end,
+                source,
+                &cancelled,
+                &mut metrics,
+                &snapshot,
+            )?;
         } else {
             let mut store = {
                 let _permit = self.gate.historical()?;
@@ -537,7 +555,9 @@ impl History {
                     metrics.cancelled = true;
                     break;
                 }
-                let Some((raw, attempt)) = self.fetch(mint, slot, source, &mut metrics)? else {
+                let Some((raw, attempt)) =
+                    self.fetch(mint, slot, source, &mut metrics, &snapshot)?
+                else {
                     continue;
                 };
                 let retained = retain(
@@ -588,6 +608,7 @@ impl History {
 
     /// Bounded workers, one connection each, fed by a queue of at most one block per
     /// worker, so at most two blocks per worker are held in memory.
+    #[allow(clippy::too_many_arguments)]
     fn run_workers(
         &self,
         mint: &str,
@@ -596,6 +617,7 @@ impl History {
         source: &mut impl BlockSource,
         cancelled: &impl Fn() -> bool,
         metrics: &mut Metrics,
+        snapshot: &Snapshot,
     ) -> Result<()> {
         use std::sync::{
             Arc, Mutex,
@@ -675,7 +697,7 @@ impl History {
                     stop.store(true, Ordering::Relaxed);
                     break;
                 }
-                if let Some((raw, attempt)) = self.fetch(mint, slot, source, metrics)? {
+                if let Some((raw, attempt)) = self.fetch(mint, slot, source, metrics, snapshot)? {
                     work.send((slot, raw, attempt))
                         .map_err(|_| Error("historical_worker_failed"))?;
                 }
@@ -717,9 +739,10 @@ impl History {
         slot: u64,
         source: &mut impl BlockSource,
         metrics: &mut Metrics,
+        snapshot: &Snapshot,
     ) -> Result<Option<(Vec<u8>, u64)>> {
-        let current = self.coverage(mint, slot, slot)?.slots.remove(0);
-        let source_done = self.db.source_done(mint, slot, self.active_source)?;
+        let current = &snapshot.slots[(slot - snapshot.start) as usize];
+        let source_done = snapshot.done.contains(&slot);
         if current.status == "skipped" || (current.status == "complete" && source_done) {
             return Ok(None);
         }
@@ -739,7 +762,9 @@ impl History {
             let _permit = self.gate.historical()?;
             self.db.add_attempt(mint, slot)?;
         }
-        let cached: Option<Vec<u8>> = if self.revision_repair
+        let cached: Option<Vec<u8>> = if !snapshot.inputs.contains(&slot) {
+            None
+        } else if self.revision_repair
             || current.error_class.is_none()
             || current.error_class.as_deref() == Some("cancelled")
             || matches!(
@@ -921,6 +946,14 @@ pub(crate) fn prune(raw: &[u8], mint: &str) -> Option<Vec<u8>> {
     } else {
         pruned.then(|| raw.to_vec())
     }
+}
+
+/// A run's slot states, read once before its first fetch.
+struct Snapshot {
+    start: u64,
+    slots: Vec<SlotCoverage>,
+    done: std::collections::HashSet<u64>,
+    inputs: std::collections::HashSet<u64>,
 }
 
 /// Transactions per historical write batch; the byte bound is shared with live intake.
