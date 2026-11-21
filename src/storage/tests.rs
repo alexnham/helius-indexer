@@ -916,6 +916,10 @@ fn observation(index: u8, source: &str, slot: u64) -> (Capture, Vec<u8>, Result<
     (capture, raw, decoded)
 }
 
+fn capture_value(raw: &[u8]) -> serde_json::Value {
+    serde_json::from_slice(raw).unwrap()
+}
+
 #[test]
 fn a_first_observation_references_captures_and_keeps_its_bytes_when_captures_changes() {
     let db = pg::TestDatabase::new();
@@ -935,14 +939,21 @@ fn a_first_observation_references_captures_and_keeps_its_bytes_when_captures_cha
     };
     // Stored once: the input row references the captures payload.
     assert_eq!(input(&mut sql, "solana-mainnet-rpc"), (None, None));
+    // The captures row stores the transaction once: no separate reference (migration 0015).
     let row = sql
         .query_one(
-            "SELECT result_json,capture_json FROM captures WHERE signature=$1",
+            &format!(
+                "SELECT result_json,{},capture_json FROM captures c WHERE signature=$1",
+                crate::storage::RESULT_JSON
+            ),
             &[&signature],
         )
         .unwrap();
-    let (original_result, original_raw): (String, Vec<u8>) = (row.get(0), row.get(1));
-    assert_eq!(original_raw, raw);
+    let (stored, original_result, original_raw): (Option<String>, String, Vec<u8>) =
+        (row.get(0), row.get(1), row.get(2));
+    assert_eq!((stored, original_raw.clone()), (None, raw.clone()));
+    let json = |text: &str| serde_json::from_str::<serde_json::Value>(text).unwrap();
+    assert_eq!(json(&original_result), capture_value(&raw)["result"]);
     let mut log = replay::JobLog::open(&db.0).unwrap();
     assert_eq!(
         log.slot_captures(400, "solana-mainnet-rpc").unwrap()[&signature].0,
@@ -952,10 +963,9 @@ fn a_first_observation_references_captures_and_keeps_its_bytes_when_captures_cha
     // first observation's exact bytes are copied into its input row first.
     let (other, other_raw, other_decoded) = observation(7, "fixture", 400);
     store.persist(&other, &other_raw, &other_decoded).unwrap();
-    assert_eq!(
-        input(&mut sql, "solana-mainnet-rpc"),
-        (Some(original_result), Some(raw.clone()))
-    );
+    let (copied, copied_raw) = input(&mut sql, "solana-mainnet-rpc");
+    assert_eq!(copied_raw, Some(raw.clone()));
+    assert_eq!(json(&copied.unwrap()), json(&original_result));
     assert_eq!(
         log.slot_captures(400, "solana-mainnet-rpc").unwrap()[&signature].0,
         raw

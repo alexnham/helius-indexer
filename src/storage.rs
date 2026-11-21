@@ -89,10 +89,15 @@ impl WriteStats {
     }
 }
 
+/// A capture's compatible reference: NULL `result_json` is the result inside `capture_json`
+/// (migration 0015), so a new capture stores its transaction once. Readers parse it as JSON;
+/// a capture_json that is not JSON gives NULL, read as `stored_record_invalid`.
+pub(crate) const RESULT_JSON: &str = "COALESCE(c.result_json,CASE WHEN pg_input_is_valid(convert_from(c.capture_json,'UTF8'),'jsonb') THEN (convert_from(c.capture_json,'UTF8')::jsonb->'result')::text END)";
+
 /// Batch statements, prepared once per connection so each later batch costs one round
 /// trip per statement instead of two.
 const BATCH_CAPTURES: &str = "INSERT INTO captures(signature,slot,result_json,capture_json,status,decoder_version)
-                 SELECT s,sl,r,c,st,$6 FROM unnest($1::text[],$2::bigint[],$3::text[],$4::bytea[],$5::text[]) AS u(s,sl,r,c,st)
+                 SELECT s,sl,NULL,c,st,$5 FROM unnest($1::text[],$2::bigint[],$3::bytea[],$4::text[]) AS u(s,sl,c,st)
                  ON CONFLICT(signature) DO NOTHING RETURNING signature";
 // A first observation's payload is the captures row just inserted: NULL references it
 // (migration 0013), so the payload is stored once.
@@ -521,7 +526,6 @@ impl Store {
             |f: &dyn Fn(&Prepared<'_>) -> String| firsts.iter().map(|p| f(p)).collect::<Vec<_>>();
         let signatures = column(&|p| p.signature.to_string());
         let slots: Vec<i64> = firsts.iter().map(|p| p.slot).collect();
-        let references = column(&|p| p.result_json.clone());
         let raws: Vec<&[u8]> = firsts.iter().map(|p| p.item.raw).collect();
         let statuses = column(&|p| p.status.to_string());
         let inserted: HashSet<String> = if firsts.is_empty() {
@@ -529,14 +533,7 @@ impl Store {
         } else {
             tx.query(
                 &statements.captures,
-                &[
-                    &signatures,
-                    &slots,
-                    &references,
-                    &raws,
-                    &statuses,
-                    &DECODER_VERSION,
-                ],
+                &[&signatures, &slots, &raws, &statuses, &DECODER_VERSION],
             )?
             .iter()
             .map(|r| r.get(0))
@@ -1004,7 +1001,7 @@ fn insert_transfer_rows(
 /// so recorded inputs keep their exact bytes.
 pub(crate) fn materialize_inputs(tx: &mut impl GenericClient, signature: &str) -> Result<()> {
     tx.execute(
-        "UPDATE capture_inputs i SET result_json=c.result_json,capture_json=c.capture_json FROM captures c WHERE c.signature=i.signature AND i.signature=$1 AND i.result_json IS NULL",
+        &format!("UPDATE capture_inputs i SET result_json={RESULT_JSON},capture_json=c.capture_json FROM captures c WHERE c.signature=i.signature AND i.signature=$1 AND i.result_json IS NULL"),
         &[&signature],
     )
     .map(drop)
@@ -1053,12 +1050,13 @@ fn reconcile_repeat(
     .map_err(write_failed)?;
     let row = tx
         .query_one(
-            "SELECT result_json,decoder_version,status FROM captures WHERE signature=$1 FOR UPDATE",
+            &format!("SELECT {RESULT_JSON},decoder_version,status FROM captures c WHERE signature=$1 FOR UPDATE"),
             &[&signature],
         )
         .map_err(read_failed)?;
-    let (prior, version, prior_status): (String, String, String) =
+    let (prior, version, prior_status): (Option<String>, String, String) =
         (row.get(0), row.get(1), row.get(2));
+    let prior = prior.ok_or(Error("stored_record_invalid"))?;
     let prior_value: serde_json::Value =
         serde_json::from_str(&prior).map_err(|_| Error("stored_record_invalid"))?;
     let mut repaired = None;

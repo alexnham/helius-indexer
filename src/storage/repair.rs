@@ -37,7 +37,7 @@ impl Store {
         let mut tx = self.db.transaction().map_err(write_failed)?;
         // Locks the capture so a concurrent observation or repair waits for this replacement.
         let row = tx.query_one(
-            "SELECT octet_length(capture_json),octet_length(result_json),decoder_version FROM captures WHERE signature=$1 FOR UPDATE", &[&signature])
+            "SELECT octet_length(capture_json),COALESCE(octet_length(result_json),octet_length(capture_json)),decoder_version FROM captures WHERE signature=$1 FOR UPDATE", &[&signature])
             .map_err(read_failed)?;
         let (raw_len, result_len, previous): (i32, i32, String) =
             (row.get(0), row.get(1), row.get(2));
@@ -63,16 +63,20 @@ impl Store {
             }
             let row = tx
                 .query_one(
-                    "SELECT capture_json,result_json FROM captures WHERE signature=$1",
+                    &format!(
+                        "SELECT capture_json,{} FROM captures c WHERE signature=$1",
+                        crate::storage::RESULT_JSON
+                    ),
                     &[&signature],
                 )
                 .map_err(read_failed)?;
-            let (raw, reference): (Vec<u8>, String) = (row.get(0), row.get(1));
+            let (raw, reference): (Vec<u8>, Option<String>) = (row.get(0), row.get(1));
+            let reference = reference.ok_or(Error("stored_record_invalid"))?;
             let mut reference: Value =
                 serde_json::from_str(&reference).map_err(|_| Error("stored_record_invalid"))?;
             // Audit receipts may contain compatible execution metadata received after the old decoder failed.
             // A NULL input payload is the captures payload (migration 0013).
-            let observations = tx.query("SELECT CASE WHEN octet_length(COALESCE(i.result_json,c.result_json))<=16777216 THEN COALESCE(i.result_json,c.result_json) END FROM capture_inputs i LEFT JOIN captures c ON c.signature=i.signature WHERE i.signature=$1 AND i.status<>'capture_conflict' ORDER BY i.source,i.result_digest LIMIT 33", &[&signature])
+            let observations = tx.query(&format!("SELECT CASE WHEN octet_length(COALESCE(i.result_json,{r}))<=16777216 THEN COALESCE(i.result_json,{r}) END FROM capture_inputs i LEFT JOIN captures c ON c.signature=i.signature WHERE i.signature=$1 AND i.status<>'capture_conflict' ORDER BY i.source,i.result_digest LIMIT 33", r = crate::storage::RESULT_JSON), &[&signature])
                 .map_err(read_failed)?;
             let mut total = 0;
             for (count, observation) in observations.iter().enumerate() {
