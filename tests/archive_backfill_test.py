@@ -28,6 +28,7 @@ elif cmd=="bridge":
  if os.environ.get("FAKE_SLEEP"): time.sleep(10)
  if os.environ.get("FAKE_FAIL"): print(os.environ.get("SOLANA_RPC_URL","secret"),file=sys.stderr); print('{"event":"command_failed","error_class":"rpc_rate_limited"}',file=sys.stderr); sys.exit(3)
  if os.environ.get("FAKE_CANCEL"): Path(os.environ["BACKFILL_CANCEL_FILE"]).touch()
+ Path(sys.argv[3]).mkdir(parents=True, exist_ok=True); (Path(sys.argv[3])/"epoch-1-slot-5.car-range").write_text("x")
  s["slots_per_batch"]=os.environ.get("INDEXER_BRIDGE_BATCH_SLOTS")
  limited=os.environ.get("FAKE_LIMITED")
  if not limited: s["pending"]=max(0,s["pending"]-1)
@@ -110,6 +111,8 @@ class ArchiveBackfillTests(unittest.TestCase):
         self.assertEqual(m["budget"]["actual_response_bytes"], 24)
         self.assertEqual([b["reserved_bytes"] for b in m["batches"]], [12, 12])
         self.assertEqual((m["total_batches"], m["stop_reason"]), (2, "coverage_complete"))
+        # Each finished batch's downloaded blocks are deleted.
+        self.assertEqual(list((self.directory / "archive-cache").glob("epoch-*")), [])
         self.assertEqual(json.loads(self.state.read_text())["batches"], 2)
         self.assertEqual(app.main(["status", *self.common]), 0)
         self.assertEqual(self.manifest()["budget"]["reserved_bytes"], 24)

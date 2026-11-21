@@ -491,6 +491,9 @@ def run_batches(args, env, path, manifest, cancel_file):
             manifest["stop_reason"] = "child_failed"
             raise
 
+        # The batch's blocks are in PostgreSQL once it returns; repair reads them from there.
+        for cached in (args.directory / "archive-cache").glob("epoch-*"):
+            cached.unlink(missing_ok=True)
         actual = source_bytes(report)
         attempt.update(state="complete", actual_response_bytes=actual,
                        finished_at_unix_seconds=int(time.time()))
