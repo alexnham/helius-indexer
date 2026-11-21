@@ -118,15 +118,38 @@ pub fn history(
     history_from(database, telemetry, mint, start, end, cancelled, false)
 }
 
-/// Reverify normalized archive blocks without fetching CAR files or the network.
+/// Reverify retained archive blocks. Without `cache` nothing is fetched; with it (archive
+/// feature, `INDEXER_ARCHIVE_OPT_IN=1`), a slot retained only as a CAR receipt is read
+/// again from Old Faithful into `cache`.
 pub fn archive_history(
     database: &Database,
     telemetry: &mut Telemetry,
     mint: &str,
     start: u64,
     end: u64,
+    cache: Option<&std::path::Path>,
     cancelled: impl Fn() -> bool,
 ) -> Result<Value> {
+    #[cfg(feature = "archive")]
+    if let Some(cache) = cache {
+        crate::backfill::scope(mint, start, end)?;
+        let limits = crate::archive::Limits::bridge(end - start + 1, 120);
+        let mut source = crate::archive::ArchiveSource::new(cache, true, limits)?;
+        return history_with(
+            database,
+            telemetry,
+            mint,
+            start,
+            end,
+            cancelled,
+            &mut source,
+            "retained_blocks_or_archive",
+        );
+    }
+    #[cfg(not(feature = "archive"))]
+    if cache.is_some() {
+        return Err(Error("archive_feature_required"));
+    }
     history_from(database, telemetry, mint, start, end, cancelled, true)
 }
 fn history_from(
@@ -160,11 +183,35 @@ fn history_from(
             Err(Error("retained_block_unavailable"))
         }
     }
+    history_with(
+        database,
+        telemetry,
+        mint,
+        start,
+        end,
+        cancelled,
+        &mut NoNetwork(archive),
+        "retained_blocks_only",
+    )
+}
+#[allow(clippy::too_many_arguments)]
+fn history_with(
+    database: &Database,
+    telemetry: &mut Telemetry,
+    mint: &str,
+    start: u64,
+    end: u64,
+    cancelled: impl Fn() -> bool,
+    source: &mut impl crate::backfill::BlockSource,
+    label: &str,
+) -> Result<Value> {
+    telemetry.set_context("decoder_repair", "retained_block", "repair");
     let mut history = crate::backfill::History::open(database)?;
     history.enable_revision_repair(telemetry.run_id.clone());
     let run_id = history.run_id().to_owned();
-    let (coverage, metrics) = history.run(mint, start, end, &mut NoNetwork(archive), cancelled)?;
+    let archive = source.provenance() == "old-faithful-jetstreamer";
+    let (coverage, metrics) = history.run(mint, start, end, source, cancelled)?;
     Ok(
-        json!({"run_id":run_id,"source":"retained_blocks_only","source_kind":if archive {"archive"} else {"rpc"},"coverage":coverage,"metrics":metrics}),
+        json!({"run_id":run_id,"source":label,"source_kind":if archive {"archive"} else {"rpc"},"coverage":coverage,"metrics":metrics}),
     )
 }

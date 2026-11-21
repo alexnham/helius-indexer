@@ -776,7 +776,10 @@ impl History {
                 .as_deref()
                 .is_some_and(|e| e.starts_with("storage_"))
         {
-            self.db.latest_input(mint, slot, source.provenance())?
+            // A receipt is not the block: the source reads it again.
+            self.db
+                .latest_input(mint, slot, source.provenance())?
+                .filter(|bytes| !is_receipt(bytes))
         } else {
             None
         };
@@ -909,6 +912,14 @@ fn retain(
     raw: &[u8],
 ) -> Result<Vec<u8>> {
     let pruned = if full { None } else { prune(raw, mint) };
+    let value = serde_json::from_slice::<Value>(raw).ok();
+    let produced = value.as_ref().is_some_and(|v| v["result"].is_object());
+    // An Old Faithful block is read again from its CAR range, so only that receipt is kept.
+    let receipt = value
+        .filter(|v| !full && provenance == ARCHIVE_SOURCE && v["archive_provenance"].is_object())
+        .and_then(|v| {
+            serde_json::to_vec(&json!({"archive_receipt": v["archive_provenance"]})).ok()
+        });
     let _permit = gate.historical()?;
     db.retain_input(
         mint,
@@ -916,10 +927,17 @@ fn retain(
         attempt,
         provenance,
         now(),
-        pruned.as_deref().unwrap_or(raw),
+        receipt.as_deref().or(pruned.as_deref()).unwrap_or(raw),
         pruned.is_some(),
+        produced,
     )?;
     Ok(pruned.unwrap_or_else(|| raw.to_vec()))
+}
+
+const ARCHIVE_SOURCE: &str = "old-faithful-jetstreamer";
+/// A retained input that holds an archive receipt instead of the block (`retain`).
+pub(crate) fn is_receipt(bytes: &[u8]) -> bool {
+    bytes.starts_with(br#"{"archive_receipt""#)
 }
 
 /// A block response with every transaction that does not touch `mint` reduced to its

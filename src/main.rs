@@ -18,7 +18,7 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
-const USAGE: &str = "usage: DATABASE_URL=postgres://... helius-indexer COMMAND, where SESSION is a schema name (^[a-z][a-z0-9_]*$), not a file path: replay-create SESSION JOB MINT START END | replay-status/replay-retry/replay-grant SESSION JOB | replay-route SESSION JOB CACHE | archive-grant SESSION JOB | replay-gap SESSION JOB | gap-grant SESSION JOB | replay SESSION JOB SECONDS | replay-monitor SESSION JOB LIVE_FROM SECONDS(0 = continuous live) [CACHE] | replay-overlap SESSION JOB | health SESSION | migrate SESSION | sample-init SESSION MINT PERCENT | mint-init SESSION MINT | sample-status SESSION | consume SESSION SECONDS (uses INDEXER_KAFKA_BROKERS) | comparison-input SESSION MINT [--sample] | monitor SESSION MINT LIVE_FROM START END SECONDS | query-recent SESSION [MINT] [WINDOW] [--limit N] [--cursor C] | ingest SESSION CAPTURE [--metrics FILE] | query SESSION [MINT] [WINDOW] [--limit N] [--cursor C] | backfill SESSION MINT START END [--metrics FILE] | coverage SESSION MINT START END | live SESSION FROM_SLOT SECONDS(0 = continuous) [MINT] | prune SESSION KEEP | live-status SESSION | live-retry SESSION | summary SESSION MINT [WINDOW] | overlap SESSION START END SECONDS | repair SESSION START END | repair-status SESSION START END | repair-history-archive SESSION MINT START END | repair-history SESSION MINT START END | [feature archive] replay-archive SESSION JOB CACHE | archive/archive-replay/archive-overlap SESSION CACHE MINT START END | bridge-plan SESSION CACHE MINT START | bridge SESSION CACHE MINT START | bridge-status SESSION MINT START | bridge-live SESSION CACHE START SECONDS | archive-overlap-replay SESSION MINT START END | archive-tip CACHE | archive-live SESSION CACHE START END SECONDS";
+const USAGE: &str = "usage: DATABASE_URL=postgres://... helius-indexer COMMAND, where SESSION is a schema name (^[a-z][a-z0-9_]*$), not a file path: replay-create SESSION JOB MINT START END | replay-status/replay-retry/replay-grant SESSION JOB | replay-route SESSION JOB CACHE | archive-grant SESSION JOB | replay-gap SESSION JOB | gap-grant SESSION JOB | replay SESSION JOB SECONDS | replay-monitor SESSION JOB LIVE_FROM SECONDS(0 = continuous live) [CACHE] | replay-overlap SESSION JOB | health SESSION | migrate SESSION | sample-init SESSION MINT PERCENT | mint-init SESSION MINT | sample-status SESSION | consume SESSION SECONDS (uses INDEXER_KAFKA_BROKERS) | comparison-input SESSION MINT [--sample] | monitor SESSION MINT LIVE_FROM START END SECONDS | query-recent SESSION [MINT] [WINDOW] [--limit N] [--cursor C] | ingest SESSION CAPTURE [--metrics FILE] | query SESSION [MINT] [WINDOW] [--limit N] [--cursor C] | backfill SESSION MINT START END [--metrics FILE] | coverage SESSION MINT START END | live SESSION FROM_SLOT SECONDS(0 = continuous) [MINT] | prune SESSION KEEP | live-status SESSION | live-retry SESSION | summary SESSION MINT [WINDOW] | overlap SESSION START END SECONDS | repair SESSION START END | repair-status SESSION START END | repair-history-archive SESSION MINT START END [CACHE] | repair-history SESSION MINT START END | [feature archive] replay-archive SESSION JOB CACHE | archive/archive-replay/archive-overlap SESSION CACHE MINT START END | bridge-plan SESSION CACHE MINT START | bridge SESSION CACHE MINT START | bridge-status SESSION MINT START | bridge-live SESSION CACHE START SECONDS | archive-overlap-replay SESSION MINT START END | archive-tip CACHE | archive-live SESSION CACHE START END SECONDS";
 
 fn ingest(db: &str, input: &str, telemetry: &mut Telemetry) -> Result<serde_json::Value> {
     let started = Instant::now();
@@ -243,6 +243,20 @@ fn run(args: &[String], telemetry: &mut Telemetry) -> Result<serde_json::Value> 
                 telemetry,
             )
         }
+        [command, db, mint, start, end, cache] if command == "repair-history-archive" => {
+            let start = start.parse().map_err(|_| Error("invalid_repair_range"))?;
+            let end = end.parse().map_err(|_| Error("invalid_repair_range"))?;
+            let cancel = env::var_os("REPAIR_CANCEL_FILE");
+            helius_indexer::repair::archive_history(
+                &Database::from_env(db)?,
+                telemetry,
+                mint,
+                start,
+                end,
+                Some(Path::new(cache)),
+                || cancel.as_ref().is_some_and(|p| Path::new(p).exists()),
+            )
+        }
         [command, db, mint, start, end]
             if command == "repair-history" || command == "repair-history-archive" =>
         {
@@ -256,6 +270,7 @@ fn run(args: &[String], telemetry: &mut Telemetry) -> Result<serde_json::Value> 
                     mint,
                     start,
                     end,
+                    None,
                     || cancel.as_ref().is_some_and(|p| Path::new(p).exists()),
                 )
             } else {

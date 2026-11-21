@@ -66,7 +66,8 @@ Each native command may take up to 360 s. The native worker shares a cooperative
 `status` takes no lock, so it works while `run` is active. Starting `run` deletes a
 `CANCEL` file left from an earlier stop and reports `cleared_stale_cancel`; create
 the file again to stop a run in progress. After each finished batch `run` deletes the downloaded blocks from `archive-cache`;
-normalized blocks and captures stay in PostgreSQL, where repair reads them. A failed or
+captures stay in PostgreSQL, and each block keeps only its CAR receipt (repair reads the
+block again from Old Faithful: `repair-history-archive ... CACHE`). A failed or
 interrupted batch keeps its cache. Each block's decoded transactions are written in batches of up to 1,000
 (16 MiB), not one PostgreSQL transaction each.
 

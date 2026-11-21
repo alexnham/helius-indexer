@@ -100,6 +100,7 @@ fn retained_archive_revision_repair_recovers_previously_undecodable_candidates_o
         mint,
         slot,
         slot,
+        None,
         || false,
     )
     .unwrap();
@@ -116,11 +117,39 @@ fn retained_archive_revision_repair_recovers_previously_undecodable_candidates_o
         mint,
         slot,
         slot,
+        None,
         || false,
     )
     .unwrap();
     assert_eq!(again["metrics"]["source_attempts"], 0);
     assert_eq!(again["coverage"]["complete"], true);
+    // A slot retained only as an archive receipt is not a block: without a cache to read it
+    // again into, repair leaves it unknown instead of decoding the receipt.
+    db.execute(
+        "UPDATE historical_inputs SET response=$1",
+        &[&br#"{"archive_receipt":{"epoch":1,"slot":1}}"#.as_slice()],
+    )
+    .unwrap();
+    db.execute(
+        "UPDATE historical_slots SET status='unknown',error_class='decoder_revision_conflict'",
+        &[],
+    )
+    .unwrap();
+    let receipt = helius_indexer::repair::archive_history(
+        path,
+        &mut helius_indexer::telemetry::Telemetry::default(),
+        mint,
+        slot,
+        slot,
+        None,
+        || false,
+    )
+    .unwrap();
+    assert_eq!(receipt["metrics"]["cached_blocks"], 0);
+    assert_eq!(
+        receipt["coverage"]["slots"][0]["error_class"],
+        "retained_block_unavailable"
+    );
 }
 
 #[test]
